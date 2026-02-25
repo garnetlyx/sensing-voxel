@@ -1,0 +1,149 @@
+"""
+Abstract base class for printer adapters
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, Callable, Awaitable
+import asyncio
+
+from sensing_voxel.core.models import (
+    NormalizedPrinterState,
+    PrintProgress,
+    TelemetryData,
+    CommandResult,
+    AdapterCommandError,
+    AdapterConnectionError,
+)
+
+
+class PrinterAdapter(ABC):
+    """Abstract base class for printer adapters"""
+
+    def __init__(self):
+        self._state_changed_callbacks: list[Callable[[NormalizedPrinterState, NormalizedPrinterState], Awaitable[None]]] = []
+        self._telemetry_callbacks: list[Callable[[TelemetryData], Awaitable[None]]] = []
+        self._connection_lost_callbacks: list[Callable[[], Awaitable[None]]] = []
+        self._connection_restored_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    # --- Commands ---
+
+    @abstractmethod
+    async def start_print(self, gcode_path: str) -> CommandResult:
+        """Start printing a G-code file"""
+        pass
+
+    @abstractmethod
+    async def pause_print(self) -> CommandResult:
+        """Pause current print"""
+        pass
+
+    @abstractmethod
+    async def resume_print(self) -> CommandResult:
+        """Resume paused print"""
+        pass
+
+    @abstractmethod
+    async def cancel_print(self) -> CommandResult:
+        """Cancel current print"""
+        pass
+
+    @abstractmethod
+    async def emergency_cancel(self) -> CommandResult:
+        """Emergency cancel - bypasses command queue"""
+        pass
+
+    @abstractmethod
+    async def upload_file(self, local_path: str, remote_name: str) -> CommandResult:
+        """Upload file to printer"""
+        pass
+
+    @abstractmethod
+    async def get_z_offset(self) -> float:
+        """Get current Z-offset"""
+        pass
+
+    @abstractmethod
+    async def set_z_offset(self, offset_mm: float) -> CommandResult:
+        """Set Z-offset"""
+        pass
+
+    # --- Queries ---
+
+    @abstractmethod
+    async def get_printer_state(self) -> NormalizedPrinterState:
+        """Get current printer state"""
+        pass
+
+    @abstractmethod
+    async def get_print_progress(self) -> PrintProgress:
+        """Get current print progress"""
+        pass
+
+    @abstractmethod
+    async def is_connected(self) -> bool:
+        """Check if adapter is connected"""
+        pass
+
+    # --- Lifecycle ---
+
+    @abstractmethod
+    async def connect(self) -> None:
+        """Connect to printer"""
+        pass
+
+    @abstractmethod
+    async def disconnect(self) -> None:
+        """Disconnect from printer"""
+        pass
+
+    # --- Events (adapter emits these) ---
+
+    def on_state_changed(
+        self,
+        callback: Callable[[NormalizedPrinterState, NormalizedPrinterState], Awaitable[None]],
+    ):
+        """Register callback for state changes"""
+        self._state_changed_callbacks.append(callback)
+
+    def on_telemetry_update(self, callback: Callable[[TelemetryData], Awaitable[None]]):
+        """Register callback for telemetry updates"""
+        self._telemetry_callbacks.append(callback)
+
+    def on_connection_lost(self, callback: Callable[[], Awaitable[None]]):
+        """Register callback for connection loss"""
+        self._connection_lost_callbacks.append(callback)
+
+    def on_connection_restored(self, callback: Callable[[], Awaitable[None]]):
+        """Register callback for connection restore"""
+        self._connection_restored_callbacks.append(callback)
+
+    async def _emit_state_changed(
+        self,
+        old_state: NormalizedPrinterState,
+        new_state: NormalizedPrinterState,
+    ):
+        """Emit state changed event"""
+        for callback in self._state_changed_callbacks:
+            await callback(old_state, new_state)
+
+    async def _emit_telemetry_update(self, data: TelemetryData):
+        """Emit telemetry update event"""
+        for callback in self._telemetry_callbacks:
+            await callback(data)
+
+    async def _emit_connection_lost(self):
+        """Emit connection lost event"""
+        for callback in self._connection_lost_callbacks:
+            await callback()
+
+    async def _emit_connection_restored(self):
+        """Emit connection restored event"""
+        for callback in self._connection_restored_callbacks:
+            await callback()
+
+
+class NotSupportedError(AdapterCommandError):
+    """Command not supported by this adapter"""
+
+    def __init__(self, message: str = "Command not supported"):
+        super().__init__(message, retryable=False)
