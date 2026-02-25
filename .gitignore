@@ -1,1 +1,66 @@
 .design/
+.crew/
+
+# Python
+__pycache__/
+*.egg-info/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Environment variables
+.env
+.env.local
+
+# Data files (runtime)
+data/
+!data/tests/
+!data/tests/.gitkeep
+
+# Models (large ML models)
+models/
+!models/.gitkeep
+
+# Logs
+*.log
+
+# Docker
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db

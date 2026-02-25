@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  sensing-voxel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensing-voxel
+    restart: unless-stopped
+
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Add any environment-specific vars here
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+
+    # Volumes for persistent data and config overrides
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./models:/app/models:ro
+      # Optional: mount PrusaSlicer profiles
+      # - ~/.PrusaSlicer:/home/sensingvoxel/.PrusaSlicer:ro
+
+    # Network mode (host mode for easier local network access)
+    # network_mode: host
+
+    # Or use bridge networking with specific ports
+    networks:
+      - sensing-voxel-net
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sensing_voxel; print('OK')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+networks:
+  sensing-voxel-net:
+    driver: bridge

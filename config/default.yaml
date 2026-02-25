@@ -1,0 +1,64 @@
+# Sensing Voxel - Default Configuration
+# Copy to config/local.yaml and override values as needed
+
+# Debug mode
+debug: false
+
+# Telegram Bot Configuration
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  allowed_users:
+    - 123456789  # Replace with your Telegram user ID
+  approval_timeout_seconds: 600      # 10 minutes
+  NOTHING: 300  # 5 minutes
+
+# Klipper/Moonraker Configuration (optional)
+# Uncomment and configure if using Klipper
+# klipper:
+#   host: "192.168.1.100"
+#   port: 7125
+#   api_key: "your_moonraker_api_key"
+#   ws_reconnect_max_attempts: 10
+#   ws_reconnect_base_delay: 1.0
+#   ws_reconnect_max_delay: 30.0
+#   ws_reconnect_factor: 1.8
+#   ws_reconnect_jitter: 0.25
+#   compatibility_mode: false
+
+# Bambu Printer Configuration (optional)
+# Uncomment and configure if using Bambu printers
+# bambu:
+#   mqtt_host: "192.168.1.101"
+#   mqtt_port: 1883
+#   mqtt_username: "bblp"
+#   mqtt_password: "your_mqtt_password"
+#   ftp_host: "192.168.1.101"
+#   ftp_port: 21
+#   ftp_username: "root"
+#   ftp_password: "your_ftp_password"
+#   mqtt_reconnect_max_attempts: 10
+#   mqtt_reconnect_base_delay: 1.0
+#   mqtt_reconnect_max_delay: 30.0
+
+# Camera Configuration (optional)
+# Uncomment and configure if using camera monitoring
+# camera:
+#   rtsp_url: "rtsp://username:password@camera_ip:554/stream1"
+#   calibration_expiry_days: 30
+#   frame_width: 1920
+#   frame_height: 1080
+#   fps: 10
+
+# Slicer Configuration
+slicer:
+  prusaslicer_path: "prusa-slicer"
+  profile_path: null
+  output_dir: "data/sliced"
+
+# Storage Configuration
+storage:
+  data_dir: "data"
+  state_file: "agent_state.json"
+  calibration_dir: "calibration"
+  models_dir: "models"
+  uploads_dir: "uploads"
