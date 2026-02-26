@@ -1,8 +1,9 @@
 # Sensing Voxel - Architecture Document
 
-**Version**: 1.0
-**Date**: 2026-02-24
+**Version**: 1.1
+**Date**: 2026-02-25
 **Source**: `.design/plan.md` v10 + `.design/review.md` (all 11 issues addressed)
+**Last Review**: 2026-02-25 — Implementation status annotations added; deviations from spec noted
 
 ---
 
@@ -534,3 +535,49 @@ The find-stl skill stages downloaded files with:
 | Community skill sharing (ClawhHub) | Single-purpose agent |
 | Multi-session management | One session per printer instance |
 | Disk budget / transcript archival | Overkill for MVP |
+
+---
+
+## 9. Implementation Status (as of 2026-02-25)
+
+This section tracks actual implementation state vs. the architecture spec, annotated during the 2026-02-25 code review.
+
+### Implemented (Core Infrastructure)
+
+| Component | File | Status | Notes |
+|-----------|------|--------|-------|
+| Core data models | `core/models.py` | Complete | All enums, dataclasses, and event types per spec |
+| Agent state machine | `core/state_machine.py` | Complete (with known bug) | Transition table enforced; BUG-5/BUG-REV-2 enter-hook atomicity unresolved |
+| Decision engine | `core/decision.py` | Complete (1 test failing) | Lock-guarded CAS correct; WeakValueDictionary causes 1 failing test |
+| State persistence | `core/persistence.py` | Complete | Uses `filelock.SoftFileLock` (cross-platform); signal handling should move to `main.py` |
+| Retry infrastructure | `infra/retry.py` | Complete | Correct backoff with jitter; `retry_async` and `retry_async_with_reset` |
+| Printer adapter ABC | `adapters/base.py` | Complete | All abstract methods, event emitters, `NotSupportedError` |
+| Command queue | `adapters/command_queue.py` | Complete | Priority queue, emergency bypass, 0.5s shutdown poll timeout |
+| Klipper/Moonraker adapter | `adapters/klipper.py` | ~70% | REST + WebSocket reconnect done; emergency_cancel shares primary session (BUG-REV-1); compatibility mode stub only |
+| Telegram bot | `bot/telegram.py` | ~50% | Auth, file upload, decision keyboard, Z-offset command present; slicing trigger is TODO; dependency injection broken (BUG-REV-5) |
+| Configuration | `config.py` | Complete | All config sections; no startup validation for placeholder token |
+| Entry point | `main.py` | ~80% | Correct async main; `shutdown()` missing persistence arg (BUG-REV-3) |
+
+### Not Yet Implemented
+
+| Component | Files | Blocking Tasks |
+|-----------|-------|----------------|
+| Bambu adapter | `adapters/bambu.py` (missing) | TASKS.md 1.8 |
+| Slicer pipeline | `slicer/pipeline.py`, `slicer/metadata.py` (missing) | TASKS.md 1.10 |
+| NOTHING detection | `vision/NOTHING.py`, `vision/camera.py` (missing) | TASKS.md 1.11 |
+| Camera calibration | `vision/calibration.py` (missing) | TASKS.md 1.12 |
+| First-layer classifier | `vision/first_layer.py` (missing) | TASKS.md 1.13 |
+| Z-offset controller | `monitoring/z_offset.py` (missing) | TASKS.md 1.13 |
+| Monitoring orchestrator | `monitoring/monitor.py` (missing) | TASKS.md 1.14, 1.15 |
+| Bot auth module | `bot/auth.py` (missing) | TASKS.md 1.9 |
+| Bot decisions module | `bot/decisions.py` (missing) | TASKS.md 1.9 |
+| Integration tests | `tests/integration/` (missing) | TASKS.md 1.16 |
+
+### Known Deviations from Architecture Spec
+
+| Spec Reference | Spec Requirement | Actual Implementation | Fix Required |
+|---|---|---|---|
+| §4.5 / §4.6 | `emergency_cancel` uses dedicated session | Uses `self._session` same as `cancel_print` | Yes — BUG-REV-1 |
+| §8.2 | Jitter should be random | Uses `event_loop.time() % 1` (deterministic) | Yes — BUG-REV-4 |
+| §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation in `_handle_status_update` |
+| §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; no env var fallback for bot token | Low risk for MVP; consider `python-dotenv` integration |
