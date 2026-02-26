@@ -4,30 +4,32 @@ Priority command queue for printer adapters
 Ensures commands are executed in priority order with emergency bypass.
 """
 
-from dataclasses import dataclass, field
-from enum import IntEnum
-from typing import Any, Optional
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import IntEnum
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class CommandPriority(IntEnum):
     """Command priority levels"""
-    EMERGENCY = 0      # Emergency cancel - bypasses queue
-    HIGH = 10          # Critical operations (pause, resume)
-    NORMAL = 50        # Standard operations (start print, upload)
-    LOW = 100          # Background operations
+
+    EMERGENCY = 0  # Emergency cancel - bypasses queue
+    HIGH = 10  # Critical operations (pause, resume)
+    NORMAL = 50  # Standard operations (start print, upload)
+    LOW = 100  # Background operations
 
 
 @dataclass(order=True)
 class QueuedCommand:
     """A command in the queue"""
+
     priority: int
-    seq: int           # Sequence number for FIFO within same priority
-    command: Any       # Command payload
+    seq: int  # Sequence number for FIFO within same priority
+    command: Any  # Command payload
     timestamp: datetime = field(default_factory=datetime.now)
 
     def __init__(self, priority: int, seq: int, command: Any):
@@ -52,16 +54,12 @@ class CommandQueue:
         seq = self._sequence_counter
         self._sequence_counter += 1
 
-        queued_cmd = QueuedCommand(
-            priority=int(priority),
-            seq=seq,
-            command=command
-        )
+        queued_cmd = QueuedCommand(priority=int(priority), seq=seq, command=command)
 
         # Emergency commands go to separate queue for immediate processing
         if priority == CommandPriority.EMERGENCY:
             self._emergency_queue.put_nowait(command)
-            logger.debug(f"Enqueued emergency command")
+            logger.debug("Enqueued emergency command")
         else:
             self._queue.put_nowait(queued_cmd)
             logger.debug(f"Enqueued command (priority={priority.name}, seq={seq})")
@@ -79,10 +77,7 @@ class CommandQueue:
 
         # Otherwise get from priority queue
         queued_cmd = await self._queue.get()
-        logger.debug(
-            f"Dequeued command (priority={queued_cmd.priority}, "
-            f"seq={queued_cmd.seq})"
-        )
+        logger.debug(f"Dequeued command (priority={queued_cmd.priority}, seq={queued_cmd.seq})")
         return queued_cmd.command
 
     def size(self) -> int:
@@ -127,7 +122,7 @@ class CommandQueue:
                     # Use wait_for with a short timeout to periodically check shutdown
                     try:
                         command = await asyncio.wait_for(self.dequeue(), timeout=0.5)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Timeout occurred - check shutdown again and loop
                         continue
 
@@ -157,4 +152,3 @@ class CommandQueue:
         self.clear()
         self._sequence_counter = 0
         logger.info("Command queue reset")
-

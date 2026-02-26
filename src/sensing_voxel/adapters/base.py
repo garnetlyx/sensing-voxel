@@ -3,16 +3,14 @@ Abstract base class for printer adapters
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Callable, Awaitable
-import asyncio
+from collections.abc import Awaitable, Callable
 
 from sensing_voxel.core.models import (
+    AdapterCommandError,
+    CommandResult,
     NormalizedPrinterState,
     PrintProgress,
     TelemetryData,
-    CommandResult,
-    AdapterCommandError,
-    AdapterConnectionError,
 )
 
 
@@ -20,7 +18,9 @@ class PrinterAdapter(ABC):
     """Abstract base class for printer adapters"""
 
     def __init__(self):
-        self._state_changed_callbacks: list[Callable[[NormalizedPrinterState, NormalizedPrinterState], Awaitable[None]]] = []
+        self._state_changed_callbacks: list[
+            Callable[[NormalizedPrinterState, NormalizedPrinterState], Awaitable[None]]
+        ] = []
         self._telemetry_callbacks: list[Callable[[TelemetryData], Awaitable[None]]] = []
         self._connection_lost_callbacks: list[Callable[[], Awaitable[None]]] = []
         self._connection_restored_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -105,17 +105,40 @@ class PrinterAdapter(ABC):
         """Register callback for state changes"""
         self._state_changed_callbacks.append(callback)
 
+    def remove_state_changed_handler(
+        self,
+        callback: Callable[[NormalizedPrinterState, NormalizedPrinterState], Awaitable[None]],
+    ):
+        """Remove state changed callback"""
+        if callback in self._state_changed_callbacks:
+            self._state_changed_callbacks.remove(callback)
+
     def on_telemetry_update(self, callback: Callable[[TelemetryData], Awaitable[None]]):
         """Register callback for telemetry updates"""
         self._telemetry_callbacks.append(callback)
+
+    def remove_telemetry_handler(self, callback: Callable[[TelemetryData], Awaitable[None]]):
+        """Remove telemetry callback"""
+        if callback in self._telemetry_callbacks:
+            self._telemetry_callbacks.remove(callback)
 
     def on_connection_lost(self, callback: Callable[[], Awaitable[None]]):
         """Register callback for connection loss"""
         self._connection_lost_callbacks.append(callback)
 
+    def remove_connection_lost_handler(self, callback: Callable[[], Awaitable[None]]):
+        """Remove connection lost callback"""
+        if callback in self._connection_lost_callbacks:
+            self._connection_lost_callbacks.remove(callback)
+
     def on_connection_restored(self, callback: Callable[[], Awaitable[None]]):
         """Register callback for connection restore"""
         self._connection_restored_callbacks.append(callback)
+
+    def remove_connection_restored_handler(self, callback: Callable[[], Awaitable[None]]):
+        """Remove connection restored callback"""
+        if callback in self._connection_restored_callbacks:
+            self._connection_restored_callbacks.remove(callback)
 
     async def _emit_state_changed(
         self,

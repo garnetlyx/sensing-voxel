@@ -4,21 +4,25 @@ Klipper/Moonraker adapter
 Adapted from OpenClaw's skills/lucakaufmann/snapmaker/scripts/snapmaker.py
 """
 
-import aiohttp
-from typing import Optional
-import logging
 import asyncio
+import logging
+import random
+from datetime import datetime
+from pathlib import Path
 
-from sensing_voxel.adapters.base import PrinterAdapter, NotSupportedError
+import aiohttp
+
+from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import (
+    AdapterCommandError,
+    AdapterConnectionError,
+    CommandResult,
+    CommandResultStatus,
     NormalizedPrinterState,
     PrintProgress,
     TelemetryData,
-    CommandResult,
-    CommandResultStatus,
-    AdapterConnectionError,
 )
-from sensing_voxel.infra.retry import retry_async, BackoffPolicy
+from sensing_voxel.infra.retry import BackoffPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +38,17 @@ class KlipperAdapter(PrinterAdapter):
         "complete": NormalizedPrinterState.TERMINAL,
         "cancelled": NormalizedPrinterState.TERMINAL,
         "error": NormalizedPrinterState.ERROR,
+        "ready": NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,  # Moonraker ready state
+        "startup": NormalizedPrinterState.UNKNOWN,  # During startup
+        "shutdown": NormalizedPrinterState.UNKNOWN,  # During shutdown
+        "disconnecting": NormalizedPrinterState.UNKNOWN,  # Disconnecting
     }
 
     def __init__(
         self,
         host: str = "localhost",
         port: int = 7125,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         compatibility_mode: bool = False,
     ):
         super().__init__()
@@ -52,8 +60,8 @@ class KlipperAdapter(PrinterAdapter):
         self._rest_base_url = f"http://{host}:{port}"
         self._ws_url = f"ws://{host}:{port}/websocket"
 
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._connected = False
         self._shutdown_event = asyncio.Event()
 
@@ -102,6 +110,9 @@ class KlipperAdapter(PrinterAdapter):
 
     async def _ws_reconnect_loop(self):
         """WebSocket reconnection loop (OpenClaw SSE reconnect pattern)"""
+        # Maximum reconnection attempts before giving up
+        max_reconnect_attempts = 100
+
         while not self._shutdown_event.is_set():
             try:
                 await self._ws_connect_and_stream()
@@ -111,21 +122,46 @@ class KlipperAdapter(PrinterAdapter):
             except Exception as e:
                 logger.error(f"WebSocket error: {e}", exc_info=True)
 
-            # Reconnect delay
+            # Give up if we've exceeded maximum attempts
+            if self._reconnect_attempts >= max_reconnect_attempts:
+                logger.error(
+                    f"WebSocket reconnection failed after {self._reconnect_attempts} attempts. "
+                    "Giving up."
+                )
+                # Emit connection lost event
+                await self._emit_connection_lost()
+                break
+
+            # Reconnect delay - cap attempts to prevent overflow
+            # Calculate max useful attempts: log(max_delay / base_delay) / log(factor)
+            import math
+
+            max_attempts_before_max_delay = (
+                int(
+                    math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
+                    / math.log(self._reconnect_policy.factor)
+                )
+                + 1
+            )
+            capped_attempts = min(self._reconnect_attempts, max_attempts_before_max_delay)
+
             delay = min(
                 self._reconnect_policy.base_delay
-                * (self._reconnect_policy.factor ** self._reconnect_attempts),
+                * (self._reconnect_policy.factor**capped_attempts),
                 self._reconnect_policy.max_delay,
             )
 
+            # Add random jitter to prevent thundering herd (deterministic event_loop.time() removed)
             if self._reconnect_policy.jitter > 0:
-                delay += delay * self._reconnect_policy.jitter * asyncio.get_event_loop().time() % 1
+                delay += delay * self._reconnect_policy.jitter * random.random()
 
-            logger.info(f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts + 1})")
+            logger.info(
+                f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts + 1}/{max_reconnect_attempts})"
+            )
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._reconnect_attempts += 1
 
     async def _ws_connect_and_stream(self):
@@ -136,6 +172,10 @@ class KlipperAdapter(PrinterAdapter):
         async with self._session.ws_connect(self._ws_url) as ws:
             self._ws = ws
             self._reconnect_attempts = 0  # Reset on successful connection
+
+            # Check printer state on reconnection to detect changes during disconnection
+            await self._check_state_after_reconnect()
+
             await self._emit_connection_restored()
 
             logger.info("WebSocket connected")
@@ -151,13 +191,33 @@ class KlipperAdapter(PrinterAdapter):
 
     async def _handle_ws_message(self, data: dict):
         """Handle WebSocket message"""
+        # Validate message structure
+        if not isinstance(data, dict):
+            logger.warning(f"Invalid WebSocket message type: {type(data)}")
+            return
+
         method = data.get("method")
-        params = data.get("params", [{}])[0]
+        if method is None:
+            logger.warning("WebSocket message missing 'method' field")
+            return
+
+        params = data.get("params")
+        if params is None:
+            params = [{}]
+        elif not isinstance(params, list) or len(params) == 0:
+            logger.warning(f"Invalid 'params' field in WebSocket message: {params}")
+            params = [{}]
+
+        # Extract first params dict
+        try:
+            params_dict = params[0] if len(params) > 0 else {}
+        except (TypeError, IndexError):
+            params_dict = {}
 
         if method == "notify_status_update":
-            await self._handle_status_update(params)
+            await self._handle_status_update(params_dict)
         elif method == "notify_gcode_output":
-            await self._handle_gcode_output(params)
+            await self._handle_gcode_output(params_dict)
 
     async def _handle_status_update(self, status: dict):
         """Handle status update from printer"""
@@ -169,9 +229,7 @@ class KlipperAdapter(PrinterAdapter):
         # Emit state changed event if state changed
         if hasattr(self, "_last_state") and self._last_state != normalized_state:
             await self._emit_state_changed(self._last_state, normalized_state)
-            logger.debug(
-                f"State changed: {self._last_state.name} -> {normalized_state.name}"
-            )
+            logger.debug(f"State changed: {self._last_state.name} -> {normalized_state.name}")
         elif not hasattr(self, "_last_state"):
             logger.debug(f"Initial state: {normalized_state.name}")
 
@@ -182,10 +240,8 @@ class KlipperAdapter(PrinterAdapter):
         if telemetry:
             await self._emit_telemetry_update(telemetry)
 
-    def _parse_telemetry(self, status: dict, print_stats: dict) -> Optional[TelemetryData]:
+    def _parse_telemetry(self, status: dict, print_stats: dict) -> TelemetryData | None:
         """Parse telemetry data from status update"""
-        from datetime import datetime
-
         # Temperature data
         temps = {}
         heater_bed = status.get("heater_bed", {})
@@ -226,9 +282,63 @@ class KlipperAdapter(PrinterAdapter):
             metadata=metadata,
         )
 
-    async def _handle_gcode_output(self, params: dict):
-        """Handle G-code output"""
-        pass
+    async def _check_state_after_reconnect(self):
+        """Check printer state after reconnection to detect changes during disconnection"""
+        try:
+            # Query current printer state
+            result = await self._rest_request("GET", "/printer/objects/query?print_stats")
+
+            if result.status != CommandResultStatus.SUCCESS or not result.data:
+                logger.warning("Failed to query printer state after reconnect")
+                return
+
+            data = result.data
+            print_stats = data.get("print_stats", {})
+            state_str = print_stats.get("state", "unknown").lower()
+            filename = print_stats.get("filename", "")
+            total_duration = print_stats.get("total_duration", 0)
+
+            normalized_state = self.STATE_MAP.get(state_str, NormalizedPrinterState.UNKNOWN)
+
+            # Check if we have a previous state to compare against
+            if hasattr(self, "_last_state"):
+                if self._last_state != normalized_state:
+                    logger.info(
+                        f"Detected state change during disconnection: "
+                        f"{self._last_state.name} -> {normalized_state.name}"
+                    )
+                    # Emit state change event
+                    await self._emit_state_changed(self._last_state, normalized_state)
+
+                    # If a print started during disconnection, log it
+                    if (
+                        self._last_state
+                        in [
+                            NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
+                            NormalizedPrinterState.UNKNOWN,
+                        ]
+                        and normalized_state == NormalizedPrinterState.PRINTING
+                    ):
+                        logger.warning(
+                            f"Print started during disconnection: {filename} "
+                            f"(duration: {total_duration:.1f}s)"
+                        )
+
+                    # If a print completed during disconnection, log it
+                    if self._last_state == NormalizedPrinterState.PRINTING and normalized_state in [
+                        NormalizedPrinterState.TERMINAL,
+                        NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
+                    ]:
+                        logger.warning(
+                            f"Print completed during disconnection: {filename} "
+                            f"(total duration: {total_duration:.1f}s)"
+                        )
+
+            # Update last state
+            self._last_state = normalized_state
+
+        except Exception as e:
+            logger.error(f"Error checking state after reconnect: {e}", exc_info=True)
 
     # --- Commands ---
 
@@ -249,13 +359,40 @@ class KlipperAdapter(PrinterAdapter):
         return await self._rest_request("POST", "/printer/print/cancel")
 
     async def emergency_cancel(self) -> CommandResult:
-        # Use dedicated session to bypass queue
-        return await self._rest_request("POST", "/printer/print/cancel")
+        """Emergency cancel with dedicated session and aggressive timeout"""
+        # Create dedicated session with aggressive timeout for immediate response
+        # This bypasses the normal queue to ensure emergency commands execute ASAP
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)  # 5s aggressive timeout
+            async with aiohttp.ClientSession(timeout=timeout) as emergency_session:
+                headers = {}
+                if self.api_key:
+                    headers["X-API-Key"] = self.api_key
+
+                url = f"{self._rest_base_url}/printer/print/cancel"
+
+                async with emergency_session.post(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        logger.warning(
+                            f"EMERGENCY CANCEL executed for printer at {self.host}:{self.port}"
+                        )
+                        return CommandResult(CommandResultStatus.SUCCESS)
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"EMERGENCY CANCEL failed: HTTP {resp.status}")
+                        return CommandResult(
+                            CommandResultStatus.FAILURE,
+                            message=f"HTTP {resp.status}: {error_text}",
+                        )
+        except Exception as e:
+            logger.error(f"EMERGENCY CANCEL exception: {e}")
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message=f"Emergency cancel failed: {str(e)}",
+            )
 
     async def upload_file(self, local_path: str, remote_name: str) -> CommandResult:
         """Upload file to printer via Moonraker"""
-        from pathlib import Path
-
         try:
             path = Path(local_path)
             if not path.exists():
@@ -267,9 +404,6 @@ class KlipperAdapter(PrinterAdapter):
             # Read file content
             with open(path, "rb") as f:
                 file_content = f.read()
-
-            # Moonraker upload endpoint
-            url = f"{self._rest_base_url}/server/files/upload"
 
             # Prepare multipart form data
             data = aiohttp.FormData()
@@ -298,9 +432,7 @@ class KlipperAdapter(PrinterAdapter):
     async def get_z_offset(self) -> float:
         """Get current Z offset via gcode"""
         # Query gcode_move object for current Z offset
-        result = await self._rest_request(
-            "GET", "/printer/objects/query?gcode_move"
-        )
+        result = await self._rest_request("GET", "/printer/objects/query?gcode_move")
 
         if result.status == CommandResultStatus.SUCCESS and result.data:
             gcode_move = result.data.get("gcode_move", {})
@@ -310,7 +442,23 @@ class KlipperAdapter(PrinterAdapter):
 
     async def set_z_offset(self, offset_mm: float) -> CommandResult:
         """Set Z offset via SET_GCODE_OFFSET command"""
-        gcode = f"SET_GCODE_OFFSET Z_ADJUST={offset_mm:.4f} MOVE=1"
+        # Validate offset is numeric to prevent G-code injection
+        try:
+            offset_value = float(offset_mm)
+        except (ValueError, TypeError) as e:
+            return CommandResult(
+                CommandResultStatus.FAILURE, message=f"Invalid offset value: {str(e)}"
+            )
+
+        # Ensure offset is within reasonable bounds
+        if offset_value < -10.0 or offset_value > 10.0:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message=f"Offset out of range: {offset_value}. Must be between -10mm and +10mm",
+            )
+
+        # Format as G-code command with only numeric value
+        gcode = f"SET_GCODE_OFFSET Z_ADJUST={offset_value:.4f} MOVE=1"
         return await self._rest_request(
             "POST",
             "/printer/gcode/script",
@@ -323,18 +471,14 @@ class KlipperAdapter(PrinterAdapter):
         result = await self._rest_request("GET", "/printer/objects/query?print_stats")
         if result.status == CommandResultStatus.SUCCESS and result.data:
             state_str = result.data.get("print_stats", {}).get("state", "unknown")
-            return self.STATE_MAP.get(
-                state_str.lower(), NormalizedPrinterState.UNKNOWN
-            )
+            return self.STATE_MAP.get(state_str.lower(), NormalizedPrinterState.UNKNOWN)
         return NormalizedPrinterState.UNKNOWN
 
     async def get_print_progress(self) -> PrintProgress:
         """Get current print progress and state"""
         # Query comprehensive printer status
         result = await self._rest_request(
-            "GET",
-            "/printer/objects/query?"
-            "print_stats&heater_bed&extruder&toolhead"
+            "GET", "/printer/objects/query?print_stats&heater_bed&extruder&toolhead"
         )
 
         if result.status != CommandResultStatus.SUCCESS or not result.data:
@@ -388,18 +532,25 @@ class KlipperAdapter(PrinterAdapter):
         self,
         method: str,
         path: str,
+        timeout: int | None = 30,
         **kwargs,
     ) -> CommandResult:
         """Make REST request to Moonraker"""
         if not self._session:
-            return CommandResult(
-                CommandResultStatus.FAILURE, message="Not connected"
-            )
+            return CommandResult(CommandResultStatus.FAILURE, message="Not connected")
 
         url = f"{self._rest_base_url}{path}"
 
+        # Enforce timeout to prevent indefinite hangs (default 30s)
+        effective_timeout = timeout if timeout else 30
+        client_timeout = aiohttp.ClientTimeout(total=effective_timeout)
+
+        # Merge custom kwargs with timeout enforcement
+        request_kwargs = {"timeout": client_timeout}
+        request_kwargs.update(kwargs)
+
         try:
-            async with self._session.request(method, url, **kwargs) as resp:
+            async with self._session.request(method, url, **request_kwargs) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return CommandResult(
@@ -412,6 +563,10 @@ class KlipperAdapter(PrinterAdapter):
                         CommandResultStatus.FAILURE,
                         message=f"HTTP {resp.status}: {error_text}",
                     )
+        except TimeoutError:
+            return CommandResult(
+                CommandResultStatus.FAILURE, message=f"Request timeout after {timeout}s"
+            )
         except Exception as e:
             return CommandResult(
                 CommandResultStatus.FAILURE,
