@@ -5,32 +5,38 @@ Adapted from OpenClaw's src/infra/retry.ts and src/infra/backoff.ts patterns
 """
 
 import asyncio
+import math
 import random
-from typing import (
-    Callable,
-    TypeVar,
-    Awaitable,
-    Optional,
-    Tuple,
-    Type,
-)
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-
-T = TypeVar("T")
 
 
 @dataclass
 class BackoffPolicy:
     """Backoff policy configuration"""
-    base_delay: float = 2.0      # Initial delay in seconds
-    max_delay: float = 30.0      # Maximum delay in seconds
-    factor: float = 1.8          # Multiplicative factor
-    jitter: float = 0.25         # Jitter factor (0.0 to 1.0)
+
+    base_delay: float = 2.0  # Initial delay in seconds
+    max_delay: float = 30.0  # Maximum delay in seconds
+    factor: float = 1.8  # Multiplicative factor
+    jitter: float = 0.25  # Jitter factor (0.0 to 1.0)
+
+    def __post_init__(self):
+        """Validate policy parameters"""
+        if self.base_delay <= 0:
+            raise ValueError("base_delay must be positive")
+        if self.max_delay <= 0:
+            raise ValueError("max_delay must be positive")
+        if self.max_delay < self.base_delay:
+            raise ValueError("max_delay must be >= base_delay")
+        if self.factor <= 1.0:
+            raise ValueError("factor must be > 1.0")
+        if not (0.0 <= self.jitter <= 1.0):
+            raise ValueError("jitter must be in range [0.0, 1.0]")
 
 
 def compute_backoff(
     attempt: int,
-    policy: Optional[BackoffPolicy] = None,
+    policy: BackoffPolicy | None = None,
 ) -> float:
     """
     Compute backoff delay with exponential backoff and jitter
@@ -50,8 +56,16 @@ def compute_backoff(
     if policy is None:
         policy = BackoffPolicy()
 
+    # Cap attempt to prevent overflow in exponentiation
+    # After log(max_delay / base_delay) / log(factor) attempts,
+    # we've already reached max_delay, so further attempts don't matter
+    max_useful_attempts = (
+        int(math.log(policy.max_delay / policy.base_delay) / math.log(policy.factor)) + 1
+    )
+    capped_attempt = min(attempt, max_useful_attempts)
+
     # Exponential backoff
-    delay = policy.base_delay * (policy.factor ** attempt)
+    delay = policy.base_delay * (policy.factor**capped_attempt)
     delay = min(delay, policy.max_delay)
 
     # Add jitter
@@ -62,13 +76,13 @@ def compute_backoff(
     return delay
 
 
-async def retry_async(
+async def retry_async[T](
     fn: Callable[[], Awaitable[T]],
     *,
     max_attempts: int = 3,
-    policy: Optional[BackoffPolicy] = None,
-    retryable_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
-    on_retry: Optional[Callable[[int, Exception], None]] = None,
+    policy: BackoffPolicy | None = None,
+    retryable_exceptions: tuple[type[Exception], ...] | None = None,
+    on_retry: Callable[[int, Exception], None] | None = None,
 ) -> T:
     """
     Retry an async function with exponential backoff
@@ -92,7 +106,7 @@ async def retry_async(
     if retryable_exceptions is None:
         retryable_exceptions = (Exception,)
 
-    last_exception: Optional[Exception] = None
+    last_exception: Exception | None = None
 
     for attempt in range(max_attempts):
         try:
@@ -116,14 +130,14 @@ async def retry_async(
     raise last_exception  # type: ignore
 
 
-async def retry_async_with_reset(
+async def retry_async_with_reset[T](
     fn: Callable[[], Awaitable[T]],
     *,
     max_attempts: int = 3,
-    policy: Optional[BackoffPolicy] = None,
-    retryable_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
-    on_retry: Optional[Callable[[int, Exception], None]] = None,
-    on_success_reset: Optional[Callable[[], None]] = None,
+    policy: BackoffPolicy | None = None,
+    retryable_exceptions: tuple[type[Exception], ...] | None = None,
+    on_retry: Callable[[int, Exception], None] | None = None,
+    on_success_reset: Callable[[], None] | None = None,
 ) -> T:
     """
     Retry with automatic attempt counter reset on success

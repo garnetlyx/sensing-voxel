@@ -12,17 +12,18 @@ from pathlib import Path
 
 import yaml
 
-from sensing_voxel.config import Config
-from sensing_voxel.core.state_machine import AgentStateMachine
-from sensing_voxel.core.persistence import StatePersistence
-from sensing_voxel.bot.telegram import TelegramBot
 from sensing_voxel.adapters.klipper import KlipperAdapter
+from sensing_voxel.bot.telegram import TelegramBot
+from sensing_voxel.config import Config
+from sensing_voxel.core.persistence import StatePersistence
+from sensing_voxel.core.state_machine import AgentStateMachine
 
 
 async def shutdown(
     signal: signal.Signals,
     loop: asyncio.AbstractEventLoop,
     state_machine: AgentStateMachine,
+    persistence: StatePersistence,
 ) -> None:
     """Graceful shutdown handler."""
     print(f"Received exit signal {signal.name}...")
@@ -34,7 +35,7 @@ async def shutdown(
 
     # Persist final state
     try:
-        await state_machine.persist()
+        await state_machine.persist(persistence)
     except Exception as e:
         print(f"Error during final persistence: {e}")
 
@@ -47,7 +48,7 @@ async def main() -> None:
     """Main async entry point."""
     # Load configuration
     config_path = Path("config/default.yaml")
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         config_dict = yaml.safe_load(f)
 
     config = Config(**config_dict)
@@ -73,6 +74,8 @@ async def main() -> None:
         allowed_users=config.telegram.allowed_users,
         state_machine=state_machine,
         adapter=adapter,
+        config=config,
+        persistence=persistence,
     )
 
     # Set up signal handlers
@@ -80,7 +83,7 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
             sig,
-            lambda sig=sig: asyncio.create_task(shutdown(sig, loop, state_machine)),
+            lambda sig=sig: asyncio.create_task(shutdown(sig, loop, state_machine, persistence)),
         )
 
     # Start bot and adapter

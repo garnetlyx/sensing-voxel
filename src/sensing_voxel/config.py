@@ -3,16 +3,16 @@ Configuration management for Sensing Voxel
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List
 from pathlib import Path
 
 
 @dataclass
 class KlipperConfig:
     """Klipper/Moonraker adapter configuration"""
+
     host: str = "localhost"
     port: int = 7125
-    api_key: Optional[str] = None
+    api_key: str | None = None
     ws_reconnect_max_attempts: int = 10
     ws_reconnect_base_delay: float = 1.0
     ws_reconnect_max_delay: float = 30.0
@@ -24,14 +24,15 @@ class KlipperConfig:
 @dataclass
 class BambuConfig:
     """Bambu adapter configuration"""
+
     mqtt_host: str = "localhost"
     mqtt_port: int = 1883
-    mqtt_username: Optional[str] = None
-    mqtt_password: Optional[str] = None
+    mqtt_username: str | None = None
+    mqtt_password: str | None = None
     ftp_host: str = "localhost"
     ftp_port: int = 21
-    ftp_username: Optional[str] = None
-    ftp_password: Optional[str] = None
+    ftp_username: str | None = None
+    ftp_password: str | None = None
     mqtt_reconnect_max_attempts: int = 10
     mqtt_reconnect_base_delay: float = 1.0
     mqtt_reconnect_max_delay: float = 30.0
@@ -40,8 +41,9 @@ class BambuConfig:
 @dataclass
 class TelegramConfig:
     """Telegram bot configuration"""
+
     bot_token: str
-    allowed_users: List[int] = field(default_factory=list)
+    allowed_users: list[int] = field(default_factory=list)
     approval_timeout_seconds: int = 600  # 10 minutes
     NOTHING: int = 300  # 5 minutes
 
@@ -49,6 +51,7 @@ class TelegramConfig:
 @dataclass
 class CameraConfig:
     """Camera configuration"""
+
     rtsp_url: str
     calibration_expiry_days: int = 30
     frame_width: int = 1920
@@ -59,14 +62,16 @@ class CameraConfig:
 @dataclass
 class SlicerConfig:
     """Slicer configuration"""
+
     prusaslicer_path: str = "prusa-slicer"
-    profile_path: Optional[str] = None
+    profile_path: str | None = None
     output_dir: str = "data/sliced"
 
 
 @dataclass
 class StorageConfig:
     """Storage configuration"""
+
     data_dir: str = "data"
     state_file: str = "agent_state.json"
     calibration_dir: str = "calibration"
@@ -77,10 +82,11 @@ class StorageConfig:
 @dataclass
 class Config:
     """Main configuration"""
-    klipper: Optional[KlipperConfig] = None
-    bambu: Optional[BambuConfig] = None
+
+    klipper: KlipperConfig | None = None
+    bambu: BambuConfig | None = None
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
-    camera: Optional[CameraConfig] = None
+    camera: CameraConfig | None = None
     slicer: SlicerConfig = field(default_factory=SlicerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     debug: bool = False
