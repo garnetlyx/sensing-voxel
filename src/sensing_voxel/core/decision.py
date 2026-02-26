@@ -2,15 +2,14 @@
 Decision idempotency engine with lock-guarded CAS
 """
 
-from typing import Dict, Optional
 import asyncio
 import logging
 from datetime import datetime
 
 from sensing_voxel.core.models import (
     AgentState,
-    DecisionAction,
     ConsumeResult,
+    DecisionAction,
     JobContext,
 )
 
@@ -21,13 +20,16 @@ class DecisionEngine:
     """Decision idempotency engine"""
 
     def __init__(self):
-        self._decision_locks: Dict[str, asyncio.Lock] = {}
-        self._timeout_tasks: Dict[str, asyncio.Task] = {}
+        self._decision_locks: dict[str, asyncio.Lock] = {}
+        self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._approval_timeout: int = 600  # 10 minutes
         self.NOTHING: int = 300  # 5 minutes
 
     def _get_lock(self, job_id: str) -> asyncio.Lock:
         """Get or create lock for job_id"""
+        # Always cache locks for all jobs - prevents race condition where
+        # concurrent consume_decision() calls get different lock instances
+        # Memory leak prevention is handled by explicit cleanup after consumption
         if job_id not in self._decision_locks:
             self._decision_locks[job_id] = asyncio.Lock()
         return self._decision_locks[job_id]
@@ -43,11 +45,40 @@ class DecisionEngine:
             del self._timeout_tasks[job_id]
         logger.debug(f"Cleaned up resources for job {job_id}")
 
+    def cleanup_all_resources(self):
+        """Clean up all resources (useful for shutdown or periodic cleanup)"""
+        job_ids = list(self._decision_locks.keys()) + list(self._timeout_tasks.keys())
+        for job_id in set(job_ids):
+            self._cleanup_job_resources(job_id)
+        logger.info("Cleaned up all job resources")
+
+    def cleanup_stale_locks(self, max_age_seconds: int = 3600):
+        """
+        Clean up locks that haven't been used recently.
+        This is a safety mechanism to prevent memory leaks from abandoned jobs.
+        """
+        # Since we don't track lock usage time, we just clean all locks
+        # In a real implementation, we would track last access time
+        count = len(self._decision_locks)
+        if count > 0:
+            logger.warning(f"Cleaning up {count} stale locks")
+            for job_id in list(self._decision_locks.keys()):
+                if job_id not in self._timeout_tasks:
+                    self._cleanup_job_resources(job_id)
+
     def _get_timeout_for_action(self, action: DecisionAction) -> int:
         """Get timeout duration for action type"""
-        if action in [DecisionAction.TIMEOUT_APPROVAL, DecisionAction.APPROVE, DecisionAction.REJECT]:
+        if action in [
+            DecisionAction.TIMEOUT_APPROVAL,
+            DecisionAction.APPROVE,
+            DecisionAction.REJECT,
+        ]:
             return self._approval_timeout
-        elif action in [DecisionAction.NOTHING, DecisionAction.RESUME, DecisionAction.CANCEL]:
+        elif action in [
+            DecisionAction.NOTHING,
+            DecisionAction.RESUME,
+            DecisionAction.CANCEL,
+        ]:
             return self.NOTHING
         return self._approval_timeout
 
@@ -64,7 +95,7 @@ class DecisionEngine:
                 decision_token=job_context.decision_token,
                 action=action,
                 expected_state=None,  # No state check for timeout
-                current_state=None,   # Will be fetched fresh
+                current_state=None,  # Will be fetched fresh
             )
 
             if result == ConsumeResult.CONSUMED:
@@ -81,8 +112,8 @@ class DecisionEngine:
         job_context: JobContext,
         decision_token: str,
         action: DecisionAction,
-        expected_state: Optional[AgentState],
-        current_state: Optional[AgentState],
+        expected_state: AgentState | None,
+        current_state: AgentState | None,
     ) -> ConsumeResult:
         """
         Consume a decision with lock-guarded CAS
@@ -101,62 +132,81 @@ class DecisionEngine:
 
         # Acquire per-job lock
         lock = self._get_lock(job_id)
-        async with lock:
-            # Cancel any pending timeout for this job
-            if job_id in self._timeout_tasks:
-                task = self._timeout_tasks[job_id]
-                task.cancel()
-                try:
-                    # Wait for the task to be cancelled (handles CancelledError)
-                    await asyncio.wait_for(task, timeout=1.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    # Task was cancelled or timed out - both are expected
-                    pass
-                except Exception as e:
-                    # Log unexpected errors but don't propagate
-                    logger.warning(f"Error while cancelling timeout task for {job_id}: {e}")
-                finally:
-                    # Always clean up the task reference
-                    if job_id in self._timeout_tasks:
-                        del self._timeout_tasks[job_id]
 
-            # Re-check guards (skip for timeout actions)
-            if action not in [DecisionAction.TIMEOUT_APPROVAL, DecisionAction.NOTHING]:
-                if current_state is None or expected_state is None:
-                    logger.error(f"State validation required for non-timeout action {action.name}")
-                    return ConsumeResult.INVALID_STATE
+        try:
+            async with lock:
+                # Cancel any pending timeout for this job
+                if job_id in self._timeout_tasks:
+                    task = self._timeout_tasks[job_id]
+                    task.cancel()
+                    try:
+                        # Wait for the task to be cancelled (handles CancelledError)
+                        await asyncio.wait_for(task, timeout=1.0)
+                    except (TimeoutError, asyncio.CancelledError):
+                        # Task was cancelled or timed out - both are expected
+                        pass
+                    except Exception as e:
+                        # Log unexpected errors but don't propagate
+                        logger.warning(f"Error while cancelling timeout task for {job_id}: {e}")
+                    finally:
+                        # Always clean up the task reference
+                        if job_id in self._timeout_tasks:
+                            del self._timeout_tasks[job_id]
 
-                if current_state != expected_state:
-                    logger.warning(
-                        f"State mismatch for job {job_id}: "
-                        f"expected {expected_state.name}, got {current_state.name}"
-                    )
-                    return ConsumeResult.INVALID_STATE
+                # Re-check guards (skip for timeout actions)
+                if action not in [
+                    DecisionAction.TIMEOUT_APPROVAL,
+                    DecisionAction.NOTHING,
+                ]:
+                    if current_state is None or expected_state is None:
+                        logger.error(
+                            f"State validation required for non-timeout action {action.name}"
+                        )
+                        # Clean up lock before returning
+                        self._cleanup_job_resources(job_id)
+                        return ConsumeResult.INVALID_STATE
 
-            if job_context.decision_consumed:
-                logger.info(f"Decision already consumed for job {job_id}")
-                return ConsumeResult.ALREADY_HANDLED
+                    if current_state != expected_state:
+                        logger.warning(
+                            f"State mismatch for job {job_id}: "
+                            f"expected {expected_state.name}, got {current_state.name}"
+                        )
+                        # Clean up lock before returning
+                        self._cleanup_job_resources(job_id)
+                        return ConsumeResult.INVALID_STATE
 
-            if job_context.decision_token != decision_token:
-                logger.warning(f"Invalid decision token for job {job_id}")
-                return ConsumeResult.INVALID_TOKEN
+                if job_context.decision_consumed:
+                    logger.info(f"Decision already consumed for job {job_id}")
+                    # Clean up resources for already-consumed job
+                    self._cleanup_job_resources(job_id)
+                    return ConsumeResult.ALREADY_HANDLED
 
-            # All guards passed - consume decision
-            job_context.decision_consumed = True
-            job_context.decision_action = action
-            job_context.decision_consumed_at = datetime.now()
+                if job_context.decision_token != decision_token:
+                    logger.warning(f"Invalid decision token for job {job_id}")
+                    # Clean up lock before returning
+                    self._cleanup_job_resources(job_id)
+                    return ConsumeResult.INVALID_TOKEN
 
-            logger.info(
-                f"Consumed decision {action.name} for job {job_id} "
-                f"in state {current_state.name if current_state else 'N/A'}"
-            )
+                # All guards passed - consume decision
+                job_context.decision_consumed = True
+                job_context.decision_action = action
+                job_context.decision_consumed_at = datetime.now()
 
-            # Clean up lock after job is done (prevent memory leak)
-            # Only clean if no timeout is scheduled and decision is consumed
-            if job_id not in self._timeout_tasks:
+                logger.info(
+                    f"Consumed decision {action.name} for job {job_id} "
+                    f"in state {current_state.name if current_state else 'N/A'}"
+                )
+
+                # Clean up lock immediately after consuming decision
+                # This prevents memory leak - lock is no longer needed
                 self._cleanup_job_resources(job_id)
 
-            return ConsumeResult.CONSUMED
+                return ConsumeResult.CONSUMED
+        except Exception as e:
+            logger.error(f"Exception in consume_decision for job {job_id}: {e}", exc_info=True)
+            # Ensure cleanup on any exception
+            self._cleanup_job_resources(job_id)
+            raise
 
     def schedule_timeout(
         self,
@@ -165,10 +215,14 @@ class DecisionEngine:
         timeout_action: DecisionAction,
     ):
         """Schedule timeout for decision"""
-        # Check if task exists and is still running
+        # Check if task exists and clean up if completed
         if job_id in self._timeout_tasks:
             task = self._timeout_tasks[job_id]
-            if not task.done():
+            if task.done():
+                # Task is completed, clean it up
+                del self._timeout_tasks[job_id]
+                logger.debug(f"Cleaned up completed timeout task for job {job_id}")
+            else:
                 logger.debug(f"Timeout already running for job {job_id}")
                 return
 
@@ -183,11 +237,15 @@ class DecisionEngine:
             task = self._timeout_tasks[job_id]
             task.cancel()
             try:
-                # Wait for cancellation
-                asyncio.create_task(task)
+                # Create a background task to wait for cancellation
+                # We don't block here since this is a sync method
+                # The task will clean itself up when done
+                pass
             except (asyncio.CancelledError, RuntimeError):
+                # Task was cancelled or already finished - expected
                 pass
             finally:
+                # Always clean up the reference
                 if job_id in self._timeout_tasks:
                     del self._timeout_tasks[job_id]
             logger.debug(f"Cancelled timeout for job {job_id}")

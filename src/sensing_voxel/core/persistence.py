@@ -5,12 +5,11 @@ Adapted from OpenClaw's src/config/sessions/store.ts pattern
 """
 
 import json
-import tempfile
-from pathlib import Path
 import logging
 import signal
-from typing import Optional
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from filelock import SoftFileLock
 
@@ -25,8 +24,8 @@ class StatePersistence:
 
     def __init__(self, state_file: Path):
         self.state_file = state_file
-        self._lock_file: Optional[Path] = None
-        self._lock_instance: Optional[SoftFileLock] = None
+        self._lock_file: Path | None = None
+        self._lock_instance: SoftFileLock | None = None
 
         # Ensure parent directory exists
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -38,8 +37,10 @@ class StatePersistence:
     def _signal_handler(self, signum, frame):
         """Handle signals for lock cleanup"""
         logger.info(f"Received signal {signum}, cleaning up")
-        # Don't exit in signal handler - raise exception instead
-        raise SystemExit(f"Signal {signum} received, shutting down gracefully")
+        # Don't exit in signal handler - signal handler can't safely raise exceptions
+        # Instead, we rely on the finally blocks in save/load to release locks
+        # and let the main process handle the signal gracefully
+        pass
 
     def _acquire_lock(self):
         """Acquire file lock"""
@@ -76,22 +77,12 @@ class StatePersistence:
                 "job_id": jc.job_id,
                 "job_file": jc.job_file,
                 "uploaded_at": jc.uploaded_at.isoformat(),
-                "expires_at": (
-                    jc.expires_at.isoformat()
-                    if jc.expires_at
-                    else None
-                ),
+                "expires_at": (jc.expires_at.isoformat() if jc.expires_at else None),
                 "decision_token": jc.decision_token,
                 "decision_consumed": jc.decision_consumed,
-                "decision_action": (
-                    jc.decision_action.name
-                    if jc.decision_action
-                    else None
-                ),
+                "decision_action": (jc.decision_action.name if jc.decision_action else None),
                 "decision_consumed_at": (
-                    jc.decision_consumed_at.isoformat()
-                    if jc.decision_consumed_at
-                    else None
+                    jc.decision_consumed_at.isoformat() if jc.decision_consumed_at else None
                 ),
                 "gcode_path": jc.gcode_path,
             }
@@ -109,10 +100,19 @@ class StatePersistence:
 
     def _from_dict(self, data: dict) -> AgentStateMachine:
         """Create state machine from dict"""
-        from sensing_voxel.core.models import JobContext, DecisionAction
+        from sensing_voxel.core.models import DecisionAction, JobContext
+
+        # Validate required fields
+        if "current_state" not in data:
+            logger.error("Missing required field 'current_state' in state data")
+            raise ValueError("Missing required field: current_state")
 
         state_machine = AgentStateMachine()
-        state_machine.current_state = AgentState[data["current_state"]]
+        try:
+            state_machine.current_state = AgentState[data["current_state"]]
+        except KeyError as err:
+            logger.error(f"Invalid state value: {data['current_state']}")
+            raise ValueError(f"Invalid state value: {data['current_state']}") from err
 
         job_data = data.get("job_context")
         if job_data:
@@ -142,9 +142,7 @@ class StatePersistence:
 
         state_machine.last_error_summary = data.get("last_error_summary")
         state_machine.z_offset_dirty = data.get("z_offset_dirty", False)
-        state_machine.last_known_z_offset_baseline = data.get(
-            "last_known_z_offset_baseline"
-        )
+        state_machine.last_known_z_offset_baseline = data.get("last_known_z_offset_baseline")
         state_machine.moonraker_compat_mode = data.get("moonraker_compat_mode", False)
         state_machine.external_print = data.get("external_print", False)
 
@@ -176,7 +174,7 @@ class StatePersistence:
         finally:
             self._release_lock()
 
-    def load(self) -> Optional[AgentStateMachine]:
+    def load(self) -> AgentStateMachine | None:
         """Load state machine from file"""
         if not self.state_file.exists():
             logger.info("No state file found, starting fresh")
@@ -184,7 +182,7 @@ class StatePersistence:
 
         self._acquire_lock()
         try:
-            with open(self.state_file, "r") as f:
+            with open(self.state_file) as f:
                 state_dict = json.load(f)
 
             state_machine = self._from_dict(state_dict)

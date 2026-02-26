@@ -6,16 +6,17 @@ Enums, data classes, and event types used across components.
 
 from __future__ import annotations
 
-from enum import Enum, auto
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Tuple, List
-from datetime import datetime, timedelta
-from pathlib import Path
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any
 
 
 class AgentState(Enum):
     """Agent state machine states"""
+
     IDLE = auto()
     RECEIVING = auto()
     SLICING = auto()
@@ -32,6 +33,7 @@ class AgentState(Enum):
 
 class NormalizedPrinterState(Enum):
     """Normalized printer states across adapters"""
+
     PRINTING = auto()
     PAUSED = auto()
     IDLE_NO_ACTIVE_PRINT = auto()
@@ -42,6 +44,7 @@ class NormalizedPrinterState(Enum):
 
 class DecisionAction(Enum):
     """Decision actions from user or timeout"""
+
     APPROVE = auto()
     REJECT = auto()
     RESUME = auto()
@@ -52,6 +55,7 @@ class DecisionAction(Enum):
 
 class ConsumeResult(Enum):
     """Result of consume_decision()"""
+
     CONSUMED = auto()
     ALREADY_HANDLED = auto()
     INVALID_STATE = auto()
@@ -61,6 +65,7 @@ class ConsumeResult(Enum):
 
 class FileValidationStatus(Enum):
     """File validation status"""
+
     VALID = auto()
     INVALID_TYPE = auto()
     TOO_LARGE = auto()
@@ -69,6 +74,7 @@ class FileValidationStatus(Enum):
 
 class SlicingStatus(Enum):
     """Slicing pipeline status"""
+
     PENDING = auto()
     IN_PROGRESS = auto()
     SUCCESS = auto()
@@ -78,6 +84,7 @@ class SlicingStatus(Enum):
 
 class VisionConfidenceLevel(Enum):
     """Vision confidence levels"""
+
     HIGH = auto()  # >0.85
     MODERATE = auto()  # 0.6-0.85
     LOW = auto()  # <0.6
@@ -85,6 +92,7 @@ class VisionConfidenceLevel(Enum):
 
 class FirstLayerQuality(Enum):
     """First layer quality classification"""
+
     EXCELLENT = auto()
     GOOD = auto()
     ACCEPTABLE = auto()
@@ -93,6 +101,7 @@ class FirstLayerQuality(Enum):
 
 class NOTHING(Enum):
     """NOTHING detection decision"""
+
     CONTINUE = auto()  # No action
     PAUSE_FOR_REVIEW = auto()  # Moderate confidence
     EMERGENCY_CANCEL = auto()  # High confidence
@@ -100,6 +109,7 @@ class NOTHING(Enum):
 
 class CalibrationStatus(Enum):
     """Camera calibration status"""
+
     VALID = auto()
     EXPIRED = auto()
     MISSING = auto()
@@ -108,6 +118,7 @@ class CalibrationStatus(Enum):
 
 class ZOffsetStatus(Enum):
     """Z-offset status"""
+
     CLEAN = auto()
     DIRTY = auto()
     UNKNOWN = auto()
@@ -115,6 +126,7 @@ class ZOffsetStatus(Enum):
 
 class CommandResultStatus(Enum):
     """Command execution status"""
+
     SUCCESS = auto()
     FAILURE = auto()
     NOT_SUPPORTED = auto()
@@ -123,63 +135,87 @@ class CommandResultStatus(Enum):
 @dataclass
 class JobContext:
     """Context for a print job"""
+
     job_id: str
     job_file: str  # Path to STL or G-code
     uploaded_at: datetime
-    expires_at: Optional[datetime] = None
-    decision_token: Optional[str] = None
+    expires_at: datetime | None = None
+    decision_token: str | None = None
     decision_consumed: bool = False
-    decision_action: Optional[DecisionAction] = None
-    decision_consumed_at: Optional[datetime] = None
-    gcode_path: Optional[str] = None
-    gcode_hash: Optional[str] = None
-    first_layer_params: Optional["FirstLayerParams"] = None
-    first_layer_bounds: Optional["FirstLayerBounds"] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    decision_action: DecisionAction | None = None
+    decision_consumed_at: datetime | None = None
+    gcode_path: str | None = None
+    gcode_hash: str | None = None
+    first_layer_params: FirstLayerParams | None = None
+    first_layer_bounds: FirstLayerBounds | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     slicing_status: SlicingStatus = SlicingStatus.PENDING
     file_validation_status: FileValidationStatus = FileValidationStatus.VALID
     is_external: bool = False  # True for externally-started prints
     external_monitoring: bool = False  # Policy flag (True for external prints)
 
+    # Immutable fields that should not be modified after creation
+    _immutable_fields = {"job_id", "job_file", "uploaded_at", "decision_token"}
+
+    def __post_init__(self):
+        """Validate job_id is safe for file path usage"""
+        if not self.job_id:
+            raise ValueError("job_id cannot be empty")
+        # Ensure job_id doesn't contain path traversal sequences
+        if "/" in self.job_id or "\\" in self.job_id or ".." in self.job_id:
+            raise ValueError(
+                f"job_id contains invalid characters for safe file path usage: {self.job_id}"
+            )
+
+    def __setattr__(self, key, value):
+        # Block modification of immutable fields after initialization
+        if key in self._immutable_fields and key in self.__dict__:
+            raise AttributeError(f"Cannot modify immutable field '{key}'")
+        super().__setattr__(key, value)
+
 
 @dataclass
 class PrintProgress:
     """Printer progress information"""
+
     state: NormalizedPrinterState
-    filename: Optional[str] = None
-    progress: Optional[float] = None  # 0.0 to 1.0
-    print_time: Optional[float] = None  # seconds
-    current_layer: Optional[int] = None
-    total_layers: Optional[int] = None
-    nozzle_temp: Optional[float] = None
-    nozzle_target: Optional[float] = None
-    bed_temp: Optional[float] = None
-    bed_target: Optional[float] = None
+    filename: str | None = None
+    progress: float | None = None  # 0.0 to 1.0
+    print_time: float | None = None  # seconds
+    current_layer: int | None = None
+    total_layers: int | None = None
+    nozzle_temp: float | None = None
+    nozzle_target: float | None = None
+    bed_temp: float | None = None
+    bed_target: float | None = None
 
 
 @dataclass
 class TelemetryData:
     """Real-time telemetry from printer"""
+
     timestamp: datetime
-    temperatures: Dict[str, float] = field(default_factory=dict)
-    position: Optional[Dict[str, float]] = None
-    velocity: Optional[float] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    temperatures: dict[str, float] = field(default_factory=dict)
+    position: dict[str, float] | None = None
+    velocity: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class FirstLayerParams:
     """First layer parameters from G-code"""
+
     layer_height: float
     nozzle_temp: float
     bed_temp: float
     speed: float
-    fan_speed: Optional[float] = None
+    fan_speed: float | None = None
 
 
 @dataclass
 class FirstLayerBounds:
     """Bounding box of first layer moves"""
+
     min_x: float
     max_x: float
     min_y: float
@@ -201,13 +237,15 @@ class FirstLayerBounds:
 @dataclass
 class CommandResult:
     """Result of a printer command"""
+
     status: CommandResultStatus
-    message: Optional[str] = None
-    data: Optional[Any] = None
+    message: str | None = None
+    data: Any | None = None
 
 
 class AdapterCommandError(Exception):
     """Printer adapter command error"""
+
     def __init__(self, message: str, retryable: bool = False):
         super().__init__(message)
         self.retryable = retryable
@@ -215,6 +253,7 @@ class AdapterCommandError(Exception):
 
 class AdapterConnectionError(Exception):
     """Printer adapter connection error"""
+
     pass
 
 
@@ -224,14 +263,15 @@ class AdapterConnectionError(Exception):
 @dataclass
 class HomographyMatrix:
     """Camera homography matrix for bed calibration"""
-    matrix: List[List[float]]  # 3x3 matrix
-    mm_per_pixel: float
-    camera_id: Optional[str] = None
-    calibration_timestamp: datetime = field(default_factory=datetime.now)
-    valid_until: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def is_valid(self, now: Optional[datetime] = None) -> bool:
+    matrix: list[list[float]]  # 3x3 matrix
+    mm_per_pixel: float
+    camera_id: str | None = None
+    calibration_timestamp: datetime = field(default_factory=datetime.now)
+    valid_until: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def is_valid(self, now: datetime | None = None) -> bool:
         """Check if calibration is still valid"""
         now = now or datetime.now()
         if self.valid_until is None:
@@ -242,19 +282,21 @@ class HomographyMatrix:
 @dataclass
 class CameraCalibration:
     """Complete camera calibration artifact"""
+
     homography: HomographyMatrix
-    roi_points: Optional[List[Tuple[float, float]]] = None  # Checkerboard corners
-    error_mm: Optional[float] = None  # Reprojection error
-    notes: Optional[str] = None
+    roi_points: list[tuple[float, float]] | None = None  # Checkerboard corners
+    error_mm: float | None = None  # Reprojection error
+    notes: str | None = None
 
 
 @dataclass
 class NOTHING:
     """Result of NOTHING detection inference"""
+
     confidence: float  # 0.0 to 1.0
-    bounding_box: Optional[Tuple[float, float, float, float]] = None  # x, y, w, h
+    bounding_box: tuple[float, float, float, float] | None = None  # x, y, w, h
     timestamp: datetime = field(default_factory=datetime.now)
-    frame_id: Optional[int] = None
+    frame_id: int | None = None
 
     @property
     def confidence_level(self) -> VisionConfidenceLevel:
@@ -270,23 +312,25 @@ class NOTHING:
 @dataclass
 class FirstLayerAnalysisResult:
     """Result of first-layer quality analysis"""
+
     quality: FirstLayerQuality
     confidence: float  # 0.0 to 1.0
-    coverage_ratio: Optional[float] = None  # ROI coverage (0.0 to 1.0)
-    defects: List[str] = field(default_factory=list)  # e.g., ["under_extrusion", "gaps"]
+    coverage_ratio: float | None = None  # ROI coverage (0.0 to 1.0)
+    defects: list[str] = field(default_factory=list)  # e.g., ["under_extrusion", "gaps"]
     timestamp: datetime = field(default_factory=datetime.now)
-    roi: Optional[Tuple[float, float, float, float]] = None  # x, y, w, h
+    roi: tuple[float, float, float, float] | None = None  # x, y, w, h
 
 
 @dataclass
 class VisionFrame:
     """Single frame from camera stream"""
+
     frame_data: Any  # OpenCV Mat or bytes
     timestamp: datetime = field(default_factory=datetime.now)
     frame_id: int = 0
     width: int = 0
     height: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # --- Monitoring & Z-Offset Models ---
@@ -295,11 +339,12 @@ class VisionFrame:
 @dataclass
 class ZOffsetState:
     """Z-offset state tracking"""
-    baseline_offset: Optional[float] = None  # Original baseline at print start
+
+    baseline_offset: float | None = None  # Original baseline at print start
     current_offset: float = 0.0  # Cumulative applied offset
-    last_known_baseline: Optional[float] = None  # Persistent across restarts
+    last_known_baseline: float | None = None  # Persistent across restarts
     status: ZOffsetStatus = ZOffsetStatus.CLEAN
-    dirty_since: Optional[datetime] = None
+    dirty_since: datetime | None = None
 
     @property
     def is_dirty(self) -> bool:
@@ -315,6 +360,7 @@ class ZOffsetState:
 @dataclass
 class MonitoringConfig:
     """Monitoring configuration for active print"""
+
     NOTHING: bool = True
     enable_first_layer: bool = True  # Only for agent-started jobs
     evaluation_interval_seconds: int = 5
@@ -330,13 +376,14 @@ class MonitoringConfig:
 @dataclass
 class MonitoringStats:
     """Monitoring statistics during active print"""
+
     frames_processed: int = 0
     NOTHING: int = 0
     first_layer_evaluations: int = 0
     z_offset_corrections: int = 0
-    NOTHING: Optional[datetime] = None
-    last_first_layer_timestamp: Optional[datetime] = None
-    first_layer_active_until_layer: Optional[int] = None  # Stop after this layer
+    NOTHING: datetime | None = None
+    last_first_layer_timestamp: datetime | None = None
+    first_layer_active_until_layer: int | None = None  # Stop after this layer
 
 
 # --- Slicer & Geometry Models ---
@@ -345,26 +392,28 @@ class MonitoringStats:
 @dataclass
 class SlicingResult:
     """Result of slicing operation"""
+
     gcode_path: Path
     gcode_hash: str
-    first_layer_params: Optional[FirstLayerParams] = None
-    first_layer_bounds: Optional[FirstLayerBounds] = None
-    estimated_print_time: Optional[timedelta] = None
-    estimated_filament_mm: Optional[float] = None
-    warnings: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    first_layer_params: FirstLayerParams | None = None
+    first_layer_bounds: FirstLayerBounds | None = None
+    estimated_print_time: timedelta | None = None
+    estimated_filament_mm: float | None = None
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class GeometryAnalysis:
     """Geometry analysis of STL model"""
+
     has_overhangs: bool
     has_bridges: bool
     has_thin_walls: bool
-    max_overhang_angle: Optional[float] = None  # degrees
-    wall_thickness_min_mm: Optional[float] = None
-    bounding_box: Optional[FirstLayerBounds] = None
-    warnings: List[str] = field(default_factory=list)
+    max_overhang_angle: float | None = None  # degrees
+    wall_thickness_min_mm: float | None = None
+    bounding_box: FirstLayerBounds | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 # --- Telegram Bot Models ---
@@ -373,28 +422,31 @@ class GeometryAnalysis:
 @dataclass
 class TelegramUser:
     """Telegram user information"""
+
     user_id: int
-    username: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     is_authorized: bool = False
 
 
 @dataclass
 class BotMessage:
     """Telegram bot message"""
+
     chat_id: int
     text: str
-    message_id: Optional[int] = None
-    reply_to_message_id: Optional[int] = None
+    message_id: int | None = None
+    reply_to_message_id: int | None = None
     parse_mode: str = "HTML"  # "HTML" or "Markdown"
     disable_web_page_preview: bool = True
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class DecisionTimeout:
     """Decision timeout configuration"""
+
     decision_type: DecisionAction
     timeout_seconds: int
     job_id: str
