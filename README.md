@@ -10,6 +10,7 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 - 📸 **Camera Calibration**: Checkerboard-based bed-level calibration
 - 🖨️ **Multi-Printer Support**: Klipper/Moonraker and Bambu printers
 - 🛡️ **External Print Detection**: Monitor prints started outside the agent
+- 📊 **Web Dashboard**: Real-time monitoring UI with WebSocket updates
 
 ## Architecture
 
@@ -41,14 +42,16 @@ Telegram Bot <-> Agent Core (state machine + policy + decision engine)
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/sensing-voxel.git
+git clone https://github.com/garnetlyx/sensing-voxel.git
 cd sensing-voxel
 ```
 
-2. Install dependencies:
+2. Create virtual environment and install:
 
 ```bash
-pip install -e .
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
 3. Configure:
@@ -61,6 +64,7 @@ cp config/default.yaml config/local.yaml
 4. Run:
 
 ```bash
+source .venv/bin/activate
 python -m sensing_voxel.main
 ```
 
@@ -106,6 +110,8 @@ sensing-voxel/
 │       ├── core/                    # Core state machine
 │       ├── adapters/                # Printer adapters
 │       ├── bot/                     # Telegram bot
+│       ├── api/                     # Dashboard REST/WS API
+│       ├── dashboard/               # Dashboard static files
 │       ├── slicer/                  # Slicing pipeline
 │       ├── vision/                  # Vision processing
 │       └── monitoring/              # Print monitoring
@@ -123,16 +129,30 @@ sensing-voxel/
 
 ## Roadmap
 
+- **Phase 0**: Stabilization (environment, compilation errors, critical bugs)
+  - [x] Fix development environment (venv + pip install)
+  - [x] Fix compilation errors (bambu.py, klipper.py, command_queue.py)
+  - [x] Bug triage & deduplication
+  - [x] Fix CRITICAL security bugs (G-code injection, path traversal, job ID collision)
+  - [x] Fix HIGH severity bugs
+
 - **Phase 1 (MVP)**: Core agent-started print workflow
   - [x] Project scaffolding
-  - [ ] Core data models
-  - [ ] State machine
-  - [ ] Decision engine
-  - [ ] State persistence
-  - [ ] Klipper adapter
-  - [ ] Telegram bot
+  - [x] Core data models
+  - [x] State machine
+  - [x] Decision engine
+  - [x] State persistence
+  - [x] Printer adapter interface
+  - [x] External print detection
+  - [ ] Klipper adapter (~70%)
+  - [ ] Bambu adapter (~80%, blocked by compilation error)
+  - [ ] Telegram bot (~50%)
   - [ ] Slicer pipeline
-  - [ ] Vision monitoring
+  - [ ] Vision: NOTHING detection
+  - [ ] Vision: camera calibration
+  - [ ] Vision: first-layer classifier
+  - [ ] Print monitoring orchestrator (~60%)
+  - [ ] Integration tests
 
 - **Phase 2**: Enhancements
   - Full Bambu adapter parity
@@ -143,7 +163,7 @@ sensing-voxel/
 
 - **Phase 3**: Polish
   - Multi-printer queue scheduling
-  - Dashboard UI
+  - [x] Dashboard UI
   - Predictive maintenance
 
 ## License

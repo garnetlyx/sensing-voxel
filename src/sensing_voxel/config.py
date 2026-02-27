@@ -80,6 +80,19 @@ class StorageConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """Web dashboard configuration"""
+
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+    api_token: str | None = None  # None = no auth (dev mode)
+    camera_rtsp_url: str | None = None
+    camera_mjpeg_fps: int = 5
+    camera_mjpeg_quality: int = 80
+
+
+@dataclass
 class Config:
     """Main configuration"""
 
@@ -89,6 +102,7 @@ class Config:
     camera: CameraConfig | None = None
     slicer: SlicerConfig = field(default_factory=SlicerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     debug: bool = False
 
     @property

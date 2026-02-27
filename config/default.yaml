@@ -55,6 +55,17 @@ slicer:
   profile_path: null
   output_dir: "data/sliced"
 
+# Dashboard Configuration (optional)
+# Uncomment to enable the web dashboard
+# dashboard:
+#   enabled: true
+#   host: "0.0.0.0"
+#   port: 8080
+#   api_token: null            # Set a token to require Bearer auth (null = no auth)
+#   camera_rtsp_url: null      # RTSP URL for MJPEG camera proxy
+#   camera_mjpeg_fps: 5
+#   camera_mjpeg_quality: 80
+
 # Storage Configuration
 storage:
   data_dir: "data"

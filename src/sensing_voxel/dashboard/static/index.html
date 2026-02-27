@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sensing Voxel</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="header-logo">Sensing <span>Voxel</span></div>
+      <div class="state-badge header-state-badge idle">Idle</div>
+    </div>
+    <div class="header-right">
+      <div class="connection-dot"></div>
+      <span class="connection-label">Disconnected</span>
+    </div>
+  </header>
+
+  <!-- Dashboard grid -->
+  <main class="dashboard-grid">
+
+    <!-- State panel -->
+    <section class="card state-panel">
+      <div class="card-header">
+        <span class="card-title">Agent State</span>
+      </div>
+      <div class="state-value" id="agent-state">Idle</div>
+      <div class="state-detail">
+        <span class="state-detail-label">Printer</span>
+        <span class="state-detail-value" id="printer-connection">Disconnected</span>
+      </div>
+      <div class="state-detail">
+        <span class="state-detail-label">Z-Offset</span>
+        <span class="state-detail-value" id="z-offset-status">Clean</span>
+      </div>
+      <div class="state-detail">
+        <span class="state-detail-label">External Print</span>
+        <span class="state-detail-value" id="external-print">No</span>
+      </div>
+    </section>
+
+    <!-- Job panel -->
+    <section class="card job-panel">
+      <div class="card-header">
+        <span class="card-title">Current Job</span>
+      </div>
+      <div class="job-content">
+        <p class="no-job">No active job</p>
+      </div>
+    </section>
+
+    <!-- Temps panel -->
+    <section class="card temps-panel">
+      <div class="card-header">
+        <span class="card-title">Temperatures</span>
+      </div>
+      <div class="temp-row">
+        <div>
+          <div class="temp-label">Nozzle</div>
+          <div>
+            <span class="temp-value" id="nozzle-temp">--</span>
+            <span class="temp-target" id="nozzle-target">/ --</span>
+          </div>
+          <div class="temp-bar-container">
+            <div class="temp-bar">
+              <div class="temp-bar-fill nozzle" id="nozzle-bar" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="temp-row">
+        <div>
+          <div class="temp-label">Bed</div>
+          <div>
+            <span class="temp-value" id="bed-temp">--</span>
+            <span class="temp-target" id="bed-target">/ --</span>
+          </div>
+          <div class="temp-bar-container">
+            <div class="temp-bar">
+              <div class="temp-bar-fill bed" id="bed-bar" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Camera panel -->
+    <section class="card camera-panel">
+      <div class="card-header">
+        <span class="card-title">Camera</span>
+      </div>
+      <div class="camera-container">
+        <div class="camera-placeholder" id="camera-view">
+          Camera not available
+        </div>
+      </div>
+    </section>
+
+    <!-- Decision panel -->
+    <section class="card decision-panel">
+      <div class="card-header">
+        <span class="card-title">Decision</span>
+      </div>
+      <div class="decision-content">
+        <p class="no-decision">No pending decisions</p>
+      </div>
+    </section>
+
+    <!-- Alerts panel -->
+    <section class="card alerts-panel">
+      <div class="card-header">
+        <span class="card-title">Alerts</span>
+      </div>
+      <div class="alerts-list">
+        <p class="no-alerts">No recent alerts</p>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -53,7 +53,8 @@ USER sensingvoxel
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Expose any necessary ports (none for now, uses external services)
+# Expose dashboard port
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \

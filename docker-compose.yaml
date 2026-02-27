@@ -14,6 +14,10 @@ services:
       # Add any environment-specific vars here
       # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 
+    # Dashboard port
+    ports:
+      - "8080:8080"
+
     # Volumes for persistent data and config overrides
     volumes:
       - ./data:/app/data

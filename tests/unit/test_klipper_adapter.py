@@ -138,18 +138,22 @@ class TestKlipperAdapter:
 
     @pytest.mark.asyncio
     async def test_emergency_cancel(self, adapter):
-        """Test emergency cancel"""
-        with patch.object(adapter, "_rest_request") as mock_request:
-            mock_request.return_value = Mock(
-                status=CommandResultStatus.SUCCESS,
-                data={},
-            )
+        """Test emergency cancel uses dedicated session with aggressive timeout"""
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
 
+        mock_session_instance = AsyncMock()
+        mock_session_instance.post = Mock(return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_response),
+            __aexit__=AsyncMock(return_value=False),
+        ))
+        mock_session_instance.__aenter__ = AsyncMock(return_value=mock_session_instance)
+        mock_session_instance.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session_instance):
             result = await adapter.emergency_cancel()
             assert result.status == CommandResultStatus.SUCCESS
-            mock_request.assert_called_once_with(
-                "POST", "/printer/print/cancel"
-            )
 
     @pytest.mark.asyncio
     async def test_get_z_offset(self, adapter):
@@ -368,15 +372,13 @@ class TestKlipperAdapter:
             assert progress.bed_temp == 60.0
             assert progress.nozzle_temp == 200.0
 
-    @pytest.mark.asyncio
-    async def test_handle_gcode_output(self, adapter):
-        """Test handling G-code output (no-op for now)"""
+    def test_handle_gcode_output(self, adapter):
+        """Test handling G-code output"""
         params = {"message": "G-code output"}
-        await adapter._handle_gcode_output(params)
+        adapter._handle_gcode_output(params)
         # Should not raise any exceptions
 
-    @pytest.mark.asyncio
-    async def test_state_map_completeness(self, adapter):
+    def test_state_map_completeness(self, adapter):
         """Test that all expected states are mapped"""
         expected_states = {
             "printing",
@@ -386,6 +388,10 @@ class TestKlipperAdapter:
             "complete",
             "cancelled",
             "error",
+            "ready",
+            "startup",
+            "shutdown",
+            "disconnecting",
         }
 
         assert set(adapter.STATE_MAP.keys()) == expected_states

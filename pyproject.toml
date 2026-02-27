@@ -35,10 +35,13 @@ dev = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["sensing_voxel"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 sensing_voxel = ["py.typed"]
+"sensing_voxel.dashboard" = ["static/**/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

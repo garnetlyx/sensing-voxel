@@ -217,7 +217,7 @@ class KlipperAdapter(PrinterAdapter):
         if method == "notify_status_update":
             await self._handle_status_update(params_dict)
         elif method == "notify_gcode_output":
-            await self._handle_gcode_output(params_dict)
+            self._handle_gcode_output(params_dict)
 
     async def _handle_status_update(self, status: dict):
         """Handle status update from printer"""
@@ -239,6 +239,12 @@ class KlipperAdapter(PrinterAdapter):
         telemetry = self._parse_telemetry(status, print_stats)
         if telemetry:
             await self._emit_telemetry_update(telemetry)
+
+    def _handle_gcode_output(self, params: dict):
+        """Handle G-code output notification from Klipper"""
+        message = params.get("message", "")
+        if message:
+            logger.debug(f"G-code output: {message}")
 
     def _parse_telemetry(self, status: dict, print_stats: dict) -> TelemetryData | None:
         """Parse telemetry data from status update"""

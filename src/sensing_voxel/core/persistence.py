@@ -6,7 +6,6 @@ Adapted from OpenClaw's src/config/sessions/store.ts pattern
 
 import json
 import logging
-import signal
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -29,18 +28,6 @@ class StatePersistence:
 
         # Ensure parent directory exists
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Set up signal handlers for lock cleanup
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        signal.signal(signal.SIGINT, self._signal_handler)
-
-    def _signal_handler(self, signum, frame):
-        """Handle signals for lock cleanup"""
-        logger.info(f"Received signal {signum}, cleaning up")
-        # Don't exit in signal handler - signal handler can't safely raise exceptions
-        # Instead, we rely on the finally blocks in save/load to release locks
-        # and let the main process handle the signal gracefully
-        pass
 
     def _acquire_lock(self):
         """Acquire file lock"""

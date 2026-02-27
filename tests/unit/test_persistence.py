@@ -144,13 +144,12 @@ class TestStatePersistence:
 
     def test_file_locking(self, persistence):
         """Test that file locking works"""
-        sm = AgentStateMachine()
-
         # Acquire lock
         persistence._acquire_lock()
-        assert persistence._lock_fd is not None
+        assert persistence._lock_instance is not None
+        assert persistence._lock_instance.is_locked
 
         # Release lock
         persistence._release_lock()
-        assert persistence._lock_fd is None
+        assert persistence._lock_instance is None
 
