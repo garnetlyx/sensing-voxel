@@ -13,9 +13,10 @@ from pathlib import Path
 
 import yaml
 
+from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.adapters.klipper import KlipperAdapter
 from sensing_voxel.bot.telegram import TelegramBot
-from sensing_voxel.config import Config
+from sensing_voxel.config import BambuConfig, Config, KlipperConfig
 from sensing_voxel.core.decision import DecisionEngine
 from sensing_voxel.core.persistence import StatePersistence
 from sensing_voxel.core.state_machine import AgentStateMachine
@@ -49,6 +50,27 @@ def load_config() -> Config:
             logger.info("Loaded config/local.yaml overrides")
 
     return Config.from_dict(config_dict)
+
+
+def create_adapters(config: Config) -> dict[str, PrinterAdapter]:
+    """Create printer adapters from config."""
+    adapters: dict[str, PrinterAdapter] = {}
+    for printer_cfg in config.printers:
+        if isinstance(printer_cfg, KlipperConfig):
+            adapters[printer_cfg.name] = KlipperAdapter(
+                host=printer_cfg.host,
+                port=printer_cfg.port,
+                api_key=printer_cfg.api_key,
+            )
+        elif isinstance(printer_cfg, BambuConfig):
+            from sensing_voxel.adapters.bambu import BambuAdapter
+
+            adapters[printer_cfg.name] = BambuAdapter(
+                host=printer_cfg.mqtt_host,
+                mqtt_port=printer_cfg.mqtt_port,
+            )
+        logger.info(f"Created adapter: {printer_cfg.name} ({type(printer_cfg).__name__})")
+    return adapters
 
 
 async def shutdown(
@@ -95,24 +117,21 @@ async def main() -> None:
     # Initialize decision engine
     decision_engine = DecisionEngine()
 
-    # Initialize adapter
-    adapter: KlipperAdapter | None = None
-    if config.klipper:
-        adapter = KlipperAdapter(
-            host=config.klipper.host,
-            port=config.klipper.port,
-            api_key=config.klipper.api_key,
-        )
+    # Initialize adapters (multi-printer)
+    adapters = create_adapters(config)
+    active_printer = next(iter(adapters), None)
 
     # Initialize bot (optional — skip if no real token configured)
     bot = None
     token = config.telegram.bot_token
     if token and token != "YOUR_BOT_TOKEN_HERE":
+        # Bot uses the active (first) printer adapter
+        active_adapter = adapters.get(active_printer) if active_printer else None
         bot = TelegramBot(
             token=token,
             allowed_users=config.telegram.allowed_users,
             state_machine=state_machine,
-            adapter=adapter,
+            adapter=active_adapter,
             config=config,
             persistence=persistence,
         )
@@ -129,40 +148,53 @@ async def main() -> None:
             config=config.dashboard,
             state_machine=state_machine,
             decision_engine=decision_engine,
-            adapter=adapter,
+            adapters=adapters,
+            active_printer=active_printer,
         )
 
-        # Wire adapter events to WebSocket broadcast
-        if adapter and ws_manager:
+        # Wire per-printer adapter events to WebSocket broadcast
+        if adapters and ws_manager:
             from sensing_voxel.api.serializers import serialize_telemetry
             from sensing_voxel.core.models import NormalizedPrinterState, TelemetryData
 
             app_state = dashboard_runner.app["app_state"] if dashboard_runner.app else None
 
-            async def on_state_changed(old: NormalizedPrinterState, new: NormalizedPrinterState):
-                await ws_manager.broadcast_state_change(state_machine.current_state.name, new.name)
+            for printer_id, adapter in adapters.items():
 
-            async def on_telemetry(data: TelemetryData):
-                if app_state:
-                    app_state["last_telemetry"] = data
-                tel = serialize_telemetry(data)
-                if tel:
-                    await ws_manager.broadcast_telemetry(tel)
+                async def on_state_changed(
+                    old: NormalizedPrinterState,
+                    new: NormalizedPrinterState,
+                    pid: str = printer_id,
+                ):
+                    await ws_manager.broadcast_state_change(
+                        state_machine.current_state.name, new.name, printer_id=pid
+                    )
 
-            async def on_connection_lost():
-                if app_state:
-                    app_state["printer_connected"] = False
-                await ws_manager.broadcast_alert("warning", "Printer connection lost")
+                async def on_telemetry(data: TelemetryData, pid: str = printer_id):
+                    if app_state:
+                        app_state["telemetries"][pid] = data
+                    tel = serialize_telemetry(data)
+                    if tel:
+                        await ws_manager.broadcast_telemetry(tel, printer_id=pid)
 
-            async def on_connection_restored():
-                if app_state:
-                    app_state["printer_connected"] = True
-                await ws_manager.broadcast_alert("success", "Printer reconnected")
+                async def on_connection_lost(pid: str = printer_id):
+                    if app_state:
+                        app_state["connections"][pid] = False
+                    await ws_manager.broadcast_alert(
+                        "warning", f"Printer '{pid}' connection lost", printer_id=pid
+                    )
 
-            adapter.on_state_changed(on_state_changed)
-            adapter.on_telemetry_update(on_telemetry)
-            adapter.on_connection_lost(on_connection_lost)
-            adapter.on_connection_restored(on_connection_restored)
+                async def on_connection_restored(pid: str = printer_id):
+                    if app_state:
+                        app_state["connections"][pid] = True
+                    await ws_manager.broadcast_alert(
+                        "success", f"Printer '{pid}' reconnected", printer_id=pid
+                    )
+
+                adapter.on_state_changed(on_state_changed)
+                adapter.on_telemetry_update(on_telemetry)
+                adapter.on_connection_lost(on_connection_lost)
+                adapter.on_connection_restored(on_connection_restored)
 
     # Set up signal handlers
     loop = asyncio.get_running_loop()
@@ -174,10 +206,14 @@ async def main() -> None:
             ),
         )
 
-    # Start bot and adapter
+    # Start bot and adapters
     try:
-        if adapter:
-            await adapter.connect()
+        for printer_id, adapter in adapters.items():
+            logger.info(f"Connecting adapter: {printer_id}")
+            try:
+                await adapter.connect()
+            except Exception as e:
+                logger.error(f"Failed to connect adapter '{printer_id}': {e}")
 
         if bot:
             await bot.start()
@@ -187,8 +223,11 @@ async def main() -> None:
 
     finally:
         # Cleanup
-        if adapter:
-            await adapter.disconnect()
+        for adapter in adapters.values():
+            try:
+                await adapter.disconnect()
+            except Exception:
+                pass
         if bot:
             await bot.stop()
         if dashboard_runner:

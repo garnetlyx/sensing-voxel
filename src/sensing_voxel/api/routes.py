@@ -12,6 +12,7 @@ from sensing_voxel.api.serializers import (
     serialize_state_machine,
     serialize_telemetry,
 )
+from sensing_voxel.config import BambuConfig, KlipperConfig
 from sensing_voxel.core.models import (
     AgentState,
     ConsumeResult,
@@ -26,13 +27,36 @@ async def health_check(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "timestamp": datetime.now().isoformat()})
 
 
+async def get_printers(request: web.Request) -> web.Response:
+    """List all configured printers with connection status"""
+    app_state = request.app["app_state"]
+    adapters = app_state.get("adapters", {})
+    connections = app_state.get("connections", {})
+    active = app_state.get("active_printer")
+
+    printers = []
+    for pid, adapter in adapters.items():
+        # Determine printer type from adapter class name
+        printer_type = type(adapter).__name__.replace("Adapter", "").lower()
+        printers.append({
+            "id": pid,
+            "type": printer_type,
+            "connected": connections.get(pid, False),
+            "active": pid == active,
+        })
+
+    return web.json_response({"printers": printers})
+
+
 async def get_status(request: web.Request) -> web.Response:
     """Get overall system status"""
     app_state = request.app["app_state"]
     sm = app_state["state_machine"]
 
     status = serialize_state_machine(sm)
-    status["printer_connected"] = app_state.get("printer_connected", False)
+    connections = app_state.get("connections", {})
+    status["printer_connected"] = any(connections.values())
+    status["active_printer"] = app_state.get("active_printer")
     status["dashboard_clients"] = app_state.get("ws_manager").client_count
 
     return web.json_response(status)
@@ -48,11 +72,20 @@ async def get_job(request: web.Request) -> web.Response:
 
 
 async def get_telemetry(request: web.Request) -> web.Response:
-    """Get latest telemetry snapshot"""
+    """Get latest telemetry snapshot, optionally for a specific printer"""
     app_state = request.app["app_state"]
-    telemetry = serialize_telemetry(app_state.get("last_telemetry"))
+    printer_id = request.query.get("printer")
+    telemetries = app_state.get("telemetries", {})
 
-    return web.json_response({"telemetry": telemetry})
+    if printer_id:
+        telemetry = serialize_telemetry(telemetries.get(printer_id))
+        return web.json_response({"printer_id": printer_id, "telemetry": telemetry})
+
+    # Return all printers' telemetry
+    result = {}
+    for pid, data in telemetries.items():
+        result[pid] = serialize_telemetry(data)
+    return web.json_response({"telemetry": result})
 
 
 async def get_alerts(request: web.Request) -> web.Response:
@@ -151,12 +184,36 @@ async def post_decision(request: web.Request) -> web.Response:
         )
 
 
+async def set_active_printer(request: web.Request) -> web.Response:
+    """Set the active printer for agent control"""
+    app_state = request.app["app_state"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    printer_id = body.get("printer_id")
+    if not printer_id:
+        raise web.HTTPBadRequest(text="Missing printer_id")
+
+    if printer_id not in app_state.get("adapters", {}):
+        raise web.HTTPNotFound(text=f"Unknown printer: {printer_id}")
+
+    app_state["active_printer"] = printer_id
+    logger.info(f"Active printer set to: {printer_id}")
+
+    return web.json_response({"active_printer": printer_id})
+
+
 def setup_routes(app: web.Application, ws_manager):
     """Register all API routes"""
     app.router.add_get("/health", health_check)
+    app.router.add_get("/api/v1/printers", get_printers)
     app.router.add_get("/api/v1/status", get_status)
     app.router.add_get("/api/v1/job", get_job)
     app.router.add_get("/api/v1/telemetry", get_telemetry)
     app.router.add_get("/api/v1/alerts", get_alerts)
     app.router.add_post("/api/v1/decision", post_decision)
+    app.router.add_post("/api/v1/active-printer", set_active_printer)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

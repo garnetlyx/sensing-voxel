@@ -12,6 +12,7 @@ from pathlib import Path
 class KlipperConfig:
     """Klipper/Moonraker adapter configuration"""
 
+    name: str = "klipper"
     host: str = "localhost"
     port: int = 7125
     api_key: str | None = None
@@ -27,6 +28,7 @@ class KlipperConfig:
 class BambuConfig:
     """Bambu adapter configuration"""
 
+    name: str = "bambu"
     mqtt_host: str = "localhost"
     mqtt_port: int = 1883
     mqtt_username: str | None = None
@@ -94,10 +96,20 @@ class DashboardConfig:
     camera_mjpeg_quality: int = 80
 
 
+PrinterConfig = KlipperConfig | BambuConfig
+
+PRINTER_TYPE_MAP = {
+    "klipper": KlipperConfig,
+    "bambu": BambuConfig,
+}
+
+
 @dataclass
 class Config:
     """Main configuration"""
 
+    printers: list[PrinterConfig] = field(default_factory=list)
+    # Legacy single-printer fields (auto-migrated to printers list)
     klipper: KlipperConfig | None = None
     bambu: BambuConfig | None = None
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
@@ -111,21 +123,33 @@ class Config:
     def from_dict(cls, data: dict) -> Config:
         """Deserialize from a nested dict (e.g. YAML output)."""
         section_map = {
-            "klipper": KlipperConfig,
-            "bambu": BambuConfig,
             "telegram": TelegramConfig,
             "camera": CameraConfig,
             "slicer": SlicerConfig,
             "storage": StorageConfig,
             "dashboard": DashboardConfig,
         }
-        parsed = {}
+        parsed: dict = {}
         for key, value in data.items():
-            if key in section_map and isinstance(value, dict):
+            if key == "printers" and isinstance(value, list):
+                parsed["printers"] = _parse_printers_list(value)
+            elif key in ("klipper", "bambu") and isinstance(value, dict):
+                parsed[key] = PRINTER_TYPE_MAP[key](**value)
+            elif key in section_map and isinstance(value, dict):
                 parsed[key] = section_map[key](**value)
             else:
                 parsed[key] = value
-        return cls(**parsed)
+
+        config = cls(**parsed)
+
+        # Auto-migrate legacy single-printer fields into printers list
+        if not config.printers:
+            if config.klipper:
+                config.printers.append(config.klipper)
+            if config.bambu:
+                config.printers.append(config.bambu)
+
+        return config
 
     @property
     def state_file_path(self) -> Path:
@@ -146,3 +170,17 @@ class Config:
     def uploads_path(self) -> Path:
         """Get full path to uploads directory"""
         return Path(self.storage.data_dir) / self.storage.uploads_dir
+
+
+def _parse_printers_list(items: list[dict]) -> list[PrinterConfig]:
+    """Parse printers list from YAML."""
+    printers: list[PrinterConfig] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)  # Don't mutate input
+        printer_type = item.pop("type", "klipper")
+        config_cls = PRINTER_TYPE_MAP.get(printer_type)
+        if config_cls:
+            printers.append(config_cls(**item))
+    return printers

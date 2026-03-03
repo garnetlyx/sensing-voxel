@@ -24,12 +24,16 @@ def create_app(
     config: DashboardConfig,
     state_machine: AgentStateMachine,
     decision_engine: DecisionEngine | None = None,
-    adapter=None,
+    adapters: dict | None = None,
+    active_printer: str | None = None,
 ) -> tuple[web.Application, WebSocketManager]:
     """Create and configure the dashboard web application.
 
     Returns (app, ws_manager) so the caller can wire up event callbacks.
     """
+    if adapters is None:
+        adapters = {}
+
     ws_manager = WebSocketManager()
 
     # Middleware stack
@@ -37,14 +41,15 @@ def create_app(
 
     app = web.Application(middlewares=middlewares)
 
-    # Shared application state
+    # Shared application state (multi-printer)
     app["app_state"] = {
         "state_machine": state_machine,
         "decision_engine": decision_engine,
-        "adapter": adapter,
+        "adapters": adapters,
+        "connections": {pid: False for pid in adapters},
+        "telemetries": {pid: None for pid in adapters},
+        "active_printer": active_printer,
         "ws_manager": ws_manager,
-        "last_telemetry": None,
-        "printer_connected": False,
         "alerts": deque(maxlen=MAX_ALERTS),
         "camera_rtsp_url": config.camera_rtsp_url,
         "camera_mjpeg_fps": config.camera_mjpeg_fps,
@@ -76,13 +81,16 @@ async def start_server(
     config: DashboardConfig,
     state_machine: AgentStateMachine,
     decision_engine: DecisionEngine | None = None,
-    adapter=None,
+    adapters: dict | None = None,
+    active_printer: str | None = None,
 ) -> tuple[web.AppRunner, WebSocketManager]:
     """Start the dashboard server (non-blocking, coexists with asyncio loop).
 
     Returns (runner, ws_manager). Caller must call runner.cleanup() on shutdown.
     """
-    app, ws_manager = create_app(config, state_machine, decision_engine, adapter)
+    app, ws_manager = create_app(
+        config, state_machine, decision_engine, adapters, active_printer
+    )
 
     runner = web.AppRunner(app)
     await runner.setup()

@@ -57,7 +57,7 @@ class WebSocketManager:
         return ws
 
     async def _send_snapshot(self, ws: web.WebSocketResponse, app_state: dict):
-        """Send full state snapshot to a single client"""
+        """Send full state snapshot to a single client (multi-printer aware)"""
         from sensing_voxel.api.serializers import (
             serialize_job_context,
             serialize_state_machine,
@@ -68,13 +68,24 @@ class WebSocketManager:
         if not sm:
             return
 
+        # Build per-printer data
+        connections = app_state.get("connections", {})
+        telemetries = app_state.get("telemetries", {})
+        printers = []
+        for pid in app_state.get("adapters", {}):
+            printers.append({
+                "id": pid,
+                "connected": connections.get(pid, False),
+                "telemetry": serialize_telemetry(telemetries.get(pid)),
+            })
+
         snapshot = {
             "type": "snapshot",
             "timestamp": datetime.now().isoformat(),
             "state": serialize_state_machine(sm),
             "job": serialize_job_context(sm.job_context),
-            "telemetry": serialize_telemetry(app_state.get("last_telemetry")),
-            "connected": app_state.get("printer_connected", False),
+            "printers": printers,
+            "active_printer": app_state.get("active_printer"),
         }
 
         try:
@@ -106,32 +117,40 @@ class WebSocketManager:
                 for ws in closed:
                     self._clients.discard(ws)
 
-    async def broadcast_state_change(self, agent_state: str, printer_state: str | None = None):
+    async def broadcast_state_change(
+        self, agent_state: str, printer_state: str | None = None, printer_id: str | None = None
+    ):
         """Broadcast state change event"""
         await self.broadcast({
             "type": "state_change",
+            "printer_id": printer_id,
             "agent_state": agent_state,
             "printer_state": printer_state,
         })
 
-    async def broadcast_telemetry(self, telemetry: dict):
+    async def broadcast_telemetry(self, telemetry: dict, printer_id: str | None = None):
         """Broadcast telemetry update"""
         await self.broadcast({
             "type": "telemetry",
+            "printer_id": printer_id,
             **telemetry,
         })
 
-    async def broadcast_progress(self, progress: dict):
+    async def broadcast_progress(self, progress: dict, printer_id: str | None = None):
         """Broadcast print progress update"""
         await self.broadcast({
             "type": "progress",
+            "printer_id": printer_id,
             **progress,
         })
 
-    async def broadcast_alert(self, alert_type: str, message: str, data: dict | None = None):
+    async def broadcast_alert(
+        self, alert_type: str, message: str, data: dict | None = None, printer_id: str | None = None
+    ):
         """Broadcast alert to all clients"""
         await self.broadcast({
             "type": "alert",
+            "printer_id": printer_id,
             "alert_type": alert_type,
             "message": message,
             "data": data,

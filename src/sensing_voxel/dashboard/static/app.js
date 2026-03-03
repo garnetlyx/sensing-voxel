@@ -1,5 +1,6 @@
 /**
  * Sensing Voxel Dashboard — WebSocket client and DOM updates
+ * Multi-printer aware: events carry printer_id, UI shows selected printer
  */
 
 (function () {
@@ -14,9 +15,10 @@
 
   const state = {
     agentState: "UNKNOWN",
-    printerConnected: false,
+    activePrinter: null,
+    selectedPrinter: null, // currently viewed in UI (dropdown)
+    printers: {},          // { pid: { connected, telemetry } }
     job: null,
-    telemetry: null,
     alerts: [],
     decisionToken: null,
     decisionJobId: null,
@@ -35,17 +37,17 @@
 
     ws.onopen = () => {
       reconnectAttempts = 0;
-      updateConnection(true);
+      updateConnectionDot(true);
       addAlert("info", "Connected to server");
     };
 
     ws.onclose = () => {
-      updateConnection(false);
+      updateConnectionDot(false);
       scheduleReconnect();
     };
 
     ws.onerror = () => {
-      updateConnection(false);
+      updateConnectionDot(false);
     };
 
     ws.onmessage = (event) => {
@@ -103,32 +105,48 @@
   function handleSnapshot(data) {
     if (data.state) {
       state.agentState = data.state.agent_state || "UNKNOWN";
-      state.printerConnected = data.connected || false;
-      updateStatePanel();
     }
     if (data.job) {
       state.job = data.job;
-      updateJobPanel();
     }
-    if (data.telemetry) {
-      state.telemetry = data.telemetry;
-      updateTempsPanel();
+    state.activePrinter = data.active_printer || null;
+
+    // Populate per-printer data
+    if (data.printers) {
+      state.printers = {};
+      for (const p of data.printers) {
+        state.printers[p.id] = {
+          connected: p.connected || false,
+          telemetry: p.telemetry || null,
+        };
+      }
     }
-    updateConnection(true);
+
+    // Auto-select first printer if none selected
+    if (!state.selectedPrinter && Object.keys(state.printers).length > 0) {
+      state.selectedPrinter = state.activePrinter || Object.keys(state.printers)[0];
+    }
+
+    updatePrinterSelect();
+    updateAll();
+    updateConnectionDot(true);
   }
 
   function handleStateChange(data) {
     state.agentState = data.agent_state || state.agentState;
-    if (data.printer_state !== undefined) {
-      state.printerConnected = data.printer_state !== null;
-    }
     updateStatePanel();
     addAlert("info", `State: ${formatState(state.agentState)}`);
   }
 
   function handleTelemetry(data) {
-    state.telemetry = data;
-    updateTempsPanel();
+    const pid = data.printer_id;
+    if (pid && state.printers[pid]) {
+      state.printers[pid].telemetry = data;
+    }
+    // Update temps panel if this is the selected printer
+    if (pid === state.selectedPrinter) {
+      updateTempsPanel();
+    }
   }
 
   function handleProgress(data) {
@@ -156,12 +174,50 @@
     addAlert("success", `Decision: ${data.action} for ${data.job_id}`);
   }
 
+  // --- Printer selector ---
+  function updatePrinterSelect() {
+    const select = $("#printer-select");
+    if (!select) return;
+
+    const printerIds = Object.keys(state.printers);
+    if (printerIds.length === 0) {
+      select.innerHTML = '<option value="">No printers</option>';
+      return;
+    }
+
+    select.innerHTML = printerIds
+      .map((pid) => {
+        const p = state.printers[pid];
+        const dot = p.connected ? "\u25cf" : "\u25cb";
+        const active = pid === state.activePrinter ? " *" : "";
+        return `<option value="${escapeHtml(pid)}" ${pid === state.selectedPrinter ? "selected" : ""}>${dot} ${escapeHtml(pid)}${active}</option>`;
+      })
+      .join("");
+  }
+
+  function onPrinterSelectChange(e) {
+    state.selectedPrinter = e.target.value;
+    updateAll();
+  }
+
   // --- UI updates ---
-  function updateConnection(connected) {
+  function updateAll() {
+    updateStatePanel();
+    updateJobPanel();
+    updateTempsPanel();
+    updateDecisionPanel();
+  }
+
+  function updateConnectionDot(serverConnected) {
     const dot = $(".connection-dot");
     const label = $(".connection-label");
+    // Show connection to selected printer, not just server
+    const printerConnected = state.selectedPrinter
+      && state.printers[state.selectedPrinter]
+      && state.printers[state.selectedPrinter].connected;
+    const connected = serverConnected && printerConnected;
     if (dot) dot.classList.toggle("connected", connected);
-    if (label) label.textContent = connected ? "Connected" : "Disconnected";
+    if (label) label.textContent = connected ? "Connected" : printerConnected === false && serverConnected ? "Printer Offline" : "Disconnected";
   }
 
   function updateStatePanel() {
@@ -176,8 +232,10 @@
 
     const printerConn = $("#printer-connection");
     if (printerConn) {
-      printerConn.textContent = state.printerConnected ? "Connected" : "Disconnected";
-      printerConn.style.color = state.printerConnected ? "var(--success)" : "var(--danger)";
+      const sel = state.selectedPrinter;
+      const connected = sel && state.printers[sel] && state.printers[sel].connected;
+      printerConn.textContent = connected ? "Connected" : "Disconnected";
+      printerConn.style.color = connected ? "var(--success)" : "var(--danger)";
     }
   }
 
@@ -217,14 +275,28 @@
   }
 
   function updateTempsPanel() {
-    const tel = state.telemetry;
-    if (!tel || !tel.temperatures) return;
-
-    const temps = tel.temperatures;
+    const sel = state.selectedPrinter;
+    const tel = sel && state.printers[sel] ? state.printers[sel].telemetry : null;
 
     const nozzle = $("#nozzle-temp");
     const nozzleTarget = $("#nozzle-target");
     const nozzleBar = $("#nozzle-bar");
+    const bed = $("#bed-temp");
+    const bedTarget = $("#bed-target");
+    const bedBar = $("#bed-bar");
+
+    if (!tel || !tel.temperatures) {
+      if (nozzle) nozzle.textContent = "--";
+      if (nozzleTarget) nozzleTarget.textContent = "/ --";
+      if (nozzleBar) nozzleBar.style.width = "0%";
+      if (bed) bed.textContent = "--";
+      if (bedTarget) bedTarget.textContent = "/ --";
+      if (bedBar) bedBar.style.width = "0%";
+      return;
+    }
+
+    const temps = tel.temperatures;
+
     if (nozzle) nozzle.textContent = (temps.extruder || 0).toFixed(1);
     if (nozzleTarget) nozzleTarget.textContent = `/ ${(temps.extruder_target || 0).toFixed(0)}`;
     if (nozzleBar) {
@@ -234,9 +306,6 @@
       nozzleBar.style.width = pct + "%";
     }
 
-    const bed = $("#bed-temp");
-    const bedTarget = $("#bed-target");
-    const bedBar = $("#bed-bar");
     if (bed) bed.textContent = (temps.bed || 0).toFixed(1);
     if (bedTarget) bedTarget.textContent = `/ ${(temps.bed_target || 0).toFixed(0)}`;
     if (bedBar) {
@@ -399,7 +468,6 @@
       if (resp.ok) {
         const data = await resp.json();
         state.agentState = data.agent_state || "UNKNOWN";
-        state.printerConnected = data.printer_connected || false;
         updateStatePanel();
       }
     } catch {
@@ -409,6 +477,10 @@
 
   // --- Init ---
   function init() {
+    // Wire up printer dropdown
+    const select = $("#printer-select");
+    if (select) select.addEventListener("change", onPrinterSelectChange);
+
     connectWebSocket();
     setInterval(pollStatus, 10000);
 
