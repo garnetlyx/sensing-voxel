@@ -67,6 +67,31 @@ class PrinterAdapter(ABC):
         """Set Z-offset"""
         pass
 
+    @abstractmethod
+    async def set_nozzle_temp(self, temperature: float) -> CommandResult:
+        """Set nozzle/extruder temperature"""
+        pass
+
+    @abstractmethod
+    async def set_bed_temp(self, temperature: float) -> CommandResult:
+        """Set heated bed temperature"""
+        pass
+
+    @abstractmethod
+    async def home_axes(self, axes: str = "") -> CommandResult:
+        """Home printer axes. Empty string = home all."""
+        pass
+
+    @abstractmethod
+    async def set_fan_speed(self, speed: int) -> CommandResult:
+        """Set part cooling fan speed (0-255)"""
+        pass
+
+    @abstractmethod
+    async def run_gcode(self, command: str) -> CommandResult:
+        """Run arbitrary G-code command"""
+        pass
+
     # --- Queries ---
 
     @abstractmethod

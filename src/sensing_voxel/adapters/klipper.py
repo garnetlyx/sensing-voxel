@@ -74,6 +74,9 @@ class KlipperAdapter(PrinterAdapter):
         )
         self._reconnect_attempts = 0
 
+        # Accumulated status from incremental WebSocket updates
+        self._cached_status: dict[str, dict] = {}
+
     async def connect(self) -> None:
         """Connect to Moonraker"""
         if self._connected:
@@ -172,6 +175,7 @@ class KlipperAdapter(PrinterAdapter):
         async with self._session.ws_connect(self._ws_url) as ws:
             self._ws = ws
             self._reconnect_attempts = 0  # Reset on successful connection
+            self._cached_status = {}  # Reset accumulated status on reconnect
 
             # Subscribe to printer objects for live status updates
             await self._ws_subscribe(ws)
@@ -219,7 +223,19 @@ class KlipperAdapter(PrinterAdapter):
 
         method = data.get("method")
         if method is None:
-            # JSON-RPC response (e.g. subscription result) — ignore silently
+            # JSON-RPC response — parse subscription initial state
+            result = data.get("result", {})
+            if isinstance(result, dict):
+                status = result.get("status", {})
+                if status:
+                    for key, value in status.items():
+                        if isinstance(value, dict):
+                            self._cached_status[key] = value
+                    # Emit initial telemetry from subscription snapshot
+                    print_stats = status.get("print_stats", {})
+                    telemetry = self._parse_telemetry(self._cached_status, print_stats)
+                    if telemetry:
+                        await self._emit_telemetry_update(telemetry)
             return
 
         params = data.get("params")
@@ -241,8 +257,20 @@ class KlipperAdapter(PrinterAdapter):
             self._handle_gcode_output(params_dict)
 
     async def _handle_status_update(self, status: dict):
-        """Handle status update from printer"""
-        print_stats = status.get("print_stats", {})
+        """Handle incremental status update from printer.
+
+        Moonraker sends partial updates — each message only contains changed
+        fields.  We merge into _cached_status so that _parse_telemetry always
+        sees the full picture.
+        """
+        # Merge incremental update into accumulated cache
+        for key, value in status.items():
+            if isinstance(value, dict) and key in self._cached_status:
+                self._cached_status[key].update(value)
+            else:
+                self._cached_status[key] = value
+
+        print_stats = self._cached_status.get("print_stats", {})
         state_str = print_stats.get("state", "unknown").lower()
 
         normalized_state = self.STATE_MAP.get(state_str, NormalizedPrinterState.UNKNOWN)
@@ -256,8 +284,8 @@ class KlipperAdapter(PrinterAdapter):
 
         self._last_state = normalized_state
 
-        # Parse telemetry data
-        telemetry = self._parse_telemetry(status, print_stats)
+        # Parse telemetry from the full accumulated status
+        telemetry = self._parse_telemetry(self._cached_status, print_stats)
         if telemetry:
             await self._emit_telemetry_update(telemetry)
 
@@ -295,9 +323,17 @@ class KlipperAdapter(PrinterAdapter):
         metadata = {}
         if print_stats:
             metadata["filename"] = print_stats.get("filename", "")
-            metadata["progress"] = print_stats.get("progress", 0.0)
             metadata["print_time"] = print_stats.get("print_duration", 0.0)
             metadata["state"] = print_stats.get("state", "")
+
+            # Prefer display_status.progress (updated by M73 / virtual_sdcard),
+            # fall back to print_stats.progress
+            display = status.get("display_status", {})
+            metadata["progress"] = (
+                display.get("progress")
+                or print_stats.get("progress")
+                or 0.0
+            )
 
         if not temps and not position:
             return None
@@ -310,17 +346,28 @@ class KlipperAdapter(PrinterAdapter):
         )
 
     async def _check_state_after_reconnect(self):
-        """Check printer state after reconnection to detect changes during disconnection"""
+        """Query full printer state on (re)connect and seed the telemetry cache."""
         try:
-            # Query current printer state
-            result = await self._rest_request("GET", "/printer/objects/query?print_stats")
+            result = await self._rest_request(
+                "GET",
+                "/printer/objects/query?print_stats&heater_bed&extruder&toolhead&display_status",
+            )
 
             if result.status != CommandResultStatus.SUCCESS or not result.data:
                 logger.warning("Failed to query printer state after reconnect")
                 return
 
             data = result.data
-            print_stats = data.get("print_stats", {})
+
+            # Moonraker REST wraps objects under {"status": {...}, "eventtime": ...}
+            status = data.get("status", data)
+
+            # Seed the accumulated cache with full current state
+            for key, value in status.items():
+                if isinstance(value, dict):
+                    self._cached_status[key] = value
+
+            print_stats = status.get("print_stats", {})
             state_str = print_stats.get("state", "unknown").lower()
             filename = print_stats.get("filename", "")
             total_duration = print_stats.get("total_duration", 0)
@@ -334,10 +381,8 @@ class KlipperAdapter(PrinterAdapter):
                         f"Detected state change during disconnection: "
                         f"{self._last_state.name} -> {normalized_state.name}"
                     )
-                    # Emit state change event
                     await self._emit_state_changed(self._last_state, normalized_state)
 
-                    # If a print started during disconnection, log it
                     if (
                         self._last_state
                         in [
@@ -351,7 +396,6 @@ class KlipperAdapter(PrinterAdapter):
                             f"(duration: {total_duration:.1f}s)"
                         )
 
-                    # If a print completed during disconnection, log it
                     if self._last_state == NormalizedPrinterState.PRINTING and normalized_state in [
                         NormalizedPrinterState.TERMINAL,
                         NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
@@ -361,8 +405,12 @@ class KlipperAdapter(PrinterAdapter):
                             f"(total duration: {total_duration:.1f}s)"
                         )
 
-            # Update last state
             self._last_state = normalized_state
+
+            # Emit initial telemetry so the context collector has data immediately
+            telemetry = self._parse_telemetry(self._cached_status, print_stats)
+            if telemetry:
+                await self._emit_telemetry_update(telemetry)
 
         except Exception as e:
             logger.error(f"Error checking state after reconnect: {e}", exc_info=True)
@@ -462,7 +510,8 @@ class KlipperAdapter(PrinterAdapter):
         result = await self._rest_request("GET", "/printer/objects/query?gcode_move")
 
         if result.status == CommandResultStatus.SUCCESS and result.data:
-            gcode_move = result.data.get("gcode_move", {})
+            status = result.data.get("status", result.data)
+            gcode_move = status.get("gcode_move", {})
             return gcode_move.get("homing_origin", [0, 0, 0])[2]  # Z component
 
         raise AdapterCommandError("Failed to query Z offset")
@@ -492,12 +541,45 @@ class KlipperAdapter(PrinterAdapter):
             json={"script": gcode},
         )
 
+    async def set_nozzle_temp(self, temperature: float) -> CommandResult:
+        temp = int(temperature)
+        return await self._rest_request(
+            "POST", "/printer/gcode/script", json={"script": f"M104 S{temp}"}
+        )
+
+    async def set_bed_temp(self, temperature: float) -> CommandResult:
+        temp = int(temperature)
+        return await self._rest_request(
+            "POST", "/printer/gcode/script", json={"script": f"M140 S{temp}"}
+        )
+
+    async def home_axes(self, axes: str = "") -> CommandResult:
+        axes_arg = f" {axes.upper()}" if axes.strip() else ""
+        return await self._rest_request(
+            "POST", "/printer/gcode/script", json={"script": f"G28{axes_arg}"}
+        )
+
+    async def set_fan_speed(self, speed: int) -> CommandResult:
+        if speed <= 0:
+            gcode = "M107"
+        else:
+            gcode = f"M106 S{min(speed, 255)}"
+        return await self._rest_request(
+            "POST", "/printer/gcode/script", json={"script": gcode}
+        )
+
+    async def run_gcode(self, command: str) -> CommandResult:
+        return await self._rest_request(
+            "POST", "/printer/gcode/script", json={"script": command}
+        )
+
     # --- Queries ---
 
     async def get_printer_state(self) -> NormalizedPrinterState:
         result = await self._rest_request("GET", "/printer/objects/query?print_stats")
         if result.status == CommandResultStatus.SUCCESS and result.data:
-            state_str = result.data.get("print_stats", {}).get("state", "unknown")
+            status = result.data.get("status", result.data)
+            state_str = status.get("print_stats", {}).get("state", "unknown")
             return self.STATE_MAP.get(state_str.lower(), NormalizedPrinterState.UNKNOWN)
         return NormalizedPrinterState.UNKNOWN
 
@@ -512,9 +594,10 @@ class KlipperAdapter(PrinterAdapter):
             return PrintProgress(state=NormalizedPrinterState.UNKNOWN)
 
         data = result.data
+        status = data.get("status", data)
 
         # Parse state
-        print_stats = data.get("print_stats", {})
+        print_stats = status.get("print_stats", {})
         state_str = print_stats.get("state", "unknown").lower()
         state = self.STATE_MAP.get(state_str, NormalizedPrinterState.UNKNOWN)
 
@@ -523,8 +606,8 @@ class KlipperAdapter(PrinterAdapter):
         print_time = print_stats.get("print_duration")
 
         # Parse temperatures
-        heater_bed = data.get("heater_bed", {})
-        extruder = data.get("extruder", {})
+        heater_bed = status.get("heater_bed", {})
+        extruder = status.get("extruder", {})
 
         # Parse layer info from filename parsing (if available)
         filename = print_stats.get("filename", "")

@@ -15,21 +15,36 @@ logger = logging.getLogger(__name__)
 
 BASE_SYSTEM_PROMPT = """\
 You are Sensing Voxel AI, an expert 3D printing assistant integrated into \
-a real-time printer monitoring system. You have live access to printer telemetry.
+a real-time printer monitoring system. You can directly query and control the \
+printer through tool calls.
 
 Your capabilities:
 - Answer questions about FDM/FFF 3D printing
-- Analyze printer status and telemetry data
+- Query real-time printer status, temperatures, and print progress via tools
+- Control the printer: set temperatures, pause/resume/cancel prints, home axes, \
+adjust fan speed, run G-code commands, and manage Z-offset
 - Provide troubleshooting advice for print issues
-- Explain print settings and their effects
 - Help with print quality problems (stringing, warping, layer adhesion, etc.)
 - Advise on filament choices and temperatures
 
-Guidelines:
+IMPORTANT — Always use tools for printer status:
+- When the user asks about print status, progress, or temperatures, ALWAYS call \
+get_print_progress first. Do NOT just read the background context below — it may be stale.
+- The "Monitoring System State" in the context below is the orchestration system's \
+internal state (e.g. IDLE means no agent-managed job). It is NOT the printer state. \
+The printer can be actively printing even when the monitoring system is IDLE \
+(e.g. print started from the printer's touchscreen).
+- To know the actual printer state, call get_printer_state or get_print_progress.
+
+Tool use guidelines:
+- For temperature changes, use set_nozzle_temp and set_bed_temp (not raw G-code).
+- Always confirm destructive actions (cancel_print) with the user before executing.
+- Never send M112 via run_gcode — use the emergency stop path instead.
+- Validate temperature requests against material limits before setting.
+
+General guidelines:
 - Be concise. Telegram messages have a 4096 character limit.
-- When reporting temps or progress, reference the live data below.
 - For safety-critical advice, always recommend caution.
-- You can suggest printer actions but cannot execute them directly.
 - Respond in the same language the user writes in.\
 """
 
@@ -63,9 +78,9 @@ class PrinterContextCollector:
         """Collect current printer context as formatted text."""
         lines = []
 
-        # Agent state
+        # Monitoring system orchestration state (NOT printer state)
         state = self._state_machine.current_state
-        lines.append(f"Agent State: {state.name}")
+        lines.append(f"Monitoring System State: {state.name} (this is NOT the printer state)")
 
         # Job context
         job = self._state_machine.job_context
@@ -126,4 +141,8 @@ class PrinterContextCollector:
     def format_system_prompt(self) -> str:
         """Build complete system prompt with live printer context."""
         context = self.collect_context()
-        return f"{BASE_SYSTEM_PROMPT}\n\n---\nLive Printer Context:\n{context}\n---"
+        return (
+            f"{BASE_SYSTEM_PROMPT}\n\n---\n"
+            "Background Context (may be stale — use tools for authoritative data):\n"
+            f"{context}\n---"
+        )

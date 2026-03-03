@@ -554,6 +554,36 @@ class BambuAdapter(PrinterAdapter):
             message="Z-offset commands not supported for Bambu printers in MVP",
         )
 
+    async def set_nozzle_temp(self, temperature: float) -> CommandResult:
+        return CommandResult(
+            CommandResultStatus.FAILURE,
+            message="Direct temperature control not supported for Bambu printers in MVP",
+        )
+
+    async def set_bed_temp(self, temperature: float) -> CommandResult:
+        return CommandResult(
+            CommandResultStatus.FAILURE,
+            message="Direct temperature control not supported for Bambu printers in MVP",
+        )
+
+    async def home_axes(self, axes: str = "") -> CommandResult:
+        return CommandResult(
+            CommandResultStatus.FAILURE,
+            message="Homing not supported for Bambu printers in MVP",
+        )
+
+    async def set_fan_speed(self, speed: int) -> CommandResult:
+        return CommandResult(
+            CommandResultStatus.FAILURE,
+            message="Fan control not supported for Bambu printers in MVP",
+        )
+
+    async def run_gcode(self, command: str) -> CommandResult:
+        return CommandResult(
+            CommandResultStatus.FAILURE,
+            message="G-code commands not supported for Bambu printers in MVP",
+        )
+
     # --- Queries ---
 
     async def get_printer_state(self) -> NormalizedPrinterState:

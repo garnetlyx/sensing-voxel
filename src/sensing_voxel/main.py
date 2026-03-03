@@ -141,6 +141,7 @@ async def main() -> None:
         chat_manager = ChatManager(
             client=llm_client,
             context_collector=context_collector,
+            adapter=adapters.get(active_printer) if active_printer else None,
             max_turns=config.llm.max_conversation_turns,
         )
         logger.info(f"LLM initialized: model={config.llm.model}")

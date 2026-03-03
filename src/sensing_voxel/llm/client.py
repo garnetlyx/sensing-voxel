@@ -89,6 +89,45 @@ class LlmClient:
             ),
         )
 
+    async def send_message_with_tools(
+        self,
+        messages: list[dict],
+        system_prompt: str,
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> anthropic.types.Message:
+        """Send messages with tool definitions and return full Message object.
+
+        The caller is responsible for handling tool_use blocks in the response.
+        """
+        if not self._client:
+            raise RuntimeError("LLM client not initialized. Call initialize() first.")
+
+        async def _call():
+            kwargs: dict = {
+                "model": self._config.model,
+                "max_tokens": max_tokens or self._config.max_tokens,
+                "temperature": (
+                    temperature if temperature is not None else self._config.temperature
+                ),
+                "system": system_prompt,
+                "messages": messages,
+            }
+            if tools:
+                kwargs["tools"] = tools
+            return await self._client.messages.create(**kwargs)
+
+        return await retry_async(
+            _call,
+            max_attempts=3,
+            policy=BackoffPolicy(base_delay=1.0, max_delay=10.0, factor=2.0, jitter=0.25),
+            retryable_exceptions=RETRYABLE_ERRORS,
+            on_retry=lambda attempt, e: logger.warning(
+                f"LLM API retry {attempt + 1}/3: {type(e).__name__}: {e}"
+            ),
+        )
+
     async def close(self) -> None:
         """Close the underlying HTTP client."""
         if self._client:
