@@ -121,6 +121,32 @@ async def main() -> None:
     adapters = create_adapters(config)
     active_printer = next(iter(adapters), None)
 
+    # Initialize LLM (optional)
+    llm_client = None
+    chat_manager = None
+    if config.llm.enabled and config.llm.api_key:
+        from sensing_voxel.llm.chat import ChatManager
+        from sensing_voxel.llm.client import LlmClient
+        from sensing_voxel.llm.context import PrinterContextCollector
+
+        llm_client = LlmClient(config.llm)
+        await llm_client.initialize()
+
+        context_collector = PrinterContextCollector(
+            state_machine=state_machine,
+            adapters=adapters,
+            active_printer=active_printer,
+        )
+
+        chat_manager = ChatManager(
+            client=llm_client,
+            context_collector=context_collector,
+            max_turns=config.llm.max_conversation_turns,
+        )
+        logger.info(f"LLM initialized: model={config.llm.model}")
+    else:
+        logger.info("LLM disabled (no api_key or enabled=false)")
+
     # Initialize bot (optional — skip if no real token configured)
     bot = None
     token = config.telegram.bot_token
@@ -134,6 +160,7 @@ async def main() -> None:
             adapter=active_adapter,
             config=config,
             persistence=persistence,
+            chat_manager=chat_manager,
         )
     else:
         logger.info("Telegram bot disabled (no token configured)")
@@ -173,6 +200,8 @@ async def main() -> None:
                 async def on_telemetry(data: TelemetryData, pid: str = printer_id):
                     if app_state:
                         app_state["telemetries"][pid] = data
+                    if chat_manager:
+                        chat_manager._context_collector.update_telemetry(pid, data)
                     tel = serialize_telemetry(data)
                     if tel:
                         await ws_manager.broadcast_telemetry(tel, printer_id=pid)
@@ -180,6 +209,8 @@ async def main() -> None:
                 async def on_connection_lost(pid: str = printer_id):
                     if app_state:
                         app_state["connections"][pid] = False
+                    if chat_manager:
+                        chat_manager._context_collector.update_connection(pid, False)
                     await ws_manager.broadcast_alert(
                         "warning", f"Printer '{pid}' connection lost", printer_id=pid
                     )
@@ -187,6 +218,8 @@ async def main() -> None:
                 async def on_connection_restored(pid: str = printer_id):
                     if app_state:
                         app_state["connections"][pid] = True
+                    if chat_manager:
+                        chat_manager._context_collector.update_connection(pid, True)
                     await ws_manager.broadcast_alert(
                         "success", f"Printer '{pid}' reconnected", printer_id=pid
                     )
@@ -195,6 +228,25 @@ async def main() -> None:
                 adapter.on_telemetry_update(on_telemetry)
                 adapter.on_connection_lost(on_connection_lost)
                 adapter.on_connection_restored(on_connection_restored)
+
+    # Wire LLM context updates when dashboard is NOT enabled
+    if chat_manager and not ws_manager and adapters:
+        from sensing_voxel.core.models import NormalizedPrinterState, TelemetryData
+
+        for printer_id, adapter in adapters.items():
+
+            async def on_telemetry_llm(data: TelemetryData, pid: str = printer_id):
+                chat_manager._context_collector.update_telemetry(pid, data)
+
+            async def on_connection_lost_llm(pid: str = printer_id):
+                chat_manager._context_collector.update_connection(pid, False)
+
+            async def on_connection_restored_llm(pid: str = printer_id):
+                chat_manager._context_collector.update_connection(pid, True)
+
+            adapter.on_telemetry_update(on_telemetry_llm)
+            adapter.on_connection_lost(on_connection_lost_llm)
+            adapter.on_connection_restored(on_connection_restored_llm)
 
     # Set up signal handlers
     loop = asyncio.get_running_loop()
@@ -223,6 +275,8 @@ async def main() -> None:
 
     finally:
         # Cleanup
+        if llm_client:
+            await llm_client.close()
         for adapter in adapters.values():
             try:
                 await adapter.disconnect()

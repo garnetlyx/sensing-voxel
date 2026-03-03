@@ -66,6 +66,18 @@ slicer:
 #   camera_mjpeg_fps: 5
 #   camera_mjpeg_quality: 80
 
+# LLM Configuration (AI assistant)
+# Configure in config/local.yaml with your API key
+# llm:
+#   api_key: null             # Set in config/local.yaml (NEVER commit)
+#   base_url: "https://api.anthropic.com"
+#   model: "claude-sonnet-4-20250514"
+#   max_tokens: 2048
+#   temperature: 0.7
+#   timeout_seconds: 30
+#   max_conversation_turns: 20
+#   enabled: false
+
 # Storage Configuration
 storage:
   data_dir: "data"

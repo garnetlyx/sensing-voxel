@@ -96,6 +96,20 @@ class DashboardConfig:
     camera_mjpeg_quality: int = 80
 
 
+@dataclass
+class LlmConfig:
+    """LLM API configuration (Anthropic-compatible)"""
+
+    api_key: str | None = None
+    base_url: str = "https://api.anthropic.com"
+    model: str = "claude-sonnet-4-20250514"
+    max_tokens: int = 2048
+    temperature: float = 0.7
+    timeout_seconds: int = 30
+    max_conversation_turns: int = 20
+    enabled: bool = False
+
+
 PrinterConfig = KlipperConfig | BambuConfig
 
 PRINTER_TYPE_MAP = {
@@ -117,6 +131,7 @@ class Config:
     slicer: SlicerConfig = field(default_factory=SlicerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
     debug: bool = False
 
     @classmethod
@@ -128,6 +143,7 @@ class Config:
             "slicer": SlicerConfig,
             "storage": StorageConfig,
             "dashboard": DashboardConfig,
+            "llm": LlmConfig,
         }
         parsed: dict = {}
         for key, value in data.items():

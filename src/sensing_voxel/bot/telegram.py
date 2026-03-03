@@ -29,6 +29,7 @@ from telegram.ext import (
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.config import Config
+from sensing_voxel.llm.chat import ChatManager
 from sensing_voxel.core.decision import DecisionEngine
 from sensing_voxel.core.models import (
     AgentState,
@@ -85,6 +86,7 @@ class TelegramBot:
         adapter: PrinterAdapter | None = None,
         config: Config | None = None,
         persistence: StatePersistence | None = None,
+        chat_manager: ChatManager | None = None,
     ):
         self.token = token
         self.allowed_users = set(allowed_users)
@@ -92,6 +94,7 @@ class TelegramBot:
         self.adapter = adapter
         self.config = config
         self.persistence = persistence
+        self.chat_manager = chat_manager
         self.decision_engine = DecisionEngine()
 
         self._app = Application.builder().token(token).build()
@@ -109,12 +112,19 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("status", self._handle_status))
         self._app.add_handler(CommandHandler("reset_z_offset", self._handle_reset_z_offset))
         self._app.add_handler(CommandHandler("calibrate_camera", self._handle_calibrate_camera))
+        self._app.add_handler(CommandHandler("ask", self._handle_ask))
+        self._app.add_handler(CommandHandler("clear_chat", self._handle_clear_chat))
 
         # Message handlers
         self._app.add_handler(MessageHandler(filters.Document.ALL, self._handle_file_upload))
 
         # Callback query handler (inline keyboard buttons)
         self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
+        # Free-text messages → AI chat (registered LAST as catch-all)
+        self._app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_chat_message)
+        )
 
     async def _check_auth(self, update: Update) -> bool:
         """Check if user is authorized"""
@@ -135,12 +145,15 @@ class TelegramBot:
             return
 
         message = (
-            "👋 Welcome to Sensing Voxel!\n\n"
-            "🤖 AI-powered 3D printer monitoring and control\n\n"
-            "📤 Send me an STL file to start a print\n"
-            "📊 Use /status to check current state\n"
-            "⚙️ Use /reset_z_offset to reset Z-offset\n"
-            "📹 Use /calibrate_camera to calibrate camera\n"
+            "Welcome to Sensing Voxel!\n\n"
+            "AI-powered 3D printer monitoring and control\n\n"
+            "Send me an STL file to start a print\n"
+            "/status - check current state\n"
+            "/reset_z_offset - reset Z-offset\n"
+            "/calibrate_camera - calibrate camera\n"
+            "/ask <question> - ask AI about printing\n"
+            "/clear_chat - reset AI conversation\n\n"
+            "Or just send a text message to chat with AI!"
         )
 
         await update.message.reply_text(message)
@@ -643,6 +656,55 @@ class TelegramBot:
             )
         except Exception as e:
             logger.error(f"Failed to send NOTHING notification: {e}")
+
+    async def _handle_chat_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle free-text messages as AI chat"""
+        if not await self._check_auth(update):
+            return
+
+        if not self.chat_manager:
+            await update.message.reply_text(
+                "AI chat is not configured. Set up LLM in config/local.yaml."
+            )
+            return
+
+        user_id = update.effective_user.id
+        user_text = update.message.text
+
+        await update.effective_chat.send_action("typing")
+
+        try:
+            response = await self.chat_manager.chat(user_id, user_text)
+            await update.message.reply_text(response)
+        except Exception as e:
+            logger.error(f"LLM chat error: {e}", exc_info=True)
+            await update.message.reply_text(
+                "Sorry, I encountered an error processing your request. Please try again later."
+            )
+
+    async def _handle_ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ask command for explicit AI chat"""
+        if not await self._check_auth(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /ask <your question>")
+            return
+
+        question = " ".join(context.args)
+        # Reuse chat handler logic
+        update.message.text = question
+        await self._handle_chat_message(update, context)
+
+    async def _handle_clear_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /clear_chat to reset conversation history"""
+        if not await self._check_auth(update):
+            return
+
+        if self.chat_manager:
+            self.chat_manager.clear_session(update.effective_user.id)
+
+        await update.message.reply_text("Chat history cleared.")
 
     def create_decision_keyboard(self, job_id: str, state: AgentState) -> InlineKeyboardMarkup:
         """Create inline keyboard for decisions (OpenClaw pattern)"""
