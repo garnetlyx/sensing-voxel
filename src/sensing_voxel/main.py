@@ -23,6 +23,34 @@ from sensing_voxel.core.state_machine import AgentStateMachine
 logger = logging.getLogger(__name__)
 
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """Deep merge override into base dict (override wins)."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config() -> Config:
+    """Load config from default.yaml, overridden by local.yaml if present."""
+    config_path = Path("config/default.yaml")
+    with open(config_path) as f:
+        config_dict = yaml.safe_load(f)
+
+    local_path = Path("config/local.yaml")
+    if local_path.exists():
+        with open(local_path) as f:
+            local_dict = yaml.safe_load(f)
+        if local_dict:
+            config_dict = deep_merge(config_dict, local_dict)
+            logger.info("Loaded config/local.yaml overrides")
+
+    return Config.from_dict(config_dict)
+
+
 async def shutdown(
     signal: signal.Signals,
     loop: asyncio.AbstractEventLoop,
@@ -56,11 +84,7 @@ async def shutdown(
 async def main() -> None:
     """Main async entry point."""
     # Load configuration
-    config_path = Path("config/default.yaml")
-    with open(config_path) as f:
-        config_dict = yaml.safe_load(f)
-
-    config = Config(**config_dict)
+    config = load_config()
 
     # Initialize persistence
     persistence = StatePersistence(config.state_file_path)
@@ -80,15 +104,20 @@ async def main() -> None:
             api_key=config.klipper.api_key,
         )
 
-    # Initialize bot
-    bot = TelegramBot(
-        token=config.telegram.bot_token,
-        allowed_users=config.telegram.allowed_users,
-        state_machine=state_machine,
-        adapter=adapter,
-        config=config,
-        persistence=persistence,
-    )
+    # Initialize bot (optional — skip if no real token configured)
+    bot = None
+    token = config.telegram.bot_token
+    if token and token != "YOUR_BOT_TOKEN_HERE":
+        bot = TelegramBot(
+            token=token,
+            allowed_users=config.telegram.allowed_users,
+            state_machine=state_machine,
+            adapter=adapter,
+            config=config,
+            persistence=persistence,
+        )
+    else:
+        logger.info("Telegram bot disabled (no token configured)")
 
     # Start dashboard if enabled
     dashboard_runner = None
@@ -108,7 +137,7 @@ async def main() -> None:
             from sensing_voxel.api.serializers import serialize_telemetry
             from sensing_voxel.core.models import NormalizedPrinterState, TelemetryData
 
-            app_state = dashboard_runner._server.app["app_state"] if dashboard_runner._server else None
+            app_state = dashboard_runner.app["app_state"] if dashboard_runner.app else None
 
             async def on_state_changed(old: NormalizedPrinterState, new: NormalizedPrinterState):
                 await ws_manager.broadcast_state_change(state_machine.current_state.name, new.name)
@@ -150,7 +179,8 @@ async def main() -> None:
         if adapter:
             await adapter.connect()
 
-        await bot.start()
+        if bot:
+            await bot.start()
 
         # Keep running until shutdown
         await asyncio.Event().wait()
@@ -159,12 +189,17 @@ async def main() -> None:
         # Cleanup
         if adapter:
             await adapter.disconnect()
-        await bot.stop()
+        if bot:
+            await bot.stop()
         if dashboard_runner:
             await dashboard_runner.cleanup()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

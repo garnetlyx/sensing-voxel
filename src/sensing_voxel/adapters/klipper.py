@@ -173,12 +173,15 @@ class KlipperAdapter(PrinterAdapter):
             self._ws = ws
             self._reconnect_attempts = 0  # Reset on successful connection
 
+            # Subscribe to printer objects for live status updates
+            await self._ws_subscribe(ws)
+
             # Check printer state on reconnection to detect changes during disconnection
             await self._check_state_after_reconnect()
 
             await self._emit_connection_restored()
 
-            logger.info("WebSocket connected")
+            logger.info("WebSocket connected and subscribed")
 
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -189,6 +192,24 @@ class KlipperAdapter(PrinterAdapter):
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     raise AdapterConnectionError(f"WebSocket error: {ws.exception()}")
 
+    async def _ws_subscribe(self, ws: aiohttp.ClientWebSocketResponse):
+        """Subscribe to Moonraker printer objects for live updates."""
+        await ws.send_json({
+            "jsonrpc": "2.0",
+            "method": "printer.objects.subscribe",
+            "params": {
+                "objects": {
+                    "print_stats": None,
+                    "heater_bed": None,
+                    "extruder": None,
+                    "toolhead": None,
+                    "display_status": None,
+                }
+            },
+            "id": 1,
+        })
+        logger.debug("Subscribed to printer objects")
+
     async def _handle_ws_message(self, data: dict):
         """Handle WebSocket message"""
         # Validate message structure
@@ -198,7 +219,7 @@ class KlipperAdapter(PrinterAdapter):
 
         method = data.get("method")
         if method is None:
-            logger.warning("WebSocket message missing 'method' field")
+            # JSON-RPC response (e.g. subscription result) — ignore silently
             return
 
         params = data.get("params")

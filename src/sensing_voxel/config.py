@@ -2,6 +2,8 @@
 Configuration management for Sensing Voxel
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,6 +106,26 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     debug: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Config:
+        """Deserialize from a nested dict (e.g. YAML output)."""
+        section_map = {
+            "klipper": KlipperConfig,
+            "bambu": BambuConfig,
+            "telegram": TelegramConfig,
+            "camera": CameraConfig,
+            "slicer": SlicerConfig,
+            "storage": StorageConfig,
+            "dashboard": DashboardConfig,
+        }
+        parsed = {}
+        for key, value in data.items():
+            if key in section_map and isinstance(value, dict):
+                parsed[key] = section_map[key](**value)
+            else:
+                parsed[key] = value
+        return cls(**parsed)
 
     @property
     def state_file_path(self) -> Path:
