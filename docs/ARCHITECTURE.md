@@ -1,29 +1,50 @@
 # Sensing Voxel - Architecture Document
 
-**Version**: 1.1
-**Date**: 2026-02-25
+**Version**: 1.2
+**Date**: 2026-03-03
 **Source**: `.design/plan.md` v10 + `.design/review.md` (all 11 issues addressed)
-**Last Review**: 2026-02-25 — Implementation status annotations added; deviations from spec noted
+**Last Review**: 2026-03-03 — Phase 2/3 vision added; detail restoration from `.design/idea.txt`
 
 ---
 
 ## 1. Overview
 
-A modular async architecture with a shared Agent Core state machine and printer-adapter abstraction. **MVP deploys one Agent Core instance per printer.** Each instance has its own state machine, Telegram command namespace (or printer-selection prefix), and `agent_state.json` file. Multi-printer coordination is deferred to Phase 3.
+A modular async architecture with a shared Agent Core state machine and printer-adapter abstraction. **MVP deploys one Agent Core instance per printer.** Each instance has its own state machine, Telegram command namespace (or printer-selection prefix), and `agent_state.json` file. Multi-printer coordination is deferred to Phase 2.
+
+The architecture is designed in three phases:
+- **Phase 1 (MVP)**: Print automation — Telegram intake, slicing, monitoring, printer control.
+- **Phase 2**: Platform maturity — audio detection, calibration automation, filament monitoring, multi-printer.
+- **Phase 3**: Photo-to-print — Image-to-3D generation, mesh repair, end-to-end pipeline.
 
 ```text
+Phase 1 (MVP):
+
 Telegram Bot <-> Agent Core (state machine + policy + decision engine)
                       |
       +---------------+-------------------+
       |               |                   |
  Slicer Pipeline   Vision Monitor     Printer Adapter (abstract)
- (PrusaSlicer CLI) (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
-                   ├── NOTHING       └── BambuAdapter (Local MQTT + FTP)
+ (PrusaSlicer/     (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
+  OrcaSlicer CLI)  ├── NOTHING       └── BambuAdapter (Local MQTT + FTP)
                    │   (NOTHING
                    ├── FirstLayer
-                   │   (OpenCV)
+                   │   "God Hand"
+                   │   (OpenCV + SET_GCODE_OFFSET Z_ADJUST)
                    └── Calibration
                        (Checkerboard)
+
+Phase 2 additions:
+
+                   ├── Audio Monitor (YAMNet → M112)
+                   │   Stepper skip / glass crack / filament grind
+                   ├── Filament Monitor (USB cam → spool volume + tangle detection)
+                   └── Calibration Automation (tower scoring → SAVE_CONFIG)
+
+Phase 3 additions:
+
+ Photo/Sketch ──→ Image-to-3D API ──→ Mesh Repair ──→ [enters Phase 1 pipeline]
+ (Telegram)       (TripoSR/Meshy/     (MeshLab/Blender
+                   Tripo3D)            headless scripts)
 ```
 
 ---
@@ -312,10 +333,11 @@ class PrinterAdapter(ABC):
 
 ### 4.8 Slicer Pipeline
 
-- Accept `.stl` in MVP intake flow.
-- Run headless PrusaSlicer CLI and parse:
+- Accept `.stl` (MVP) and `.step` (Phase 2) intake flow.
+- Run headless PrusaSlicer or OrcaSlicer CLI and parse:
   - `FirstLayerParams`: layer height, nozzle temp, bed temp, speed.
   - `FirstLayerBounds`: XY bounding box of first-layer moves from G-code parsing.
+- **Proactive geometry analysis**: detect overhangs >60°, bridges, thin walls. Agent recommends optimizations to user (e.g., "Detected overhangs >60° — enable tree supports? Estimated +15g filament, +20min print time") rather than silently slicing with defaults.
 - If extraction fails, print may proceed with NOTHING-only monitoring.
 - For external prints, metadata parsing is best-effort and used for observability only; it does not enable first-layer actuation.
 
@@ -348,15 +370,53 @@ class PrinterAdapter(ABC):
   - **Moderate confidence**: 2/3 frames 0.6-0.85 → pause + ask user.
 - Active for both agent-started and external prints.
 
-#### 4.9.3 First-Layer Classifier
+#### 4.9.3 First-Layer "God Hand" Classifier
 
 - OpenCV-based analysis of calibrated ROI.
+- Visual classification logic: gaps between extrusion lines → Z too high; filament scraping/ridging → Z too low.
+- Correction via `SET_GCODE_OFFSET Z_ADJUST` (±0.01mm step, ±0.05mm clamp).
 - Only executes when all preflight gates pass:
   - Agent-started job (not external).
   - Valid camera calibration.
   - `FirstLayerParams` and `FirstLayerBounds` available.
 - Coverage guard skips low-signal ROI cycles.
 - Evaluation cadence: 5s with 2-consecutive hysteresis and 10s cooldown.
+
+### 4.10 Audio Monitor (Phase 2)
+
+- YAMNet-based audio classifier on microphone input (USB mic or IP camera audio stream).
+- Target anomaly classes:
+  - **Stepper motor skipping**: rhythmic clicking/thudding indicating missed steps or mechanical binding.
+  - **Glass bed cracking**: sharp crack sound indicating thermal stress failure.
+  - **Filament grinding**: continuous grinding/clicking at extruder indicating filament jam or stripped gear.
+- On detection of mechanical safety events, agent triggers `M112` (firmware emergency stop) immediately — does not wait for vision confirmation.
+- Audio detection is independent of and additive to vision-based NOTHING detection.
+
+### 4.11 Filament Spool Monitor (Phase 2)
+
+- Secondary USB camera pointed at filament spool holder.
+- **Volume estimation**: estimate remaining filament diameter/weight from spool image to predict runout.
+- **Tangle detection**: visual detection of crossed filament lines on spool surface — a common failure mode invisible to filament runout sensors. Tangles cause mid-print jams when the crossed section reaches the extruder.
+- On tangle detection or low-filament warning, agent pauses print and notifies user.
+
+### 4.12 Calibration Automation (Phase 2)
+
+- Agent generates temperature tower and flow-rate tower G-code for specified filament.
+- Agent prints towers and uses vision to score each zone (surface quality, stringing, layer adhesion).
+- Agent proposes optimal values to user.
+- On approval, agent injects values into Klipper config via Moonraker `server/config/save` API and executes `SAVE_CONFIG` G-code to persist across restarts.
+
+### 4.13 Image-to-3D Pipeline (Phase 3)
+
+- Accept photo or sketch via Telegram.
+- Call external Image-to-3D API (TripoSR, Meshy, Tripo3D, or self-hosted open-source model).
+- **Mesh repair pipeline** (headless MeshLab/Blender scripts):
+  - Manifold repair (close holes, fix normals, remove degenerate faces).
+  - Thin-wall thickening (ensure minimum wall thickness for FDM printability).
+  - Orientation optimization (minimize support volume, maximize bed adhesion surface).
+  - Support analysis (estimate support requirements, inform user).
+- **Printability gate**: reject meshes that cannot be made structurally sound after repair.
+- Output: repaired STL → enters Phase 1 slicer pipeline (§4.8).
 
 ---
 
@@ -369,13 +429,14 @@ User -> Telegram: .stl file
   -> Bot/Auth: validate user allowlist
   -> Bot: stage file, ACK to user
   -> Slicer Pipeline: headless slice + metadata extraction
-  -> Bot: send summary + Approve/Reject inline keyboard
+  -> Slicer Pipeline: geometry analysis (overhangs, bridges, thin walls)
+  -> Bot: send summary + proactive recommendations + Approve/Reject inline keyboard
   -> Decision Engine: await user response (10min timeout)
   -> Adapter: upload_file() + start_print()
   -> State Machine: PRINTING -> MONITORING
   -> Vision Monitor: NOTHING detection (continuous)
-  -> Vision Monitor: first-layer classifier (first N layers)
-  -> Z-Offset Controller: bounded corrections
+  -> Vision Monitor: first-layer "God Hand" classifier (first N layers)
+  -> Z-Offset Controller: SET_GCODE_OFFSET Z_ADJUST bounded corrections
   -> (print completes)
   -> Z-Offset Controller: restore baseline + verify
   -> State Machine: COMPLETE -> IDLE
@@ -390,6 +451,18 @@ Adapter WebSocket: print_stats.state -> "printing" (debounced)
   -> Vision Monitor: NOTHING-only (no first-layer correction)
   -> (print completes or fails)
   -> State Machine: COMPLETE/FAILED -> IDLE
+```
+
+### Photo-to-Print (Phase 3)
+
+```
+User -> Telegram: photo or sketch
+  -> Bot/Auth: validate user allowlist
+  -> Image-to-3D API: generate mesh (TripoSR/Meshy/Tripo3D)
+  -> Mesh Repair: MeshLab/Blender headless (manifold, walls, orientation)
+  -> Printability Gate: reject if structurally unsound
+  -> Bot: send 3D preview + print estimates + Approve/Reject
+  -> [enters Agent-Started Print flow from Slicer Pipeline step]
 ```
 
 ---
