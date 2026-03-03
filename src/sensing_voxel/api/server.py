@@ -26,6 +26,7 @@ def create_app(
     decision_engine: DecisionEngine | None = None,
     adapters: dict | None = None,
     active_printer: str | None = None,
+    chat_manager=None,
 ) -> tuple[web.Application, WebSocketManager]:
     """Create and configure the dashboard web application.
 
@@ -54,6 +55,7 @@ def create_app(
         "camera_rtsp_url": config.camera_rtsp_url,
         "camera_mjpeg_fps": config.camera_mjpeg_fps,
         "camera_mjpeg_quality": config.camera_mjpeg_quality,
+        "chat_manager": chat_manager,
     }
 
     # Register REST + WebSocket routes
@@ -83,13 +85,14 @@ async def start_server(
     decision_engine: DecisionEngine | None = None,
     adapters: dict | None = None,
     active_printer: str | None = None,
+    chat_manager=None,
 ) -> tuple[web.AppRunner, WebSocketManager]:
     """Start the dashboard server (non-blocking, coexists with asyncio loop).
 
     Returns (runner, ws_manager). Caller must call runner.cleanup() on shutdown.
     """
     app, ws_manager = create_app(
-        config, state_machine, decision_engine, adapters, active_printer
+        config, state_machine, decision_engine, adapters, active_printer, chat_manager
     )
 
     runner = web.AppRunner(app)

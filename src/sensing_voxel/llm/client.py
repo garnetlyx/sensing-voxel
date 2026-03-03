@@ -73,7 +73,11 @@ class LlmClient:
                 system=system_prompt,
                 messages=messages,
             )
-            return response.content[0].text
+            # Find the text block (some models return ThinkingBlock before TextBlock)
+            for block in response.content:
+                if hasattr(block, "text"):
+                    return block.text
+            return response.content[0].text if response.content else ""
 
         return await retry_async(
             _call,

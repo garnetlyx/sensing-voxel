@@ -177,6 +177,7 @@ async def main() -> None:
             decision_engine=decision_engine,
             adapters=adapters,
             active_printer=active_printer,
+            chat_manager=chat_manager,
         )
 
         # Wire per-printer adapter events to WebSocket broadcast

@@ -184,6 +184,46 @@ async def post_decision(request: web.Request) -> web.Response:
         )
 
 
+async def post_chat(request: web.Request) -> web.Response:
+    """Send a message to AI chat and return response"""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+
+    if not chat_manager:
+        raise web.HTTPServiceUnavailable(text="AI chat not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    message = (body.get("message") or "").strip()
+    if not message:
+        raise web.HTTPBadRequest(text="Empty message")
+
+    try:
+        # Use user_id=0 for dashboard session
+        response = await chat_manager.chat(user_id=0, message=message)
+        return web.json_response({"response": response})
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        return web.json_response(
+            {"error": "Failed to get AI response. Please try again."},
+            status=500,
+        )
+
+
+async def post_chat_clear(request: web.Request) -> web.Response:
+    """Clear the dashboard chat session"""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+
+    if chat_manager:
+        chat_manager.clear_session(0)
+
+    return web.json_response({"status": "cleared"})
+
+
 async def set_active_printer(request: web.Request) -> web.Response:
     """Set the active printer for agent control"""
     app_state = request.app["app_state"]
@@ -216,4 +256,6 @@ def setup_routes(app: web.Application, ws_manager):
     app.router.add_get("/api/v1/alerts", get_alerts)
     app.router.add_post("/api/v1/decision", post_decision)
     app.router.add_post("/api/v1/active-printer", set_active_printer)
+    app.router.add_post("/api/v1/chat", post_chat)
+    app.router.add_post("/api/v1/chat/clear", post_chat_clear)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

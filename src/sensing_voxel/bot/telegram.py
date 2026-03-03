@@ -662,6 +662,10 @@ class TelegramBot:
         if not await self._check_auth(update):
             return
 
+        await self._send_chat_response(update, update.message.text)
+
+    async def _send_chat_response(self, update: Update, message: str):
+        """Send a message to the LLM and reply with the response."""
         if not self.chat_manager:
             await update.message.reply_text(
                 "AI chat is not configured. Set up LLM in config/local.yaml."
@@ -669,12 +673,11 @@ class TelegramBot:
             return
 
         user_id = update.effective_user.id
-        user_text = update.message.text
 
         await update.effective_chat.send_action("typing")
 
         try:
-            response = await self.chat_manager.chat(user_id, user_text)
+            response = await self.chat_manager.chat(user_id, message)
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"LLM chat error: {e}", exc_info=True)
@@ -692,9 +695,7 @@ class TelegramBot:
             return
 
         question = " ".join(context.args)
-        # Reuse chat handler logic
-        update.message.text = question
-        await self._handle_chat_message(update, context)
+        await self._send_chat_response(update, question)
 
     async def _handle_clear_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /clear_chat to reset conversation history"""

@@ -90,15 +90,18 @@
       </div>
     </section>
 
-    <!-- Camera panel -->
-    <section class="card camera-panel">
+    <!-- Chat panel -->
+    <section class="card chat-panel">
       <div class="card-header">
-        <span class="card-title">Camera</span>
+        <span class="card-title">AI Chat</span>
+        <button class="chat-clear-btn" onclick="clearChat()">Clear</button>
       </div>
-      <div class="camera-container">
-        <div class="camera-placeholder" id="camera-view">
-          Camera not available
-        </div>
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-welcome">Ask me anything about 3D printing or your printer status.</div>
+      </div>
+      <div class="chat-input-row">
+        <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
+        <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>
       </div>
     </section>
 

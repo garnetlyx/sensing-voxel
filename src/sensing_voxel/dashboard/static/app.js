@@ -460,6 +460,88 @@
     return div.innerHTML;
   }
 
+  // --- AI Chat ---
+  let chatPending = false;
+
+  window.sendChatMessage = async function () {
+    const input = $("#chat-input");
+    const message = (input.value || "").trim();
+    if (!message || chatPending) return;
+
+    input.value = "";
+    appendChatMessage("user", message);
+    chatPending = true;
+    updateChatSendButton();
+
+    // Show typing indicator
+    const typingEl = document.createElement("div");
+    typingEl.className = "chat-msg assistant typing";
+    typingEl.textContent = "Thinking...";
+    $("#chat-messages").appendChild(typingEl);
+    scrollChatToBottom();
+
+    try {
+      const resp = await fetch("/api/v1/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+
+      typingEl.remove();
+
+      if (resp.ok) {
+        const data = await resp.json();
+        appendChatMessage("assistant", data.response || data.error || "No response");
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        appendChatMessage("assistant", data.error || `Error: ${resp.statusText}`);
+      }
+    } catch (e) {
+      typingEl.remove();
+      appendChatMessage("assistant", `Connection error: ${e.message}`);
+    } finally {
+      chatPending = false;
+      updateChatSendButton();
+    }
+  };
+
+  window.clearChat = async function () {
+    const messages = $("#chat-messages");
+    if (messages) {
+      messages.innerHTML = '<div class="chat-welcome">Ask me anything about 3D printing or your printer status.</div>';
+    }
+    try {
+      await fetch("/api/v1/chat/clear", { method: "POST" });
+    } catch {
+      // Ignore
+    }
+  };
+
+  function appendChatMessage(role, text) {
+    const messages = $("#chat-messages");
+    if (!messages) return;
+
+    // Remove welcome message
+    const welcome = messages.querySelector(".chat-welcome");
+    if (welcome) welcome.remove();
+
+    const el = document.createElement("div");
+    el.className = `chat-msg ${role}`;
+    el.textContent = text;
+    messages.appendChild(el);
+    scrollChatToBottom();
+  }
+
+  function scrollChatToBottom() {
+    const messages = $("#chat-messages");
+    if (messages) messages.scrollTop = messages.scrollHeight;
+  }
+
+  function updateChatSendButton() {
+    const btn = $("#chat-send");
+    if (btn) btn.disabled = chatPending;
+  }
+
   // --- Polling fallback (fetch status every 10s if WS down) ---
   async function pollStatus() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -480,6 +562,17 @@
     // Wire up printer dropdown
     const select = $("#printer-select");
     if (select) select.addEventListener("change", onPrinterSelectChange);
+
+    // Wire up chat input
+    const chatInput = $("#chat-input");
+    if (chatInput) {
+      chatInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
+    }
 
     connectWebSocket();
     setInterval(pollStatus, 10000);
