@@ -58,8 +58,10 @@ Phase 3 additions:
 | Slicing | PrusaSlicer CLI (headless) | Headless automation and profile support |
 | Vision | OpenCV + NOTHING
 | Camera | RTSP via OpenCV `VideoCapture` | Network IP camera support |
+| Camera PTZ | ONVIF via `python-onvif-zeep` | Tapo C220 pan/tilt/zoom control |
 | Klipper Control | Moonraker REST + WebSocket | Standard Klipper control plane |
 | Bambu Control | Local MQTT + FTP/FTPS | Native local integration path |
+| LLM | Anthropic SDK (`anthropic`) | Tool-use agentic loop for natural language control |
 | Storage (MVP) | JSON atomic snapshots | Simple state persistence, no DB dependency |
 | Storage (Phase 2) | SQLite | Job history, calibration records, analytics |
 | Config | YAML/TOML | Human-readable configuration |
@@ -94,6 +96,25 @@ sensing-voxel/
 │       │   ├── telegram.py          # Telegram bot handlers
 │       │   ├── auth.py              # User allowlist authentication
 │       │   └── decisions.py         # Inline keyboard decision UI
+│       ├── api/
+│       │   ├── __init__.py
+│       │   ├── server.py            # aiohttp web server setup
+│       │   ├── routes.py            # REST API endpoints
+│       │   ├── websocket.py         # WebSocket manager for dashboard
+│       │   ├── camera_proxy.py      # RTSP→MJPEG proxy for browser
+│       │   ├── auth.py              # API token authentication
+│       │   └── serializers.py       # State/telemetry JSON serializers
+│       ├── dashboard/
+│       │   └── static/              # HTML/CSS/JS dashboard UI
+│       ├── llm/
+│       │   ├── __init__.py
+│       │   ├── client.py            # Async Anthropic SDK wrapper
+│       │   ├── chat.py              # ChatSession + agentic tool-use loop
+│       │   ├── context.py           # PrinterContextCollector (system prompt)
+│       │   └── tools.py             # 31 tool definitions + ToolExecutor
+│       ├── camera/
+│       │   ├── __init__.py
+│       │   └── tapo.py              # Tapo C220 ONVIF PTZ controller
 │       ├── slicer/
 │       │   ├── __init__.py
 │       │   ├── pipeline.py          # STL → G-code pipeline
@@ -111,6 +132,7 @@ sensing-voxel/
 ├── tests/
 │   ├── unit/
 │   ├── integration/
+│   ├── e2e/                         # Live system tests
 │   └── conftest.py
 ├── config/
 │   └── default.yaml                # Default configuration
@@ -418,6 +440,36 @@ class PrinterAdapter(ABC):
 - **Printability gate**: reject meshes that cannot be made structurally sound after repair.
 - Output: repaired STL → enters Phase 1 slicer pipeline (§4.8).
 
+### 4.14 LLM Chat with Tool Use
+
+- Anthropic SDK-based async client (`llm/client.py`) with retry on transient errors.
+- Per-user `ChatSession` (`llm/chat.py`) with conversation history and safe trim (never orphans tool_result messages).
+- `ChatManager` runs an agentic tool-use loop: LLM calls tools, observes results, continues until text response or max 5 iterations.
+- `PrinterContextCollector` (`llm/context.py`) builds system prompt with live printer state, telemetry, and job context. System prompt explicitly warns LLM that background context may be stale — always use tools for authoritative data.
+- 31 tool definitions in `llm/tools.py`:
+  - **Printer query**: get_printer_state, get_print_progress, get_z_offset, list_files, get_file_metadata, get_system_info, list_macros
+  - **Printer control**: start_print, pause_print, resume_print, cancel_print, set_nozzle_temp, set_bed_temp, home_axes, set_fan_speed, set_z_offset, move_axis, extrude, motors_off, set_speed_override, set_flow_override, run_gcode, execute_macro, restart_firmware, restart_service
+  - **Camera**: camera_snapshot (RTSP frame + base64 image block), camera_move_step, camera_move_to, camera_get_presets, camera_go_to_preset
+- Safety: nozzle temp capped at 300C, bed at 120C, M112 blocked via run_gcode (must use emergency_cancel path).
+- `camera_snapshot` returns multimodal content blocks (base64 image + text) for vision analysis by the LLM.
+
+### 4.15 Camera PTZ Control
+
+- `TapoCamera` (`camera/tapo.py`) uses `python-onvif-zeep` for ONVIF protocol.
+- ONVIF connection via `asyncio.to_thread` (blocking ONVIF SDK calls offloaded).
+- Supports: move_step (left/right/up/down), move_to (absolute pan/tilt), get_presets, go_to_preset.
+- Step movements use velocity-based continuous move with 0.3s duration + stop.
+- Configuration via `TapoCameraConfig` (host, user, password, onvif_port).
+
+### 4.16 Web Dashboard API
+
+- `aiohttp`-based web server (`api/server.py`) with REST + WebSocket endpoints.
+- REST: `/api/health`, `/api/printers`, `/api/status`, `/api/telemetry/{printer_id}`, `/api/actions/{printer_id}/{action}`, `/api/llm/chat`.
+- WebSocket: `/ws` for real-time telemetry push to dashboard clients.
+- MJPEG camera proxy: `/api/camera/stream` converts RTSP to browser-compatible MJPEG.
+- Optional API token authentication (`DashboardConfig.api_token`).
+- Static file serving for dashboard UI at `/`.
+
 ---
 
 ## 5. Data Flow
@@ -611,46 +663,50 @@ The find-stl skill stages downloaded files with:
 
 ---
 
-## 9. Implementation Status (as of 2026-02-25)
+## 9. Implementation Status (as of 2026-03-05)
 
-This section tracks actual implementation state vs. the architecture spec, annotated during the 2026-02-25 code review.
+This section tracks actual implementation state vs. the architecture spec.
 
 ### Implemented (Core Infrastructure)
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
 | Core data models | `core/models.py` | Complete | All enums, dataclasses, and event types per spec |
-| Agent state machine | `core/state_machine.py` | Complete (with known bug) | Transition table enforced; BUG-5/BUG-REV-2 enter-hook atomicity unresolved |
+| Agent state machine | `core/state_machine.py` | Complete | Transition table enforced, hook rollback implemented |
 | Decision engine | `core/decision.py` | Complete (1 test failing) | Lock-guarded CAS correct; WeakValueDictionary causes 1 failing test |
-| State persistence | `core/persistence.py` | Complete | Uses `filelock.SoftFileLock` (cross-platform); signal handling should move to `main.py` |
+| State persistence | `core/persistence.py` | Complete | Uses `filelock.SoftFileLock` (cross-platform) |
 | Retry infrastructure | `infra/retry.py` | Complete | Correct backoff with jitter; `retry_async` and `retry_async_with_reset` |
 | Printer adapter ABC | `adapters/base.py` | Complete | All abstract methods, event emitters, `NotSupportedError` |
 | Command queue | `adapters/command_queue.py` | Complete | Priority queue, emergency bypass, 0.5s shutdown poll timeout |
-| Klipper/Moonraker adapter | `adapters/klipper.py` | ~70% | REST + WebSocket reconnect done; emergency_cancel shares primary session (BUG-REV-1); compatibility mode stub only |
-| Telegram bot | `bot/telegram.py` | ~50% | Auth, file upload, decision keyboard, Z-offset command present; slicing trigger is TODO; dependency injection broken (BUG-REV-5) |
-| Configuration | `config.py` | Complete | All config sections; no startup validation for placeholder token |
-| Entry point | `main.py` | ~80% | Correct async main; `shutdown()` missing persistence arg (BUG-REV-3) |
+| Klipper/Moonraker adapter | `adapters/klipper.py` | ~85% | REST+WS, base_url support, telemetry parsing, state normalization |
+| Bambu adapter | `adapters/bambu.py` | ~80% | MQTT+FTP, start/pause/cancel/status, emergency cancel |
+| Telegram bot | `bot/telegram.py` | ~70% | Auth, upload, decisions, DI, notifications; missing AI chat wiring |
+| Configuration | `config.py` | Complete | All config sections including LLM, TapoCamera, Dashboard |
+| Entry point | `main.py` | ~90% | Async main, multi-printer, dashboard, LLM wiring |
+| Web dashboard API | `api/` | Complete | REST endpoints, WebSocket, MJPEG proxy, token auth |
+| Dashboard UI | `dashboard/static/` | ~40% | Real-time telemetry, multi-printer selector |
+| LLM client | `llm/client.py` | Complete | Async Anthropic SDK wrapper with retry |
+| LLM chat | `llm/chat.py` | Complete | Per-user sessions, agentic tool-use loop (max 5 iterations) |
+| LLM context | `llm/context.py` | Complete | Printer context collector + system prompt builder |
+| LLM tools | `llm/tools.py` | Complete | 31 tools: printer control, camera, system (Fluidd-equivalent) |
+| Camera PTZ | `camera/tapo.py` | Complete | ONVIF-based Tapo C220 pan/tilt control |
+| Monitoring orchestrator | `monitoring/monitor.py` | ~60% | External print detection done, NOTHING routing done |
 
 ### Not Yet Implemented
 
 | Component | Files | Blocking Tasks |
 |-----------|-------|----------------|
-| Bambu adapter | `adapters/bambu.py` (missing) | TASKS.md 1.8 |
-| Slicer pipeline | `slicer/pipeline.py`, `slicer/metadata.py` (missing) | TASKS.md 1.10 |
-| NOTHING detection | `vision/NOTHING.py`, `vision/camera.py` (missing) | TASKS.md 1.11 |
-| Camera calibration | `vision/calibration.py` (missing) | TASKS.md 1.12 |
-| First-layer classifier | `vision/first_layer.py` (missing) | TASKS.md 1.13 |
-| Z-offset controller | `monitoring/z_offset.py` (missing) | TASKS.md 1.13 |
-| Monitoring orchestrator | `monitoring/monitor.py` (missing) | TASKS.md 1.14, 1.15 |
-| Bot auth module | `bot/auth.py` (missing) | TASKS.md 1.9 |
-| Bot decisions module | `bot/decisions.py` (missing) | TASKS.md 1.9 |
-| Integration tests | `tests/integration/` (missing) | TASKS.md 1.16 |
+| Slicer pipeline | `slicer/pipeline.py`, `slicer/metadata.py` (stubs) | TASKS.md 1.10 |
+| NOTHING detection | `vision/NOTHING.py`, `vision/camera.py` (stubs) | TASKS.md 1.11 |
+| Camera calibration | `vision/calibration.py` (stub) | TASKS.md 1.12 |
+| First-layer classifier | `vision/first_layer.py` (stub) | TASKS.md 1.13 |
+| Z-offset controller | `monitoring/z_offset.py` (stub) | TASKS.md 1.13 |
+| Integration tests | `tests/integration/` (sparse) | TASKS.md 1.16 |
 
 ### Known Deviations from Architecture Spec
 
 | Spec Reference | Spec Requirement | Actual Implementation | Fix Required |
 |---|---|---|---|
-| §4.5 / §4.6 | `emergency_cancel` uses dedicated session | Uses `self._session` same as `cancel_print` | Yes — BUG-REV-1 |
 | §8.2 | Jitter should be random | Uses `event_loop.time() % 1` (deterministic) | Yes — BUG-REV-4 |
-| §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation in `_handle_status_update` |
-| §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; no env var fallback for bot token | Low risk for MVP; consider `python-dotenv` integration |
+| §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation |
+| §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; no env var fallback | Low risk for MVP |

@@ -201,19 +201,22 @@ This vision is delivered in phases:
 
 ### 4.1 Must Have (MVP)
 
-- [ ] Telegram bot workflow with upload validation, inline decisions, configurable timeout handling, and **user allowlist authentication**.
-- [ ] Klipper/Moonraker printer adapter with compatibility mode for older/modified Moonraker APIs (Neptune-class firmware variants).
-- [ ] Bambu printer adapter (minimal): start, pause, cancel, status via local MQTT + FTP/FTPS.
-- [ ] Shared printer adapter interface contract (abstract base for Klipper and Bambu adapters).
+- [x] Telegram bot workflow with upload validation, inline decisions, configurable timeout handling, and **user allowlist authentication** (~70%).
+- [x] Klipper/Moonraker printer adapter with compatibility mode for older/modified Moonraker APIs (~90%).
+- [x] Bambu printer adapter (minimal): start, pause, cancel, status via local MQTT + FTP/FTPS (~80%).
+- [x] Shared printer adapter interface contract (abstract base for Klipper and Bambu adapters).
 - [ ] STL slicing pipeline with parameter extraction (`FirstLayerParams`, `FirstLayerBounds`) for agent-started jobs.
 - [ ] Camera calibration lifecycle: checkerboard calibration, artifact storage, validity checking, `/calibrate_camera` command.
 - [ ] First-layer auto-correction for agent-started jobs only, with saturation exit behavior.
 - [ ] NOTHING detection with pause/cancel policy and emergency bypass path.
-- [ ] Decision idempotency with lock-guarded CAS helper across callbacks/timeouts/recovery.
-- [ ] Persistent state snapshots (JSON) with safe IDLE reset policy preserving safety flags.
-- [ ] Z-offset baseline capture/restore contract with verification, dirty-state print blocking, and `/reset_z_offset [target_mm]`.
-- [ ] External print detection with NOTHING-only monitoring policy.
-- [ ] Moonraker WebSocket reconnection with backoff and state reconciliation.
+- [x] Decision idempotency with lock-guarded CAS helper across callbacks/timeouts/recovery.
+- [x] Persistent state snapshots (JSON) with safe IDLE reset policy preserving safety flags.
+- [x] Z-offset baseline capture/restore contract with verification, dirty-state print blocking, and `/reset_z_offset [target_mm]`.
+- [x] External print detection with NOTHING-only monitoring policy.
+- [x] Moonraker WebSocket reconnection with backoff and state reconciliation.
+- [x] **LLM chat with 31 tool-use functions** for natural language printer control (added post-PRD).
+- [x] **PTZ camera control** via ONVIF for Tapo C220 (added post-PRD).
+- [x] **Web dashboard API** with REST, WebSocket, MJPEG proxy (added post-PRD).
 
 ### 4.2 Phase 2 — Platform Maturity
 
