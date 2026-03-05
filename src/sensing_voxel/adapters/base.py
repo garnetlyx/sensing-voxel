@@ -92,6 +92,71 @@ class PrinterAdapter(ABC):
         """Run arbitrary G-code command"""
         pass
 
+    @abstractmethod
+    async def list_files(self) -> CommandResult:
+        """List G-code files on the printer"""
+        pass
+
+    @abstractmethod
+    async def delete_file(self, filename: str) -> CommandResult:
+        """Delete a G-code file from the printer"""
+        pass
+
+    @abstractmethod
+    async def get_file_metadata(self, filename: str) -> CommandResult:
+        """Get G-code file metadata (layers, height, etc.)"""
+        pass
+
+    @abstractmethod
+    async def move_axis(self, axis: str, distance: float, speed: int = 3000) -> CommandResult:
+        """Move an axis by relative distance (mm)"""
+        pass
+
+    @abstractmethod
+    async def extrude(self, length: float, speed: int = 300) -> CommandResult:
+        """Extrude or retract filament (negative = retract)"""
+        pass
+
+    @abstractmethod
+    async def set_speed_override(self, percent: int) -> CommandResult:
+        """Set speed override percentage (e.g. 100 = normal)"""
+        pass
+
+    @abstractmethod
+    async def set_flow_override(self, percent: int) -> CommandResult:
+        """Set flow/extrusion multiplier percentage"""
+        pass
+
+    @abstractmethod
+    async def list_macros(self) -> CommandResult:
+        """List available Klipper macros"""
+        pass
+
+    @abstractmethod
+    async def execute_macro(self, name: str) -> CommandResult:
+        """Execute a Klipper macro by name"""
+        pass
+
+    @abstractmethod
+    async def restart_firmware(self) -> CommandResult:
+        """Restart Klipper firmware"""
+        pass
+
+    @abstractmethod
+    async def restart_service(self) -> CommandResult:
+        """Restart Klipper service"""
+        pass
+
+    @abstractmethod
+    async def get_system_info(self) -> CommandResult:
+        """Get system info (CPU, memory, etc.)"""
+        pass
+
+    @abstractmethod
+    async def motors_off(self) -> CommandResult:
+        """Turn off all stepper motors"""
+        pass
+
     # --- Queries ---
 
     @abstractmethod

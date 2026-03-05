@@ -311,6 +311,79 @@ body {
 .temp-bar-fill.nozzle { background: var(--danger); }
 .temp-bar-fill.bed { background: var(--warning); }
 
+/* Camera panel */
+.camera-panel {
+  grid-column: 1 / -1;
+}
+
+.camera-feed-container {
+  position: relative;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  margin-bottom: 12px;
+}
+
+.camera-feed {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.camera-no-feed {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.camera-ptz-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.ptz-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ptz-center {
+  width: 36px;
+  height: 36px;
+}
+
+.ptz-btn {
+  width: 36px;
+  height: 36px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.ptz-btn:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--accent);
+}
+
+.ptz-btn:active {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* Chat panel */
 .chat-panel {
   grid-column: 1 / 3;

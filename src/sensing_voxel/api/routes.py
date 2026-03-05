@@ -246,6 +246,52 @@ async def set_active_printer(request: web.Request) -> web.Response:
     return web.json_response({"active_printer": printer_id})
 
 
+async def post_camera_move(request: web.Request) -> web.Response:
+    """Move camera in a direction (step movement)"""
+    app_state = request.app["app_state"]
+    camera = app_state.get("camera")
+
+    if not camera:
+        raise web.HTTPServiceUnavailable(text="Camera PTZ not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    direction = (body.get("direction") or "").strip().lower()
+    if direction not in ("left", "right", "up", "down"):
+        raise web.HTTPBadRequest(text="Invalid direction. Use: left, right, up, down")
+
+    result = await camera.move_step(direction)
+    if "error" in result:
+        return web.json_response(result, status=500)
+    return web.json_response(result)
+
+
+async def post_camera_preset(request: web.Request) -> web.Response:
+    """Move camera to a preset position"""
+    app_state = request.app["app_state"]
+    camera = app_state.get("camera")
+
+    if not camera:
+        raise web.HTTPServiceUnavailable(text="Camera PTZ not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    preset_id = body.get("preset_id")
+    if preset_id is None:
+        raise web.HTTPBadRequest(text="Missing preset_id")
+
+    result = await camera.set_preset(int(preset_id))
+    if "error" in result:
+        return web.json_response(result, status=500)
+    return web.json_response(result)
+
+
 def setup_routes(app: web.Application, ws_manager):
     """Register all API routes"""
     app.router.add_get("/health", health_check)
@@ -258,4 +304,6 @@ def setup_routes(app: web.Application, ws_manager):
     app.router.add_post("/api/v1/active-printer", set_active_printer)
     app.router.add_post("/api/v1/chat", post_chat)
     app.router.add_post("/api/v1/chat/clear", post_chat_clear)
+    app.router.add_post("/api/v1/camera/move", post_camera_move)
+    app.router.add_post("/api/v1/camera/preset", post_camera_preset)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

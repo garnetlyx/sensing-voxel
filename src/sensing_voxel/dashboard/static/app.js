@@ -460,6 +460,23 @@
     return div.innerHTML;
   }
 
+  // --- Camera PTZ ---
+  window.cameraMove = async function (direction) {
+    try {
+      const resp = await fetch("/api/v1/camera/move", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ direction }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        addAlert("error", `Camera move failed: ${data.error || resp.statusText}`);
+      }
+    } catch (e) {
+      addAlert("error", `Camera move failed: ${e.message}`);
+    }
+  };
+
   // --- AI Chat ---
   let chatPending = false;
 

@@ -50,6 +50,13 @@ telegram:
 #   frame_height: 1080
 #   fps: 10
 
+# Tapo Camera PTZ Configuration (optional)
+# Uncomment and configure for camera pan/tilt control
+# tapo_camera:
+#   host: "192.168.1.102"
+#   user: "admin"
+#   password: "your_camera_password"
+
 # Slicer Configuration
 slicer:
   prusaslicer_path: "prusa-slicer"

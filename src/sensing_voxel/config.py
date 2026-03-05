@@ -65,6 +65,15 @@ class CameraConfig:
 
 
 @dataclass
+class TapoCameraConfig:
+    """Tapo PTZ camera configuration"""
+
+    host: str = ""
+    user: str = ""
+    password: str = ""
+
+
+@dataclass
 class SlicerConfig:
     """Slicer configuration"""
 
@@ -129,6 +138,7 @@ class Config:
     bambu: BambuConfig | None = None
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     camera: CameraConfig | None = None
+    tapo_camera: TapoCameraConfig | None = None
     slicer: SlicerConfig = field(default_factory=SlicerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
@@ -141,6 +151,7 @@ class Config:
         section_map = {
             "telegram": TelegramConfig,
             "camera": CameraConfig,
+            "tapo_camera": TapoCameraConfig,
             "slicer": SlicerConfig,
             "storage": StorageConfig,
             "dashboard": DashboardConfig,

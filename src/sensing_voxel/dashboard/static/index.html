@@ -90,6 +90,29 @@
       </div>
     </section>
 
+    <!-- Camera panel -->
+    <section class="card camera-panel" id="camera-panel">
+      <div class="card-header">
+        <span class="card-title">Camera</span>
+      </div>
+      <div class="camera-feed-container">
+        <img id="camera-feed" class="camera-feed"
+             src="/api/v1/camera/stream"
+             alt="Camera feed"
+             onerror="this.style.display='none';document.getElementById('camera-no-feed').style.display='flex'">
+        <div class="camera-no-feed" id="camera-no-feed">No camera feed</div>
+      </div>
+      <div class="camera-ptz-controls">
+        <button class="ptz-btn" onclick="cameraMove('up')" title="Tilt Up">&#9650;</button>
+        <div class="ptz-row">
+          <button class="ptz-btn" onclick="cameraMove('left')" title="Pan Left">&#9664;</button>
+          <div class="ptz-center"></div>
+          <button class="ptz-btn" onclick="cameraMove('right')" title="Pan Right">&#9654;</button>
+        </div>
+        <button class="ptz-btn" onclick="cameraMove('down')" title="Tilt Down">&#9660;</button>
+      </div>
+    </section>
+
     <!-- Chat panel -->
     <section class="card chat-panel">
       <div class="card-header">

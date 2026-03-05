@@ -122,6 +122,18 @@ async def main() -> None:
     adapters = create_adapters(config)
     active_printer = next(iter(adapters), None)
 
+    # Initialize Tapo camera (optional)
+    tapo_camera = None
+    if config.tapo_camera and config.tapo_camera.host:
+        from sensing_voxel.camera.tapo import TapoCamera
+
+        tapo_camera = TapoCamera(config.tapo_camera)
+        try:
+            await tapo_camera.connect()
+        except Exception as e:
+            logger.error(f"Failed to connect Tapo camera: {e}")
+            tapo_camera = None
+
     # Initialize LLM (optional)
     llm_client = None
     chat_manager = None
@@ -143,6 +155,7 @@ async def main() -> None:
             client=llm_client,
             context_collector=context_collector,
             adapter=adapters.get(active_printer) if active_printer else None,
+            camera=tapo_camera,
             max_turns=config.llm.max_conversation_turns,
         )
         logger.info(f"LLM initialized: model={config.llm.model}")
@@ -180,6 +193,7 @@ async def main() -> None:
             adapters=adapters,
             active_printer=active_printer,
             chat_manager=chat_manager,
+            camera=tapo_camera,
         )
 
         # Wire per-printer adapter events to WebSocket broadcast
@@ -278,6 +292,8 @@ async def main() -> None:
 
     finally:
         # Cleanup
+        if tapo_camera:
+            await tapo_camera.disconnect()
         if llm_client:
             await llm_client.close()
         for adapter in adapters.values():

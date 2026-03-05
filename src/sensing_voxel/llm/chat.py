@@ -94,12 +94,14 @@ class ChatManager:
         client: LlmClient,
         context_collector: PrinterContextCollector,
         adapter: PrinterAdapter | None = None,
+        camera=None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
     ):
         self._client = client
         self._context_collector = context_collector
         self._adapter = adapter
+        self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
         self._sessions: dict[int, ChatSession] = {}
@@ -108,10 +110,12 @@ class ChatManager:
         self._tool_executor = None
         self._tools = None
         if adapter:
-            from sensing_voxel.llm.tools import PRINTER_TOOLS, ToolExecutor
+            from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
 
-            self._tool_executor = ToolExecutor(adapter)
-            self._tools = PRINTER_TOOLS
+            self._tool_executor = ToolExecutor(adapter, camera=camera)
+            self._tools = list(PRINTER_TOOLS)
+            if camera:
+                self._tools.extend(CAMERA_TOOLS)
 
     async def chat(self, user_id: int, message: str) -> str:
         """Process user message and return AI response.

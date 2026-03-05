@@ -584,6 +584,45 @@ class BambuAdapter(PrinterAdapter):
             message="G-code commands not supported for Bambu printers in MVP",
         )
 
+    async def list_files(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def delete_file(self, filename: str) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def get_file_metadata(self, filename: str) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def move_axis(self, axis: str, distance: float, speed: int = 3000) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def extrude(self, length: float, speed: int = 300) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def set_speed_override(self, percent: int) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def set_flow_override(self, percent: int) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def list_macros(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def execute_macro(self, name: str) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def restart_firmware(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def restart_service(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def get_system_info(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
+    async def motors_off(self) -> CommandResult:
+        return CommandResult(CommandResultStatus.FAILURE, message="Not supported for Bambu in MVP")
+
     # --- Queries ---
 
     async def get_printer_state(self) -> NormalizedPrinterState:
