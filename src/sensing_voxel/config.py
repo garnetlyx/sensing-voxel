@@ -16,6 +16,7 @@ class KlipperConfig:
     host: str = "localhost"
     port: int = 7125
     api_key: str | None = None
+    base_url: str | None = None  # Override host:port (e.g. "http://printer.example")
     ws_reconnect_max_attempts: int = 10
     ws_reconnect_base_delay: float = 1.0
     ws_reconnect_max_delay: float = 30.0

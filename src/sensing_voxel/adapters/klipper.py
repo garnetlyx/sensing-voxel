@@ -50,6 +50,7 @@ class KlipperAdapter(PrinterAdapter):
         port: int = 7125,
         api_key: str | None = None,
         compatibility_mode: bool = False,
+        base_url: str | None = None,
     ):
         super().__init__()
         self.host = host
@@ -57,8 +58,13 @@ class KlipperAdapter(PrinterAdapter):
         self.api_key = api_key
         self.compatibility_mode = compatibility_mode
 
-        self._rest_base_url = f"http://{host}:{port}"
-        self._ws_url = f"ws://{host}:{port}/websocket"
+        if base_url:
+            self._rest_base_url = base_url.rstrip("/")
+            ws_base = self._rest_base_url.replace("https://", "wss://").replace("http://", "ws://")
+            self._ws_url = f"{ws_base}/websocket"
+        else:
+            self._rest_base_url = f"http://{host}:{port}"
+            self._ws_url = f"ws://{host}:{port}/websocket"
 
         self._session: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None

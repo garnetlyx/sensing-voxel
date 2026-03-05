@@ -61,6 +61,7 @@ def create_adapters(config: Config) -> dict[str, PrinterAdapter]:
                 host=printer_cfg.host,
                 port=printer_cfg.port,
                 api_key=printer_cfg.api_key,
+                base_url=printer_cfg.base_url,
             )
         elif isinstance(printer_cfg, BambuConfig):
             from sensing_voxel.adapters.bambu import BambuAdapter
