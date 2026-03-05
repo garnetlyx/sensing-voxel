@@ -71,6 +71,7 @@ class TapoCameraConfig:
     host: str = ""
     user: str = ""
     password: str = ""
+    onvif_port: int = 2020
 
 
 @dataclass

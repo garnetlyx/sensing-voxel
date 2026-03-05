@@ -314,6 +314,7 @@ body {
 /* Camera panel */
 .camera-panel {
   grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 .camera-feed-container {
@@ -321,8 +322,8 @@ body {
   background: #000;
   border-radius: 4px;
   overflow: hidden;
-  aspect-ratio: 16 / 9;
-  margin-bottom: 12px;
+  height: 280px;
+  margin-bottom: 8px;
 }
 
 .camera-feed {
@@ -334,7 +335,7 @@ body {
 .camera-no-feed {
   position: absolute;
   inset: 0;
-  display: flex;
+  display: none;
   align-items: center;
   justify-content: center;
   color: var(--text-muted);

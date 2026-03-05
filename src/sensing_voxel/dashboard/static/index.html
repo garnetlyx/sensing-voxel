@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sensing Voxel</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
   <!-- Header -->
@@ -99,7 +99,8 @@
         <img id="camera-feed" class="camera-feed"
              src="/api/v1/camera/stream"
              alt="Camera feed"
-             onerror="this.style.display='none';document.getElementById('camera-no-feed').style.display='flex'">
+             onerror="this.style.display='none';document.getElementById('camera-no-feed').style.display='flex'"
+             onload="document.getElementById('camera-no-feed').style.display='none'">
         <div class="camera-no-feed" id="camera-no-feed">No camera feed</div>
       </div>
       <div class="camera-ptz-controls">
@@ -110,6 +111,16 @@
           <button class="ptz-btn" onclick="cameraMove('right')" title="Pan Right">&#9654;</button>
         </div>
         <button class="ptz-btn" onclick="cameraMove('down')" title="Tilt Down">&#9660;</button>
+      </div>
+    </section>
+
+    <!-- Decision panel -->
+    <section class="card decision-panel">
+      <div class="card-header">
+        <span class="card-title">Decision</span>
+      </div>
+      <div class="decision-content">
+        <p class="no-decision">No pending decisions</p>
       </div>
     </section>
 
@@ -125,16 +136,6 @@
       <div class="chat-input-row">
         <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
         <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>
-      </div>
-    </section>
-
-    <!-- Decision panel -->
-    <section class="card decision-panel">
-      <div class="card-header">
-        <span class="card-title">Decision</span>
-      </div>
-      <div class="decision-content">
-        <p class="no-decision">No pending decisions</p>
       </div>
     </section>
 

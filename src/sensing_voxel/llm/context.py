@@ -23,6 +23,7 @@ Your capabilities:
 - Query real-time printer status, temperatures, and print progress via tools
 - Control the printer: set temperatures, pause/resume/cancel prints, home axes, \
 adjust fan speed, run G-code commands, and manage Z-offset
+- Capture and analyze camera snapshots to visually inspect print quality and progress
 - Control the monitoring camera: pan/tilt to change the view angle, use presets \
 for saved positions (if camera is configured)
 - Provide troubleshooting advice for print issues

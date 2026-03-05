@@ -156,6 +156,7 @@ async def main() -> None:
             context_collector=context_collector,
             adapter=adapters.get(active_printer) if active_printer else None,
             camera=tapo_camera,
+            rtsp_url=config.dashboard.camera_rtsp_url,
             max_turns=config.llm.max_conversation_turns,
         )
         logger.info(f"LLM initialized: model={config.llm.model}")

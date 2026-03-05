@@ -4,8 +4,11 @@ Anthropic tool definitions and executor for printer control
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 from sensing_voxel.adapters.base import PrinterAdapter
@@ -312,6 +315,19 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
 
 CAMERA_TOOLS: list[dict[str, Any]] = [
     {
+        "name": "camera_snapshot",
+        "description": (
+            "Capture a snapshot from the monitoring camera and analyze it visually. "
+            "Use this when the user asks you to look at the printer, check print quality, "
+            "or see what's happening."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "camera_move_step",
         "description": (
             "Move the monitoring camera one step in a direction. "
@@ -379,9 +395,10 @@ CAMERA_TOOLS: list[dict[str, Any]] = [
 class ToolExecutor:
     """Dispatches tool calls to the printer adapter and optional camera."""
 
-    def __init__(self, adapter: PrinterAdapter, camera=None):
+    def __init__(self, adapter: PrinterAdapter, camera=None, rtsp_url: str | None = None):
         self._adapter = adapter
         self._camera = camera
+        self._rtsp_url = rtsp_url
         self._dispatch: dict[str, Any] = {
             "get_printer_state": self._get_printer_state,
             "get_print_progress": self._get_print_progress,
@@ -417,15 +434,20 @@ class ToolExecutor:
                 "camera_get_presets": self._camera_get_presets,
                 "camera_go_to_preset": self._camera_go_to_preset,
             })
+        if rtsp_url:
+            self._dispatch["camera_snapshot"] = self._camera_snapshot
 
-    async def execute(self, tool_name: str, tool_input: dict) -> str:
-        """Execute a tool call and return JSON result string."""
+    async def execute(self, tool_name: str, tool_input: dict) -> str | dict:
+        """Execute a tool call and return JSON string or structured content blocks."""
         handler = self._dispatch.get(tool_name)
         if not handler:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
         try:
             result = await handler(tool_input)
+            # Structured content (e.g. image blocks) — pass through as-is
+            if isinstance(result, dict) and "content" in result:
+                return result
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Tool execution error ({tool_name}): {e}", exc_info=True)
@@ -720,6 +742,46 @@ class ToolExecutor:
         if preset_id is None:
             return {"error": "preset_id is required"}
         return await self._camera.set_preset(int(preset_id))
+
+    async def _camera_snapshot(self, _input: dict) -> dict:
+        """Capture RTSP frame and return as image content blocks."""
+        if not self._rtsp_url:
+            return {"error": "Camera RTSP URL not configured"}
+
+        def _capture():
+            import cv2
+            cap = cv2.VideoCapture(self._rtsp_url)
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    return None
+                frame = cv2.resize(frame, (320, 180))
+                ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                return jpeg.tobytes() if ret else None
+            finally:
+                cap.release()
+
+        jpeg_bytes = await asyncio.to_thread(_capture)
+        if not jpeg_bytes:
+            return {"error": "Failed to capture frame from camera"}
+
+        b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+        return {
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": f"Camera snapshot captured at {datetime.now().strftime('%H:%M:%S')}",
+                },
+            ]
+        }
 
     # --- Helpers ---
 

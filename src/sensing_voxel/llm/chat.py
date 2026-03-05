@@ -39,8 +39,8 @@ class ChatSession:
             self.messages.append({"role": "assistant", "content": content})
         self._trim()
 
-    def add_tool_result(self, tool_use_id: str, result: str) -> None:
-        """Add tool result message."""
+    def add_tool_result(self, tool_use_id: str, result: str | list) -> None:
+        """Add tool result message (str or content blocks list)."""
         self.messages.append({
             "role": "user",
             "content": [
@@ -95,6 +95,7 @@ class ChatManager:
         context_collector: PrinterContextCollector,
         adapter: PrinterAdapter | None = None,
         camera=None,
+        rtsp_url: str | None = None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
     ):
@@ -112,9 +113,9 @@ class ChatManager:
         if adapter:
             from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
 
-            self._tool_executor = ToolExecutor(adapter, camera=camera)
+            self._tool_executor = ToolExecutor(adapter, camera=camera, rtsp_url=rtsp_url)
             self._tools = list(PRINTER_TOOLS)
-            if camera:
+            if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
 
     async def chat(self, user_id: int, message: str) -> str:
@@ -160,8 +161,12 @@ class ChatManager:
                 if block.type == "tool_use":
                     logger.info(f"Tool call: {block.name}({block.input})")
                     result = await self._tool_executor.execute(block.name, block.input)
-                    logger.info(f"Tool result: {result[:200]}")
-                    session.add_tool_result(block.id, result)
+                    if isinstance(result, dict) and "content" in result:
+                        logger.info(f"Tool result: [image + text content blocks]")
+                        session.add_tool_result(block.id, result["content"])
+                    else:
+                        logger.info(f"Tool result: {result[:200]}")
+                        session.add_tool_result(block.id, result)
 
         # Exhausted iterations
         return self._truncate(
