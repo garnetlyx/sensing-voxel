@@ -4,6 +4,7 @@ Unit tests for TelegramBot
 import pytest
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from datetime import datetime
+from pathlib import Path
 import asyncio
 
 from sensing_voxel.core.models import (
@@ -137,8 +138,8 @@ class TestTelegramBotFileUpload:
     """File upload tests"""
 
     @pytest.mark.asyncio
-    async def test_reject_non_stl_files(self):
-        """Test that non-STL files are rejected"""
+    async def test_reject_unsupported_extension(self):
+        """Test that unsupported file types are rejected"""
         state_machine = AgentStateMachine()
         bot = TelegramBot(
             token="test_token",
@@ -157,11 +158,92 @@ class TestTelegramBotFileUpload:
 
         update.message.reply_text.assert_called_once()
         call_text = update.message.reply_text.call_args[0][0]
-        assert "Only STL files" in call_text
+        assert "STL" in call_text or "G-code" in call_text
 
     @pytest.mark.asyncio
-    async def test_reject_oversized_files(self):
-        """Test that oversized files are rejected"""
+    async def test_reject_txt_extension(self):
+        """Test that .txt files are rejected"""
+        state_machine = AgentStateMachine()
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+        )
+
+        update = Mock()
+        update.effective_user.id = 12345
+        update.message = Mock()
+        update.message.document = Mock()
+        update.message.document.file_name = "notes.txt"
+        update.message.reply_text = AsyncMock()
+
+        await bot._handle_file_upload(update, None)
+
+        update.message.reply_text.assert_called_once()
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "supported" in call_text.lower() or "STL" in call_text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ext", [".gcode", ".g", ".gco"])
+    async def test_accept_gcode_extensions(self, ext):
+        """Test that G-code file extensions (.gcode, .g, .gco) pass the extension check"""
+        state_machine = AgentStateMachine()
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+        )
+
+        update = Mock()
+        update.effective_user.id = 12345
+        update.effective_chat = Mock()
+        update.effective_chat.id = 99
+        update.message = Mock()
+        update.message.document = Mock()
+        update.message.document.file_name = f"benchy{ext}"
+        update.message.document.file_size = 1024  # 1KB — small enough
+        update.message.reply_text = AsyncMock()
+
+        # Bot is not IDLE — but it should get past extension/size checks first
+        state_machine.current_state = AgentState.MONITORING
+
+        await bot._handle_file_upload(update, None)
+
+        # The first reply should be the "Processing" message (extension accepted),
+        # followed by the "Agent is busy" message
+        calls = update.message.reply_text.call_args_list
+        assert any("Processing" in str(c) or "G-code" in str(c) for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_accept_stl_extension(self):
+        """Test that .stl extension passes the extension check"""
+        state_machine = AgentStateMachine()
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+        )
+
+        update = Mock()
+        update.effective_user.id = 12345
+        update.effective_chat = Mock()
+        update.effective_chat.id = 99
+        update.message = Mock()
+        update.message.document = Mock()
+        update.message.document.file_name = "model.stl"
+        update.message.document.file_size = 1024
+        update.message.reply_text = AsyncMock()
+
+        state_machine.current_state = AgentState.MONITORING
+
+        await bot._handle_file_upload(update, None)
+
+        calls = update.message.reply_text.call_args_list
+        assert any("Processing" in str(c) or "STL" in str(c) for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_reject_oversized_stl_files(self):
+        """Test that oversized STL files are rejected (>100MB)"""
         state_machine = AgentStateMachine()
         bot = TelegramBot(
             token="test_token",
@@ -179,8 +261,35 @@ class TestTelegramBotFileUpload:
 
         await bot._handle_file_upload(update, None)
 
-        update.message.reply_text.assert_called_once()
-        call_text = update.message.reply_text.call_args[0][0]
+        # First call is "Processing", second is the size rejection
+        calls = update.message.reply_text.call_args_list
+        size_call = calls[-1]
+        call_text = size_call[0][0]
+        assert "too large" in call_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_reject_oversized_gcode_files(self):
+        """Test that oversized G-code files are rejected (>200MB)"""
+        state_machine = AgentStateMachine()
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+        )
+
+        update = Mock()
+        update.effective_user.id = 12345
+        update.message = Mock()
+        update.message.document = Mock()
+        update.message.document.file_name = "big.gcode"
+        update.message.document.file_size = 300 * 1024 * 1024  # 300MB > 200MB limit
+        update.message.reply_text = AsyncMock()
+
+        await bot._handle_file_upload(update, None)
+
+        calls = update.message.reply_text.call_args_list
+        size_call = calls[-1]
+        call_text = size_call[0][0]
         assert "too large" in call_text.lower()
 
     @pytest.mark.asyncio
@@ -483,6 +592,121 @@ class TestTelegramBotNotifications:
             call_kwargs = mock_send.call_args[1]
             assert 'Error' in call_kwargs['content']
             assert 'Test error message' in call_kwargs['content']
+
+
+class TestParseGcodeMetadata:
+    """Tests for TelegramBot._parse_gcode_metadata static method"""
+
+    def test_parse_total_layers(self, tmp_path):
+        """Parse total layer count from G-code header"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; total layer number: 42\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["total_layers"] == 42
+
+    def test_parse_estimated_time(self, tmp_path):
+        """Parse estimated print time in seconds"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; estimated_time = 3600\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["estimated_time"] == 3600
+
+    def test_parse_filament_type(self, tmp_path):
+        """Parse filament type"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; filament_type = PLA\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["filament_type"] == "PLA"
+
+    def test_parse_layer_height(self, tmp_path):
+        """Parse layer height as float"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; layer_height = 0.20\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["layer_height"] == pytest.approx(0.20)
+
+    def test_parse_filament_used_mm(self, tmp_path):
+        """Parse filament used in mm"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; filament used [mm] = 1234.5\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["filament_used_mm"] == pytest.approx(1234.5)
+
+    def test_parse_multiple_fields(self, tmp_path):
+        """Parse multiple metadata fields from a realistic header"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text(
+            "; generated by PrusaSlicer\n"
+            "; filament_type = PETG\n"
+            "; total layer number: 150\n"
+            "; estimated_time = 7200\n"
+            "; layer_height = 0.15\n"
+            "; filament used [mm] = 5678.9\n"
+            "G28\n"
+            "G1 X0 Y0\n"
+        )
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["filament_type"] == "PETG"
+        assert metadata["total_layers"] == 150
+        assert metadata["estimated_time"] == 7200
+        assert metadata["layer_height"] == pytest.approx(0.15)
+        assert metadata["filament_used_mm"] == pytest.approx(5678.9)
+
+    def test_parse_empty_file(self, tmp_path):
+        """Empty file returns empty metadata dict"""
+        gcode = tmp_path / "empty.gcode"
+        gcode.write_text("")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata == {}
+
+    def test_parse_no_metadata_comments(self, tmp_path):
+        """G-code with no metadata comments returns empty dict"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("G28\nG1 X100 Y100 F3000\nG1 Z0.3\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata == {}
+
+    def test_parse_nonexistent_file(self, tmp_path):
+        """Non-existent file returns empty dict instead of raising"""
+        missing = tmp_path / "nonexistent.gcode"
+
+        metadata = TelegramBot._parse_gcode_metadata(missing)
+        assert metadata == {}
+
+    def test_parse_total_layers_alternate_format(self, tmp_path):
+        """Parse 'total layers' with alternate comment formats"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; total_count: 99\n; total layers: 88\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["total_layers"] == 88
+
+    def test_parse_time_uppercase_keyword(self, tmp_path):
+        """Parse TIME = <seconds> format"""
+        gcode = tmp_path / "test.gcode"
+        gcode.write_text("; TIME = 1800\nG28\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        assert metadata["estimated_time"] == 1800
+
+    def test_parse_reads_only_first_10kb(self, tmp_path):
+        """Metadata after first 10KB of file is ignored"""
+        gcode = tmp_path / "test.gcode"
+        # 12KB of padding, then the metadata
+        padding = "G1 X0 Y0 F3000\n" * 1000  # ~16KB
+        gcode.write_text(padding + "; total layer number: 42\n")
+
+        metadata = TelegramBot._parse_gcode_metadata(gcode)
+        # Should NOT find the metadata past 10KB
+        assert "total_layers" not in metadata
 
 
 if __name__ == "__main__":

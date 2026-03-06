@@ -46,6 +46,60 @@ class MockAdapter(PrinterAdapter):
     async def set_z_offset(self, offset_mm: float):
         pass
 
+    async def set_nozzle_temp(self, temperature: float):
+        pass
+
+    async def set_bed_temp(self, temperature: float):
+        pass
+
+    async def home_axes(self, axes: str = ""):
+        pass
+
+    async def set_fan_speed(self, speed: int):
+        pass
+
+    async def run_gcode(self, command: str):
+        pass
+
+    async def list_files(self):
+        pass
+
+    async def delete_file(self, filename: str):
+        pass
+
+    async def get_file_metadata(self, filename: str):
+        pass
+
+    async def move_axis(self, axis: str, distance: float, speed: int = 3000):
+        pass
+
+    async def extrude(self, length: float, speed: int = 300):
+        pass
+
+    async def set_speed_override(self, percent: int):
+        pass
+
+    async def set_flow_override(self, percent: int):
+        pass
+
+    async def list_macros(self):
+        pass
+
+    async def execute_macro(self, name: str):
+        pass
+
+    async def restart_firmware(self):
+        pass
+
+    async def restart_service(self):
+        pass
+
+    async def get_system_info(self):
+        pass
+
+    async def motors_off(self):
+        pass
+
     async def get_printer_state(self) -> NormalizedPrinterState:
         return NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT
 

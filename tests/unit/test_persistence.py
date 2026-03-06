@@ -4,9 +4,10 @@ Unit tests for StatePersistence
 
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 import tempfile
 import json
-from sensing_voxel.core.persistence import StatePersistence
+from sensing_voxel.core.persistence import StatePersistence, StatePersistenceError
 from sensing_voxel.core.state_machine import AgentStateMachine
 from sensing_voxel.core.models import AgentState, JobContext, DecisionAction
 from datetime import datetime
@@ -152,4 +153,26 @@ class TestStatePersistence:
         # Release lock
         persistence._release_lock()
         assert persistence._lock_instance is None
+
+    def test_save_failure_raises_persistence_error(self, persistence):
+        """Test that save failure raises StatePersistenceError"""
+        sm = AgentStateMachine()
+        sm.current_state = AgentState.IDLE
+
+        with patch("tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
+            with pytest.raises(StatePersistenceError, match="disk full"):
+                persistence.save(sm)
+
+    def test_save_failure_cleans_up_temp_file(self, persistence):
+        """Test that orphaned temp file is cleaned up on rename failure"""
+        sm = AgentStateMachine()
+        sm.current_state = AgentState.IDLE
+
+        with patch.object(Path, "rename", side_effect=OSError("cross-device")):
+            with pytest.raises(StatePersistenceError):
+                persistence.save(sm)
+
+        # No orphaned .tmp files should remain
+        tmp_files = list(persistence.state_file.parent.glob("*.tmp"))
+        assert len(tmp_files) == 0
 

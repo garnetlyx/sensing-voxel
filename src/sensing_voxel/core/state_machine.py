@@ -22,6 +22,7 @@ class AgentStateMachine:
     TRANSITIONS: dict[AgentState, set[AgentState]] = {
         AgentState.IDLE: {
             AgentState.RECEIVING,
+            AgentState.AWAITING_APPROVAL,  # Direct G-code upload (bypass slicing)
             AgentState.MONITORING,
             AgentState.PAUSED_PENDING_USER,
             AgentState.ERROR,  # Allow direct entry for error recovery

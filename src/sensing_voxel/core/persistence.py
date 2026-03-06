@@ -4,6 +4,7 @@ State persistence with atomic snapshots
 Adapted from OpenClaw's src/config/sessions/store.ts pattern
 """
 
+import asyncio
 import json
 import logging
 import tempfile
@@ -18,6 +19,12 @@ from sensing_voxel.core.state_machine import AgentStateMachine
 logger = logging.getLogger(__name__)
 
 
+class StatePersistenceError(Exception):
+    """Raised when state persistence fails"""
+
+    pass
+
+
 class StatePersistence:
     """Atomic state persistence to JSON file"""
 
@@ -25,6 +32,7 @@ class StatePersistence:
         self.state_file = state_file
         self._lock_file: Path | None = None
         self._lock_instance: SoftFileLock | None = None
+        self._async_lock = asyncio.Lock()
 
         # Ensure parent directory exists
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +145,7 @@ class StatePersistence:
 
     def save(self, state_machine: AgentStateMachine):
         """Atomically save state machine to file"""
+        tmp_path = None
         self._acquire_lock()
         try:
             state_dict = self._to_dict(state_machine)
@@ -157,9 +166,17 @@ class StatePersistence:
 
         except Exception as e:
             logger.error(f"Error saving state: {e}")
-            raise
+            # Clean up orphaned temp file
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise StatePersistenceError(f"Failed to save state: {e}") from e
         finally:
             self._release_lock()
+
+    async def save_async(self, state_machine: AgentStateMachine):
+        """Async-safe save with serialization lock to prevent concurrent writes"""
+        async with self._async_lock:
+            self.save(state_machine)
 
     def load(self) -> AgentStateMachine | None:
         """Load state machine from file"""

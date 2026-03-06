@@ -179,8 +179,12 @@ class TelegramBot:
 
         await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
+    GCODE_EXTENSIONS = {".gcode", ".g", ".gco"}
+    STL_EXTENSIONS = {".stl"}
+    ALLOWED_EXTENSIONS = STL_EXTENSIONS | GCODE_EXTENSIONS
+
     async def _handle_file_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle file upload"""
+        """Handle file upload (STL or G-code)"""
         if not await self._check_auth(update):
             return
 
@@ -189,16 +193,24 @@ class TelegramBot:
             return
 
         # Check file type
-        if not document.file_name.lower().endswith(".stl"):
-            await update.message.reply_text("❌ Only STL files are supported")
+        ext = Path(document.file_name).suffix.lower() if document.file_name else ""
+        if ext not in self.ALLOWED_EXTENSIONS:
+            await update.message.reply_text(
+                "Only STL and G-code files are supported (.stl, .gcode, .g, .gco)"
+            )
             return
 
-        # Check file size (limit to 100MB)
-        if document.file_size > 100 * 1024 * 1024:
-            await update.message.reply_text("❌ File too large (max 100MB)")
+        is_gcode = ext in self.GCODE_EXTENSIONS
+        max_size = 200 * 1024 * 1024 if is_gcode else 100 * 1024 * 1024
+
+        # Check file size
+        if document.file_size > max_size:
+            limit_mb = max_size // (1024 * 1024)
+            await update.message.reply_text(f"File too large (max {limit_mb}MB)")
             return
 
-        await update.message.reply_text("🔄 Processing your STL file...")
+        file_type = "G-code" if is_gcode else "STL"
+        await update.message.reply_text(f"Processing your {file_type} file...")
 
         # Store chat ID for future notifications
         self._chat_id = update.effective_chat.id
@@ -206,7 +218,7 @@ class TelegramBot:
         # Check if we're already in a job
         if self.state_machine.current_state != AgentState.IDLE:
             await update.message.reply_text(
-                f"⚠️ Agent is busy in state {self.state_machine.current_state.name}. "
+                f"Agent is busy in state {self.state_machine.current_state.name}. "
                 "Please wait or cancel current job first."
             )
             return
@@ -214,56 +226,145 @@ class TelegramBot:
         # Download and stage file
         try:
             file = await document.get_file()
-            # Use config-provided uploads path or default
             uploads_dir = self.config.uploads_path if self.config else Path("data/uploads")
             uploads_dir.mkdir(parents=True, exist_ok=True)
 
-            # Generate job ID and file path - ALWAYS use job_id for filename to prevent path traversal
             job_id = generate_job_id()
-            stl_path = uploads_dir / f"{job_id}.stl"
+            staged_path = uploads_dir / f"{job_id}{ext}"
 
             # Security check: validate resolved path is within uploads directory
-            resolved = stl_path.resolve()
+            resolved = staged_path.resolve()
             try:
                 resolved.relative_to(uploads_dir.resolve())
             except ValueError:
-                await update.message.reply_text("❌ Invalid file path")
-                logger.error(f"Path traversal attempt detected: {stl_path}")
+                await update.message.reply_text("Invalid file path")
+                logger.error(f"Path traversal attempt detected: {staged_path}")
                 return
 
-            # Download file
-            await file.download_to_drive(str(stl_path))
+            await file.download_to_drive(str(staged_path))
 
-            # Create job context
-            job_context = JobContext(
-                job_id=job_id,
-                job_file=str(stl_path),
-                uploaded_at=datetime.now(),
-                decision_token=generate_decision_token(),
-                file_validation_status=FileValidationStatus.VALID,
-                is_external=False,
-                external_monitoring=False,
-            )
-
-            # Transition to RECEIVING state
-            self.state_machine.job_context = job_context
-            success = await self.state_machine.transition_to(
-                AgentState.RECEIVING, persistence=self.persistence
-            )
-
-            if success:
-                await update.message.reply_text(
-                    f"✅ File received: {document.file_name}\n"
-                    f"Job ID: `{job_id}`\n\n"
-                    "🔄 Starting slicing pipeline..."
-                )
-                # TODO: Trigger slicing pipeline
+            if is_gcode:
+                await self._handle_gcode_upload(update, document, staged_path, job_id)
             else:
-                await update.message.reply_text("❌ Failed to start job. Please try again.")
+                await self._handle_stl_upload(update, document, staged_path, job_id)
 
         except Exception as e:
             logger.error(f"Error processing file upload: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+            await update.message.reply_text(f"Error processing file: {str(e)}")
+
+    async def _handle_stl_upload(self, update, document, stl_path, job_id):
+        """Handle STL file upload — enters slicing pipeline"""
+        job_context = JobContext(
+            job_id=job_id,
+            job_file=str(stl_path),
+            uploaded_at=datetime.now(),
+            decision_token=generate_decision_token(),
+            file_validation_status=FileValidationStatus.VALID,
+            is_external=False,
+            external_monitoring=False,
+        )
+
+        self.state_machine.job_context = job_context
+        success = await self.state_machine.transition_to(
+            AgentState.RECEIVING, persistence=self.persistence
+        )
+
+        if success:
+            await update.message.reply_text(
+                f"File received: {document.file_name}\n"
+                f"Job ID: `{job_id}`\n\n"
+                "Starting slicing pipeline..."
+            )
+        else:
+            await update.message.reply_text("Failed to start job. Please try again.")
+
+    async def _handle_gcode_upload(self, update, document, gcode_path, job_id):
+        """Handle G-code file upload — bypasses slicing, goes to approval"""
+        metadata = self._parse_gcode_metadata(gcode_path)
+
+        job_context = JobContext(
+            job_id=job_id,
+            job_file=str(gcode_path),
+            uploaded_at=datetime.now(),
+            decision_token=generate_decision_token(),
+            gcode_path=str(gcode_path),
+            metadata=metadata,
+            file_validation_status=FileValidationStatus.VALID,
+            is_external=False,
+            external_monitoring=False,
+        )
+
+        self.state_machine.job_context = job_context
+        success = await self.state_machine.transition_to(
+            AgentState.AWAITING_APPROVAL, persistence=self.persistence
+        )
+
+        if success:
+            meta_lines = []
+            if metadata.get("total_layers"):
+                meta_lines.append(f"Layers: {metadata['total_layers']}")
+            if metadata.get("estimated_time"):
+                minutes = metadata["estimated_time"] // 60
+                meta_lines.append(f"Est. time: {minutes}min")
+            if metadata.get("filament_type"):
+                meta_lines.append(f"Filament: {metadata['filament_type']}")
+            if metadata.get("layer_height"):
+                meta_lines.append(f"Layer height: {metadata['layer_height']}mm")
+
+            meta_text = "\n".join(meta_lines) if meta_lines else "No metadata found"
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Approve", callback_data=f"apr_{job_id}"),
+                    InlineKeyboardButton("Reject", callback_data=f"rej_{job_id}"),
+                ]
+            ])
+
+            await update.message.reply_text(
+                f"G-code file received: {document.file_name}\n"
+                f"Job ID: `{job_id}`\n\n"
+                f"{meta_text}\n\n"
+                "Approve to upload and start print?",
+                reply_markup=keyboard,
+            )
+
+            logger.info(f"gcode_upload_staged job_id={job_id} file={document.file_name}")
+        else:
+            await update.message.reply_text("Failed to start job. Please try again.")
+            gcode_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _parse_gcode_metadata(gcode_path: Path) -> dict:
+        """Parse metadata from G-code file header (first 10KB)"""
+        import re
+
+        try:
+            with open(gcode_path, "r", errors="replace") as f:
+                header = f.read(10240)
+        except OSError:
+            return {}
+
+        metadata = {}
+        patterns = {
+            "total_layers": r";\s*total layer(?:s| number|_count)\s*[:=]\s*(\d+)",
+            "estimated_time": r";\s*(?:estimated[_ ]?(?:printing[_ ]?)?time|TIME)\s*[:=]\s*(\d+)",
+            "filament_type": r";\s*filament_type\s*[:=]\s*(\S+)",
+            "layer_height": r";\s*layer_height\s*[:=]\s*([\d.]+)",
+            "filament_used_mm": r";\s*filament used\s*\[mm\]\s*[:=]\s*([\d.]+)",
+        }
+
+        for key, regex in patterns.items():
+            m = re.search(regex, header, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if key in ("total_layers", "estimated_time"):
+                    metadata[key] = int(val)
+                elif key in ("layer_height", "filament_used_mm"):
+                    metadata[key] = float(val)
+                else:
+                    metadata[key] = val
+
+        return metadata
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callback"""
@@ -324,20 +425,19 @@ class TelegramBot:
 
             # Handle action-specific transitions
             if action == DecisionAction.APPROVE:
-                # TODO: Start upload and print
-                await self._app.bot.send_message(chat_id=self._chat_id, text="🚀 Starting print...")
-                # Transition to UPLOADING
-                await self.state_machine.transition_to(
-                    AgentState.UPLOADING, persistence=self.persistence
-                )
+                await self._app.bot.send_message(chat_id=self._chat_id, text="Starting print...")
+                await self._execute_print_approval(job)
             elif action == DecisionAction.REJECT:
-                # Transition to IDLE
+                # Cleanup staged file
+                if job.gcode_path:
+                    Path(job.gcode_path).unlink(missing_ok=True)
                 await self.state_machine.transition_to(
                     AgentState.IDLE, persistence=self.persistence
                 )
                 await self._app.bot.send_message(
-                    chat_id=self._chat_id, text="🛑 Job rejected. Back to idle."
+                    chat_id=self._chat_id, text="Job rejected. Back to idle."
                 )
+                logger.info(f"gcode_upload_rejected job_id={job.job_id}")
             elif action == DecisionAction.RESUME:
                 # Resume print
                 if self.adapter:
@@ -359,6 +459,72 @@ class TelegramBot:
             await query.edit_message_text("ℹ️ Decision already processed for this job.")
         else:
             await query.edit_message_text(f"⚠️ Decision rejected: {result.name}")
+
+    async def _execute_print_approval(self, job: JobContext):
+        """Upload G-code to printer and start print after approval"""
+        if not self.adapter:
+            await self._app.bot.send_message(
+                chat_id=self._chat_id, text="No printer connected."
+            )
+            return
+
+        gcode_path = job.gcode_path or job.job_file
+        if not gcode_path:
+            await self._app.bot.send_message(
+                chat_id=self._chat_id, text="No G-code file found for this job."
+            )
+            return
+
+        try:
+            # Transition to UPLOADING
+            await self.state_machine.transition_to(
+                AgentState.UPLOADING, persistence=self.persistence
+            )
+
+            # Upload file to printer
+            remote_name = Path(gcode_path).name
+            upload_result = await self.adapter.upload_file(gcode_path, remote_name)
+
+            if upload_result.status != CommandResultStatus.SUCCESS:
+                await self._app.bot.send_message(
+                    chat_id=self._chat_id,
+                    text=f"Upload failed: {upload_result.message}",
+                )
+                await self.state_machine.transition_to(
+                    AgentState.ERROR, persistence=self.persistence
+                )
+                return
+
+            # Start print
+            start_result = await self.adapter.start_print(remote_name)
+
+            if start_result.status != CommandResultStatus.SUCCESS:
+                await self._app.bot.send_message(
+                    chat_id=self._chat_id,
+                    text=f"Failed to start print: {start_result.message}",
+                )
+                await self.state_machine.transition_to(
+                    AgentState.ERROR, persistence=self.persistence
+                )
+                return
+
+            # Transition to PRINTING
+            await self.state_machine.transition_to(
+                AgentState.PRINTING, persistence=self.persistence
+            )
+            await self._app.bot.send_message(
+                chat_id=self._chat_id, text="Print started successfully!"
+            )
+            logger.info(f"gcode_upload_approved job_id={job.job_id}")
+
+        except Exception as e:
+            logger.error(f"Error executing print approval: {e}", exc_info=True)
+            await self._app.bot.send_message(
+                chat_id=self._chat_id, text=f"Error starting print: {e}"
+            )
+            await self.state_machine.transition_to(
+                AgentState.ERROR, persistence=self.persistence
+            )
 
     async def _handle_reset_z_offset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset_z_offset command"""

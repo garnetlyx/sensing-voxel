@@ -93,9 +93,9 @@ async def shutdown(
     for task in tasks:
         task.cancel()
 
-    # Persist final state
+    # Persist final state (use async lock to avoid race with in-flight saves)
     try:
-        await state_machine.persist(persistence)
+        await persistence.save_async(state_machine)
     except Exception as e:
         print(f"Error during final persistence: {e}")
 
