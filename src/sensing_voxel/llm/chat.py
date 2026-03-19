@@ -4,7 +4,10 @@ Chat session manager for AI conversations with tool use
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from sensing_voxel.adapters.base import PrinterAdapter
@@ -24,6 +27,21 @@ class ChatSession:
         self.user_id = user_id
         self.max_turns = max_turns
         self.messages: list[dict] = []
+
+    def to_dict(self) -> dict:
+        """Convert session to serializable dict."""
+        return {
+            "user_id": self.user_id,
+            "max_turns": self.max_turns,
+            "messages": self.messages,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ChatSession:
+        """Create session from dict."""
+        session = cls(data["user_id"], data.get("max_turns", 20))
+        session.messages = data.get("messages", [])
+        return session
 
     def add_user_message(self, content: str) -> None:
         """Add user message and trim history if needed."""
@@ -137,6 +155,7 @@ class ChatManager:
                 system_prompt=system_prompt,
             )
             session.add_assistant_message(response)
+            self.save_history()
             return self._truncate(response)
 
         # Agentic tool-use loop
@@ -153,6 +172,7 @@ class ChatManager:
 
             # If no tool use, we're done
             if response.stop_reason != "tool_use":
+                self.save_history()
                 text = self._extract_text(response.content)
                 return self._truncate(text)
 
@@ -178,6 +198,35 @@ class ChatManager:
         """Clear user's conversation history."""
         if user_id in self._sessions:
             self._sessions[user_id].clear()
+            self.save_history()
+
+    def get_history(self, user_id: int) -> list[dict]:
+        """Get message history for a user."""
+        session = self._get_or_create_session(user_id)
+        return session.get_messages()
+
+    def save_history(self, path: str = "data/chat_history.json") -> None:
+        """Save all sessions to disk."""
+        try:
+            data = {str(uid): s.to_dict() for uid, s in self._sessions.items()}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save chat history: {e}")
+
+    def load_history(self, path: str = "data/chat_history.json") -> None:
+        """Load sessions from disk."""
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            for uid_str, s_data in data.items():
+                self._sessions[int(uid_str)] = ChatSession.from_dict(s_data)
+            logger.info(f"Loaded {len(self._sessions)} chat sessions from {path}")
+        except Exception as e:
+            logger.error(f"Failed to load chat history: {e}")
 
     def get_session_count(self) -> int:
         """Get number of active sessions."""
@@ -205,6 +254,15 @@ class ChatManager:
                 })
             elif block.type == "thinking":
                 blocks.append({"type": "thinking", "thinking": block.thinking})
+            elif block.type == "image":
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block.source.media_type,
+                        "data": block.source.data,
+                    },
+                })
         return blocks
 
     @staticmethod

@@ -8,7 +8,9 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sensing_voxel.adapters.base import PrinterAdapter
@@ -310,6 +312,23 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
         "description": "Get system info: CPU load, memory, Klipper state and messages.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "upload_to_printer",
+        "description": (
+            "Upload a file from the server's local storage to the printer. "
+            "Use this when a user has uploaded a G-code file to the dashboard."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "The name of the file to upload to the printer.",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
 ]
 
 
@@ -426,6 +445,7 @@ class ToolExecutor:
             "restart_firmware": self._restart_firmware,
             "restart_service": self._restart_service,
             "get_system_info": self._get_system_info,
+            "upload_to_printer": self._upload_to_printer,
         }
         if camera:
             self._dispatch.update({
@@ -623,6 +643,24 @@ class ToolExecutor:
             return self._cmd_result(cmd)
         return cmd.data or {}
 
+    async def _upload_to_printer(self, tool_input: dict) -> dict:
+        filename = tool_input.get("filename", "")
+        if not filename:
+            return {"error": "filename is required"}
+
+        # Sanitize filename
+        filename = os.path.basename(filename)
+        local_path = Path("data/uploads") / filename
+
+        if not local_path.exists():
+            return {"error": f"File '{filename}' not found on server. Ask user to upload it first."}
+
+        cmd = await self._adapter.upload_file(str(local_path.absolute()), filename)
+        result = self._cmd_result(cmd)
+        if cmd.status == CommandResultStatus.SUCCESS:
+            result["message"] = f"Successfully uploaded '{filename}' to the printer."
+        return result
+
     # --- Manual motion ---
 
     async def _move_axis(self, tool_input: dict) -> dict:
@@ -755,8 +793,8 @@ class ToolExecutor:
                 ret, frame = cap.read()
                 if not ret:
                     return None
-                frame = cv2.resize(frame, (320, 180))
-                ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                frame = cv2.resize(frame, (640, 360))
+                ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 return jpeg.tobytes() if ret else None
             finally:
                 cap.release()

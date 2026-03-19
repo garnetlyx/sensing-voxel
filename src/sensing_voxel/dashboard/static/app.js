@@ -22,6 +22,7 @@
     alerts: [],
     decisionToken: null,
     decisionJobId: null,
+    selectedFile: null,
   };
 
   // --- DOM refs ---
@@ -192,7 +193,6 @@
         const active = pid === state.activePrinter ? " *" : "";
         return `<option value="${escapeHtml(pid)}" ${pid === state.selectedPrinter ? "selected" : ""}>${dot} ${escapeHtml(pid)}${active}</option>`;
       })
-      .join("");
   }
 
   function onPrinterSelectChange(e) {
@@ -209,15 +209,28 @@
   }
 
   function updateConnectionDot(serverConnected) {
-    const dot = $(".connection-dot");
+    const dot = $("#connection-dot");
+    const chatDot = $("#chat-connection-dot");
     const label = $(".connection-label");
-    // Show connection to selected printer, not just server
-    const printerConnected = state.selectedPrinter
-      && state.printers[state.selectedPrinter]
-      && state.printers[state.selectedPrinter].connected;
-    const connected = serverConnected && printerConnected;
-    if (dot) dot.classList.toggle("connected", connected);
-    if (label) label.textContent = connected ? "Connected" : printerConnected === false && serverConnected ? "Printer Offline" : "Disconnected";
+
+    if (chatDot) chatDot.classList.toggle("connected", serverConnected);
+
+    const printerConnected = state.selectedPrinter &&
+      state.printers[state.selectedPrinter] &&
+      state.printers[state.selectedPrinter].connected;
+
+    const bothConnected = serverConnected && printerConnected;
+    if (dot) dot.classList.toggle("connected", bothConnected);
+
+    if (label) {
+      if (bothConnected) {
+        label.textContent = "Connected";
+      } else if (serverConnected && printerConnected === false) {
+        label.textContent = "Printer Offline";
+      } else {
+        label.textContent = "Disconnected";
+      }
+    }
   }
 
   function updateStatePanel() {
@@ -481,21 +494,52 @@
   let chatPending = false;
 
   window.sendChatMessage = async function () {
-    const input = $("#chat-input");
-    const message = (input.value || "").trim();
-    if (!message || chatPending) return;
+    if (chatPending) return;
 
-    input.value = "";
-    appendChatMessage("user", message);
+    const input = $("#chat-input");
+    let message = input.value.trim();
+
+    // If we have a file and NO message, use a default message
+    if (state.selectedFile && !message) {
+      message = `I've uploaded ${state.selectedFile.name}. What can you do with it?`;
+    }
+
+    if (!message && !state.selectedFile) return;
+
     chatPending = true;
     updateChatSendButton();
+    input.value = "";
 
-    // Show typing indicator
-    const typingEl = document.createElement("div");
-    typingEl.className = "chat-msg assistant typing";
-    typingEl.textContent = "Thinking...";
-    $("#chat-messages").appendChild(typingEl);
-    scrollChatToBottom();
+    // Handle file upload first if present
+    let uploadedFileInfo = null;
+    if (state.selectedFile) {
+      const fileToUpload = state.selectedFile;
+      updateFileIndicator(null); // Clear indicator early
+      appendChatMessage("system", `Uploading ${fileToUpload.name}...`);
+
+      uploadedFileInfo = await uploadFile(fileToUpload);
+      if (!uploadedFileInfo) {
+        chatPending = false;
+        updateChatSendButton();
+        return;
+      }
+
+      appendChatMessage("system", `Uploaded ${fileToUpload.name} successfully.`);
+
+      // Add a hint to the message so the LLM knows it has a "local" file to work with
+      const systemHint = `\n\n[System: User uploaded file '${uploadedFileInfo.filename}' to server storage. Use upload_to_printer to send it to the printer if requested.]`;
+      
+      // Append user message (clean version)
+      appendChatMessage("user", message);
+      
+      // Send message with hint to API
+      message += systemHint;
+    } else {
+      appendChatMessage("user", message);
+    }
+
+    const typingEl = appendChatMessage("assistant", "Thinking...");
+    typingEl.classList.add("typing");
 
     try {
       const resp = await fetch("/api/v1/chat", {
@@ -554,6 +598,127 @@
     if (messages) messages.scrollTop = messages.scrollHeight;
   }
 
+  // --- File Upload Helpers ---
+  function initFileUpload() {
+    const messages = $("#chat-messages");
+    const fileInput = $("#chat-file-input");
+
+    if (!messages || !fileInput) return;
+
+    // Drag events
+    ["dragenter", "dragover"].forEach(name => {
+      messages.addEventListener(name, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        messages.classList.add("drag-over");
+      }, false);
+    });
+
+    ["dragleave", "drop"].forEach(name => {
+      messages.addEventListener(name, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        messages.classList.remove("drag-over");
+      }, false);
+    });
+
+    messages.addEventListener("drop", (e) => {
+      const dt = e.dataTransfer;
+      const files = dt.files;
+      if (files && files[0]) {
+        handleFileSelect(files[0]);
+      }
+    }, false);
+
+    fileInput.addEventListener("change", (e) => {
+      if (e.target.files && e.target.files[0]) {
+        handleFileSelect(e.target.files[0]);
+      }
+    });
+  }
+
+  function handleFileSelect(file) {
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!["gcode", "bgcode"].includes(ext)) {
+      addAlert("warning", "Only .gcode or .bgcode files are supported currently.");
+      // Still allow upload but warn
+    }
+
+    state.selectedFile = file;
+    updateFileIndicator(file.name);
+  }
+
+  function updateFileIndicator(name) {
+    const indicator = $("#file-indicator");
+    const fileName = $("#file-name");
+    if (indicator && fileName) {
+      if (name) {
+        fileName.textContent = name;
+        indicator.classList.add("active");
+      } else {
+        indicator.classList.remove("active");
+        state.selectedFile = null;
+        const fileInput = $("#chat-file-input");
+        if (fileInput) fileInput.value = "";
+      }
+    }
+  }
+
+  window.cancelUpload = function () {
+    updateFileIndicator(null);
+  };
+
+  async function uploadFile(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const resp = await fetch("/api/v1/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        throw new Error(errorText || resp.statusText);
+      }
+      return await resp.json();
+    } catch (e) {
+      console.error("Upload failed:", e);
+      addAlert("error", `File upload failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  async function loadChatHistory() {
+    try {
+      const resp = await fetch("/api/v1/chat/history");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.history && data.history.length > 0) {
+        data.history.forEach((msg) => {
+          let text = "";
+          if (typeof msg.content === "string") {
+            text = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            const textBlock = msg.content.find((b) => b.type === "text");
+            if (textBlock) text = textBlock.text;
+          }
+
+          if (text) {
+            // Remove the system hint from user messages if present
+            const cleanText = text.replace(/\n\n\[System: .*\]/, "");
+            if (cleanText.trim()) {
+              appendChatMessage(msg.role, cleanText);
+            }
+          }
+        });
+      }
+    } catch (e) {
+      console.error("Failed to load chat history:", e);
+    }
+  }
+
   function updateChatSendButton() {
     const btn = $("#chat-send");
     if (btn) btn.disabled = chatPending;
@@ -592,6 +757,9 @@
     }
 
     connectWebSocket();
+    initFileUpload();
+    loadChatHistory();
+
     setInterval(pollStatus, 10000);
 
     // Ping every 25s to keep WS alive

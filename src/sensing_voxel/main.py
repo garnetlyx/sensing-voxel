@@ -159,6 +159,7 @@ async def main() -> None:
             rtsp_url=config.dashboard.camera_rtsp_url,
             max_turns=config.llm.max_conversation_turns,
         )
+        chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")
     else:
         logger.info("LLM disabled (no api_key or enabled=false)")

@@ -1,7 +1,9 @@
 """REST API route handlers for dashboard"""
 
 import logging
+import os
 from datetime import datetime
+from pathlib import Path
 
 from aiohttp import web
 
@@ -224,6 +226,18 @@ async def post_chat_clear(request: web.Request) -> web.Response:
     return web.json_response({"status": "cleared"})
 
 
+async def get_chat_history(request: web.Request) -> web.Response:
+    """Get the dashboard chat history"""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+
+    if not chat_manager:
+        return web.json_response({"history": []})
+
+    history = chat_manager.get_history(0)
+    return web.json_response({"history": history})
+
+
 async def set_active_printer(request: web.Request) -> web.Response:
     """Set the active printer for agent control"""
     app_state = request.app["app_state"]
@@ -292,6 +306,50 @@ async def post_camera_preset(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def post_upload(request: web.Request) -> web.Response:
+    """Handle file upload and save to data/uploads"""
+    try:
+        reader = await request.multipart()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid multipart request")
+
+    field = await reader.next()
+    if not field or field.name != "file":
+        return web.json_response({"error": "No file field in multipart request"}, status=400)
+
+    filename = field.filename
+    if not filename:
+        return web.json_response({"error": "No filename provided"}, status=400)
+
+    # Sanitize filename
+    filename = os.path.basename(filename)
+
+    # Ensure data/uploads directory exists
+    # Use data directory relative to the project root
+    upload_dir = Path("data/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = upload_dir / filename
+
+    size = 0
+    with open(file_path, "wb") as f:
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            size += len(chunk)
+            f.write(chunk)
+
+    logger.info(f"Saved uploaded file to {file_path} ({size} bytes)")
+
+    return web.json_response({
+        "status": "success",
+        "filename": filename,
+        "path": str(file_path.absolute()),
+        "size": size
+    })
+
+
 def setup_routes(app: web.Application, ws_manager):
     """Register all API routes"""
     app.router.add_get("/health", health_check)
@@ -303,7 +361,9 @@ def setup_routes(app: web.Application, ws_manager):
     app.router.add_post("/api/v1/decision", post_decision)
     app.router.add_post("/api/v1/active-printer", set_active_printer)
     app.router.add_post("/api/v1/chat", post_chat)
+    app.router.add_get("/api/v1/chat/history", get_chat_history)
     app.router.add_post("/api/v1/chat/clear", post_chat_clear)
+    app.router.add_post("/api/v1/upload", post_upload)
     app.router.add_post("/api/v1/camera/move", post_camera_move)
     app.router.add_post("/api/v1/camera/preset", post_camera_preset)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

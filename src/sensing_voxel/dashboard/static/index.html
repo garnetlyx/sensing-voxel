@@ -17,7 +17,7 @@
       <select id="printer-select" class="printer-select">
         <option value="">No printers</option>
       </select>
-      <div class="connection-dot"></div>
+      <div id="connection-dot" class="connection-dot"></div>
       <span class="connection-label">Disconnected</span>
     </div>
   </header>
@@ -127,15 +127,27 @@
     <!-- Chat panel -->
     <section class="card chat-panel">
       <div class="card-header">
-        <span class="card-title">AI Chat</span>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <div id="chat-connection-dot" class="connection-dot"></div>
+          <span class="card-title">AI Chat</span>
+        </div>
         <button class="chat-clear-btn" onclick="clearChat()">Clear</button>
       </div>
-      <div class="chat-messages" id="chat-messages">
+      <div id="chat-messages" class="chat-messages drop-zone">
         <div class="chat-welcome">Ask me anything about 3D printing or your printer status.</div>
       </div>
-      <div class="chat-input-row">
-        <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
-        <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>
+      <div class="chat-input-container">
+        <div id="file-indicator" class="chat-file-indicator">
+          <span>📎</span>
+          <span id="file-name">filename.gcode</span>
+          <button class="chat-clear-btn" onclick="cancelUpload()" style="margin-left: auto">&times;</button>
+        </div>
+        <div class="chat-input-row">
+          <button class="btn-icon" onclick="document.getElementById('chat-file-input').click()" title="Attach file">📎</button>
+          <input type="file" id="chat-file-input" style="display: none" accept=".gcode,.bgcode">
+          <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
+          <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>
+        </div>
       </div>
     </section>
 
