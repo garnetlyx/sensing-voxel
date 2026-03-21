@@ -77,9 +77,10 @@ slicer:
 # LLM Configuration (AI assistant)
 # Configure in config/local.yaml with your API key
 # llm:
-#   api_key: null             # Set in config/local.yaml (NEVER commit)
-#   base_url: "https://api.anthropic.com"
-#   model: "claude-sonnet-4-20250514"
+#   provider: minimax          # "minimax" or "ollama"
+#   api_key: null             # Set in config/local.yaml (NEVER commit) - required for minimax
+#   base_url: "https://api.anthropic.com"  # For Ollama: "http://localhost:11434/v1"
+#   model: "claude-sonnet-4-20250514"       # For Ollama: "llama3.2" or your local model
 #   max_tokens: 2048
 #   temperature: 0.7
 #   timeout_seconds: 30
@@ -93,3 +94,24 @@ storage:
   calibration_dir: "calibration"
   models_dir: "models"
   uploads_dir: "uploads"
+
+# 3D Modeling & Photo-to-Print Configuration
+# Uncomment to enable photo-to-print pipeline
+# modeling:
+#   enabled: true
+#   image_to_3d:
+#     default_provider: "triposr"
+#     triposr_api_key: "your_stability_api_key"
+#     # meshy_api_key: "your_meshy_api_key"
+#     # tripo3d_api_key: "your_tripo3d_api_key"
+#   auto_approve: false
+#   require_manual_approval: true
+
+# Multi-Printer Job Queue Configuration
+# Uncomment to enable multi-printer queue scheduling
+# queue:
+#   enabled: true
+#   max_queue_size: 100
+#   auto_assignment: true
+#   assignment_strategy: "OPTIMAL"
+#   enable_load_balancing: true

@@ -12,15 +12,18 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+    git \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
 COPY pyproject.toml .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -e .
+# Create virtual environment and install dependencies
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -e ".[camera]"
 
 # Production stage
 FROM python:3.12-slim
@@ -32,21 +35,25 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependencies from builder
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Copy application code
-COPY src/ ./src/
-COPY config/ ./config/
-
-# Create data directories
-RUN mkdir -p data/calibration data/models data/uploads data/sliced
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Create non-root user
 RUN useradd -m -u 1000 sensingvoxel
+
+# Create required directories with proper permissions
+RUN mkdir -p data/calibration data/models data/uploads data/sliced && \
+    chown -R sensingvoxel:sensingvoxel /app
+
+# Copy application code
+COPY --chown=sensingvoxel:sensingvoxel src/ ./src/
+COPY --chown=sensingvoxel:sensingvoxel config/ ./config/
+
+# Switch to non-root user
 USER sensingvoxel
 
 # Set environment variables

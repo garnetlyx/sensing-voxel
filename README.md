@@ -68,13 +68,55 @@ source .venv/bin/activate
 python -m sensing_voxel.main
 ```
 
-### Docker Deployment
+### Docker Deployment (One-Liner)
+
+The fastest way to deploy Sensing Voxel is using Docker Compose:
 
 ```bash
-docker-compose up -d
+# 1. Clone the repository
+git clone https://github.com/garnetlyx/sensing-voxel.git
+cd sensing-voxel
+
+# 2. Copy and configure environment variables
+cp .env.example .env
+# Edit .env with your settings (at minimum, set SV_TELEGRAM_BOT_TOKEN)
+
+# 3. Start the services
+docker compose up -d
+
+# 4. View logs
+docker compose logs -f
 ```
 
-## Configuration
+**Configuration via environment variables:**
+
+All configuration is done through the `.env` file. Key variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SV_TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from @BotFather |
+| `SV_TELEGRAM_ALLOWED_USERS` | Yes | Comma-separated Telegram user IDs |
+| `SV_DASHBOARD_PORT` | No | Dashboard port (default: 8080) |
+| `SV_KLIPPER_HOST` | No | Klipper/Moonraker IP address |
+| `SV_BAMBU_MQTT_HOST` | No | Bambu printer IP address |
+| `SV_CAMERA_RTSP_URL` | No | RTSP URL for camera stream |
+
+**Persistent data:**
+
+Docker volumes are automatically created for:
+- `sensing-voxel-data`: Agent state, calibration data
+- `sensing-voxel-uploads`: Uploaded STL files
+- `sensing-voxel-models`: ML models (NOTHING weights)
+
+**Updating:**
+
+```bash
+# Pull latest changes and rebuild
+git pull
+docker compose up -d --build
+```
+
+### Manual Installation
 
 See `config/default.yaml` for configuration options:
 
@@ -136,7 +178,7 @@ sensing-voxel/
   - [x] Fix CRITICAL security bugs (G-code injection, path traversal, job ID collision)
   - [x] Fix HIGH severity bugs
 
-- **Phase 1 (MVP)**: Core agent-started print workflow
+- **Phase 1 (MVP)**: Core agent-started print workflow ✅ COMPLETE
   - [x] Project scaffolding
   - [x] Core data models
   - [x] State machine
@@ -144,15 +186,18 @@ sensing-voxel/
   - [x] State persistence
   - [x] Printer adapter interface
   - [x] External print detection
-  - [ ] Klipper adapter (~70%)
-  - [ ] Bambu adapter (~80%, blocked by compilation error)
-  - [ ] Telegram bot (~50%)
-  - [ ] Slicer pipeline
-  - [ ] Vision: NOTHING detection
-  - [ ] Vision: camera calibration
-  - [ ] Vision: first-layer classifier
-  - [ ] Print monitoring orchestrator (~60%)
-  - [ ] Integration tests
+  - [x] Klipper adapter (100%)
+  - [x] Bambu adapter (100%)
+  - [x] Telegram bot (100%)
+  - [x] Slicer pipeline (100%)
+  - [x] Vision: NOTHING detection (100%)
+  - [x] Vision: camera calibration (100%)
+  - [x] Vision: first-layer classifier (100%)
+  - [x] Print monitoring orchestrator (100%)
+  - [x] LLM integration (100%)
+  - [x] Camera PTZ control (100%)
+  - [x] Web dashboard API (100%)
+  - [x] Integration tests (100%)
 
 - **Phase 2**: Enhancements
   - Full Bambu adapter parity

@@ -1,0 +1,73 @@
+services:
+  sensing-voxel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sensing-voxel
+    restart: unless-stopped
+    environment:
+      # Core settings
+      - SV_DEBUG=${SV_DEBUG:-false}
+      - SV_DATA_DIR=/app/data
+
+      # Telegram Bot
+      - SV_TELEGRAM_BOT_TOKEN=${SV_TELEGRAM_BOT_TOKEN:-}
+      - SV_TELEGRAM_ALLOWED_USERS=${SV_TELEGRAM_ALLOWED_USERS:-}
+
+      # Dashboard
+      - SV_DASHBOARD_ENABLED=${SV_DASHBOARD_ENABLED:-true}
+      - SV_DASHBOARD_HOST=0.0.0.0
+      - SV_DASHBOARD_PORT=8080
+      - SV_DASHBOARD_API_TOKEN=${SV_DASHBOARD_API_TOKEN:-}
+
+      # Klipper/Moonraker
+      - SV_KLIPPER_HOST=${SV_KLIPPER_HOST:-}
+      - SV_KLIPPER_PORT=${SV_KLIPPER_PORT:-7125}
+      - SV_KLIPPER_API_KEY=${SV_KLIPPER_API_KEY:-}
+
+      # Bambu Printer
+      - SV_BAMBU_MQTT_HOST=${SV_BAMBU_MQTT_HOST:-}
+      - SV_BAMBU_MQTT_PORT=${SV_BAMBU_MQTT_PORT:-1883}
+      - SV_BAMBU_MQTT_USERNAME=${SV_BAMBU_MQTT_USERNAME:-bblp}
+      - SV_BAMBU_MQTT_PASSWORD=${SV_BAMBU_MQTT_PASSWORD:-}
+      - SV_BAMBU_FTP_HOST=${SV_BAMBU_FTP_HOST:-}
+      - SV_BAMBU_FTP_PORT=${SV_BAMBU_FTP_PORT:-21}
+
+      # Camera
+      - SV_CAMERA_RTSP_URL=${SV_CAMERA_RTSP_URL:-}
+      - SV_TAPO_CAMERA_HOST=${SV_TAPO_CAMERA_HOST:-}
+      - SV_TAPO_CAMERA_USER=${SV_TAPO_CAMERA_USER:-}
+      - SV_TAPO_CAMERA_PASSWORD=${SV_TAPO_CAMERA_PASSWORD:-}
+
+      # LLM
+      - SV_LLM_ENABLED=${SV_LLM_ENABLED:-false}
+      - SV_LLM_API_KEY=${SV_LLM_API_KEY:-}
+      - SV_LLM_MODEL=${SV_LLM_MODEL:-claude-sonnet-4-20250514}
+
+    volumes:
+      - ./config:/app/config:ro
+      - sensing-voxel-data:/app/data
+      - sensing-voxel-uploads:/app/uploads
+      - sensing-voxel-models:/app/models
+    ports:
+      - "${SV_DASHBOARD_PORT:-8080}:8080"
+    networks:
+      - sensing-voxel-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sensing_voxel; print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  sensing-voxel-data:
+    driver: local
+  sensing-voxel-uploads:
+    driver: local
+  sensing-voxel-models:
+    driver: local
+
+networks:
+  sensing-voxel-network:
+    driver: bridge
