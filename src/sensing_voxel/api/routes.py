@@ -2,8 +2,9 @@
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
@@ -20,6 +21,7 @@ from sensing_voxel.core.models import (
     ConsumeResult,
     DecisionAction,
 )
+from sensing_voxel.storage.job_repository import JobRepository, JobStatus
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +42,14 @@ async def get_printers(request: web.Request) -> web.Response:
     for pid, adapter in adapters.items():
         # Determine printer type from adapter class name
         printer_type = type(adapter).__name__.replace("Adapter", "").lower()
-        printers.append({
-            "id": pid,
-            "type": printer_type,
-            "connected": connections.get(pid, False),
-            "active": pid == active,
-        })
+        printers.append(
+            {
+                "id": pid,
+                "type": printer_type,
+                "connected": connections.get(pid, False),
+                "active": pid == active,
+            }
+        )
 
     return web.json_response({"printers": printers})
 
@@ -95,10 +99,12 @@ async def get_alerts(request: web.Request) -> web.Response:
     app_state = request.app["app_state"]
     alerts = app_state.get("alerts", [])
 
-    return web.json_response({
-        "alerts": [serialize_alert(a) for a in alerts],
-        "count": len(alerts),
-    })
+    return web.json_response(
+        {
+            "alerts": [serialize_alert(a) for a in alerts],
+            "count": len(alerts),
+        }
+    )
 
 
 async def post_decision(request: web.Request) -> web.Response:
@@ -171,14 +177,14 @@ async def post_decision(request: web.Request) -> web.Response:
         # Broadcast decision result via WebSocket
         ws_manager = app_state.get("ws_manager")
         if ws_manager:
-            await ws_manager.broadcast_decision_result(
-                sm.job_context.job_id, action.name
-            )
+            await ws_manager.broadcast_decision_result(sm.job_context.job_id, action.name)
 
-        return web.json_response({
-            "result": result.name,
-            "message": result_messages[result],
-        })
+        return web.json_response(
+            {
+                "result": result.name,
+                "message": result_messages[result],
+            }
+        )
     else:
         return web.json_response(
             {"result": result.name, "message": result_messages.get(result, "Unknown error")},
@@ -313,11 +319,11 @@ async def post_upload(request: web.Request) -> web.Response:
     except Exception:
         raise web.HTTPBadRequest(text="Invalid multipart request")
 
-    field = await reader.next()
-    if not field or field.name != "file":
+    field = await reader.next()  # type: ignore[attr-defined]
+    if not field or field.name != "file":  # type: ignore[union-attr]
         return web.json_response({"error": "No file field in multipart request"}, status=400)
 
-    filename = field.filename
+    filename = field.filename  # type: ignore[union-attr]
     if not filename:
         return web.json_response({"error": "No filename provided"}, status=400)
 
@@ -334,7 +340,7 @@ async def post_upload(request: web.Request) -> web.Response:
     size = 0
     with open(file_path, "wb") as f:
         while True:
-            chunk = await field.read_chunk()
+            chunk = await field.read_chunk()  # type: ignore[attr-defined]
             if not chunk:
                 break
             size += len(chunk)
@@ -342,12 +348,181 @@ async def post_upload(request: web.Request) -> web.Response:
 
     logger.info(f"Saved uploaded file to {file_path} ({size} bytes)")
 
-    return web.json_response({
-        "status": "success",
-        "filename": filename,
-        "path": str(file_path.absolute()),
-        "size": size
-    })
+    return web.json_response(
+        {"status": "success", "filename": filename, "path": str(file_path.absolute()), "size": size}
+    )
+
+
+async def get_job_history(request: web.Request) -> web.Response:
+    """Get job history from SQLite database with pagination and filtering"""
+    app_state = request.app["app_state"]
+    job_repo = app_state.get("job_repository")
+
+    if not job_repo:
+        return web.json_response(
+            {
+                "jobs": [],
+                "total": 0,
+                "page": 1,
+                "per_page": 20,
+            }
+        )
+
+    try:
+        page = int(request.query.get("page", "1"))
+        per_page = min(int(request.query.get("per_page", "20")), 100)
+        printer_id = request.query.get("printer_id")
+        status = request.query.get("status")
+        days = int(request.query.get("days", "30"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid query parameters")
+
+    offset = (page - 1) * per_page
+
+    status_filter = None
+    if status:
+        try:
+            status_filter = JobStatus[status.upper()]
+        except KeyError:
+            raise web.HTTPBadRequest(text=f"Invalid status: {status}")
+
+    try:
+        all_jobs = job_repo.list_jobs(
+            printer_id=printer_id,
+            status=status_filter,
+            limit=999999,
+            offset=0,
+        )
+        total = len(all_jobs)
+
+        jobs = job_repo.list_jobs(
+            printer_id=printer_id,
+            status=status_filter,
+            limit=per_page,
+            offset=offset,
+        )
+
+        serialized_jobs = []
+        for job in jobs:
+            serialized_jobs.append(
+                {
+                    "id": job.id,
+                    "job_id": job.job_id,
+                    "printer_id": job.printer_id,
+                    "file_name": job.file_name,
+                    "status": job.status.name.lower(),
+                    "started_at": job.started_at.isoformat() if job.started_at else None,
+                    "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                    "duration_seconds": job.duration_seconds,
+                    "filament_used_mm": job.filament_used_mm,
+                    "notes": job.notes,
+                    "metadata": job.metadata,
+                }
+            )
+
+        return web.json_response(
+            {
+                "jobs": serialized_jobs,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "pages": (total + per_page - 1) // per_page,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error fetching job history: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Failed to fetch job history")
+
+
+async def get_job_stats(request: web.Request) -> web.Response:
+    """Get job statistics from SQLite database"""
+    app_state = request.app["app_state"]
+    job_repo = app_state.get("job_repository")
+
+    if not job_repo:
+        return web.json_response(
+            {
+                "total_jobs": 0,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "success_rate": 0.0,
+                "avg_duration_seconds": 0.0,
+                "total_filament_mm": 0.0,
+                "period_days": 30,
+            }
+        )
+
+    try:
+        days = int(request.query.get("days", "30"))
+        printer_id = request.query.get("printer_id")
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid query parameters")
+
+    try:
+        stats = job_repo.get_job_stats(printer_id=printer_id, days=days)
+        return web.json_response(stats)
+    except Exception as e:
+        logger.error(f"Error fetching job stats: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Failed to fetch job stats")
+
+
+async def get_queue_status(request: web.Request) -> web.Response:
+    """Get current command queue status"""
+    app_state = request.app["app_state"]
+
+    # Get command queue from adapters if available
+    queue_info = []
+    for printer_id, adapter in app_state.get("adapters", {}).items():
+        if hasattr(adapter, "_command_queue"):
+            queue = adapter._command_queue
+            queue_info.append(
+                {
+                    "printer_id": printer_id,
+                    "queue_size": queue.size(),
+                    "processing": queue._processing if hasattr(queue, "_processing") else False,
+                }
+            )
+
+    return web.json_response(
+        {
+            "queues": queue_info,
+            "total_pending": sum(q["queue_size"] for q in queue_info),
+        }
+    )
+
+
+async def post_queue_clear(request: web.Request) -> web.Response:
+    """Clear command queue for a printer"""
+    app_state = request.app["app_state"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    printer_id = body.get("printer_id")
+    if not printer_id:
+        raise web.HTTPBadRequest(text="Missing printer_id")
+
+    adapter = app_state.get("adapters", {}).get(printer_id)
+    if not adapter:
+        raise web.HTTPNotFound(text=f"Unknown printer: {printer_id}")
+
+    if not hasattr(adapter, "_command_queue"):
+        raise web.HTTPServiceUnavailable(text=f"Printer {printer_id} has no command queue")
+
+    try:
+        adapter._command_queue.clear()
+        return web.json_response(
+            {
+                "status": "cleared",
+                "printer_id": printer_id,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error clearing queue: {e}", exc_info=True)
+        raise web.HTTPInternalServerError(text="Failed to clear queue")
 
 
 def setup_routes(app: web.Application, ws_manager):
@@ -366,4 +541,10 @@ def setup_routes(app: web.Application, ws_manager):
     app.router.add_post("/api/v1/upload", post_upload)
     app.router.add_post("/api/v1/camera/move", post_camera_move)
     app.router.add_post("/api/v1/camera/preset", post_camera_preset)
+    # Job history endpoints
+    app.router.add_get("/api/v1/jobs/history", get_job_history)
+    app.router.add_get("/api/v1/jobs/stats", get_job_stats)
+    # Queue management endpoints
+    app.router.add_get("/api/v1/queue", get_queue_status)
+    app.router.add_post("/api/v1/queue/clear", post_queue_clear)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

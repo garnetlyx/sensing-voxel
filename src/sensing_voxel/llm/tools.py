@@ -15,13 +15,14 @@ from typing import Any
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import CommandResultStatus
+from sensing_voxel.infra.gcode import _strip_gcode_comment, validate_gcode_command
 
 logger = logging.getLogger(__name__)
 
-# Safety limits
+# Safety limits (kept for tool schema descriptions)
 NOZZLE_TEMP_MAX = 300
 BED_TEMP_MAX = 120
-BLOCKED_GCODE_PREFIXES = ("M112",)  # Emergency stop goes through dedicated path
+
 
 PRINTER_TOOLS: list[dict[str, Any]] = [
     {
@@ -230,8 +231,15 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "axis": {"type": "string", "description": "Axis: X, Y, or Z"},
-                "distance": {"type": "number", "description": "Distance in mm (negative = reverse)"},
-                "speed": {"type": "integer", "description": "Feed rate in mm/min (default 3000)", "default": 3000},
+                "distance": {
+                    "type": "number",
+                    "description": "Distance in mm (negative = reverse)",
+                },
+                "speed": {
+                    "type": "integer",
+                    "description": "Feed rate in mm/min (default 3000)",
+                    "default": 3000,
+                },
             },
             "required": ["axis", "distance"],
         },
@@ -246,7 +254,11 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "length": {"type": "number", "description": "Length in mm (negative = retract)"},
-                "speed": {"type": "integer", "description": "Feed rate in mm/min (default 300)", "default": 300},
+                "speed": {
+                    "type": "integer",
+                    "description": "Feed rate in mm/min (default 300)",
+                    "default": 300,
+                },
             },
             "required": ["length"],
         },
@@ -416,8 +428,8 @@ class ToolExecutor:
 
     def __init__(self, adapter: PrinterAdapter, camera=None, rtsp_url: str | None = None):
         self._adapter = adapter
-        self._camera = camera
-        self._rtsp_url = rtsp_url
+        self._camera: Any | None = camera
+        self._rtsp_url: str | None = rtsp_url
         self._dispatch: dict[str, Any] = {
             "get_printer_state": self._get_printer_state,
             "get_print_progress": self._get_print_progress,
@@ -448,12 +460,14 @@ class ToolExecutor:
             "upload_to_printer": self._upload_to_printer,
         }
         if camera:
-            self._dispatch.update({
-                "camera_move_step": self._camera_move_step,
-                "camera_move_to": self._camera_move_to,
-                "camera_get_presets": self._camera_get_presets,
-                "camera_go_to_preset": self._camera_go_to_preset,
-            })
+            self._dispatch.update(
+                {
+                    "camera_move_step": self._camera_move_step,
+                    "camera_move_to": self._camera_move_to,
+                    "camera_get_presets": self._camera_get_presets,
+                    "camera_go_to_preset": self._camera_go_to_preset,
+                }
+            )
         if rtsp_url:
             self._dispatch["camera_snapshot"] = self._camera_snapshot
 
@@ -580,14 +594,13 @@ class ToolExecutor:
         command = tool_input.get("command", "").strip()
         if not command:
             return {"error": "command is required"}
-        # Block dangerous commands
-        upper = command.upper()
-        for prefix in BLOCKED_GCODE_PREFIXES:
-            if upper.startswith(prefix):
-                return {"error": f"G-code '{prefix}' is blocked. Use emergency_cancel instead."}
-        cmd = await self._adapter.run_gcode(command)
+        validation_error = validate_gcode_command(command)
+        if validation_error:
+            return {"error": validation_error}
+        safe_command = _strip_gcode_comment(command)
+        cmd = await self._adapter.run_gcode(safe_command)
         result = self._cmd_result(cmd)
-        result["warning"] = f"Executed raw G-code: {command}"
+        result["warning"] = f"Executed raw G-code: {safe_command}"
         return result
 
     # --- Z-offset ---
@@ -764,18 +777,26 @@ class ToolExecutor:
     # --- Camera tools ---
 
     async def _camera_move_step(self, tool_input: dict) -> dict:
+        if self._camera is None:
+            return {"error": "Camera is not configured"}
         direction = tool_input.get("direction", "")
         return await self._camera.move_step(direction)
 
     async def _camera_move_to(self, tool_input: dict) -> dict:
+        if self._camera is None:
+            return {"error": "Camera is not configured"}
         pan = tool_input.get("pan", 0)
         tilt = tool_input.get("tilt", 0)
         return await self._camera.move_to(int(pan), int(tilt))
 
     async def _camera_get_presets(self, _input: dict) -> dict:
+        if self._camera is None:
+            return {"error": "Camera is not configured"}
         return await self._camera.get_presets()
 
     async def _camera_go_to_preset(self, tool_input: dict) -> dict:
+        if self._camera is None:
+            return {"error": "Camera is not configured"}
         preset_id = tool_input.get("preset_id")
         if preset_id is None:
             return {"error": "preset_id is required"}
@@ -785,10 +806,12 @@ class ToolExecutor:
         """Capture RTSP frame and return as image content blocks."""
         if not self._rtsp_url:
             return {"error": "Camera RTSP URL not configured"}
+        rtsp_url = self._rtsp_url
 
         def _capture():
             import cv2
-            cap = cv2.VideoCapture(self._rtsp_url)
+
+            cap = cv2.VideoCapture(rtsp_url)
             try:
                 ret, frame = cap.read()
                 if not ret:

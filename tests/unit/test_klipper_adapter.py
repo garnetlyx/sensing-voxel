@@ -1,6 +1,7 @@
 """
 Unit tests for Klipper/Moonraker adapter
 """
+
 import pytest
 from unittest.mock import Mock, AsyncMock, patch, mock_open
 from sensing_voxel.adapters.klipper import KlipperAdapter
@@ -102,9 +103,7 @@ class TestKlipperAdapter:
 
             result = await adapter.pause_print()
             assert result.status == CommandResultStatus.SUCCESS
-            mock_request.assert_called_once_with(
-                "POST", "/printer/print/pause"
-            )
+            mock_request.assert_called_once_with("POST", "/printer/print/pause")
 
     @pytest.mark.asyncio
     async def test_resume_print(self, adapter):
@@ -117,9 +116,7 @@ class TestKlipperAdapter:
 
             result = await adapter.resume_print()
             assert result.status == CommandResultStatus.SUCCESS
-            mock_request.assert_called_once_with(
-                "POST", "/printer/print/resume"
-            )
+            mock_request.assert_called_once_with("POST", "/printer/print/resume")
 
     @pytest.mark.asyncio
     async def test_cancel_print(self, adapter):
@@ -132,9 +129,7 @@ class TestKlipperAdapter:
 
             result = await adapter.cancel_print()
             assert result.status == CommandResultStatus.SUCCESS
-            mock_request.assert_called_once_with(
-                "POST", "/printer/print/cancel"
-            )
+            mock_request.assert_called_once_with("POST", "/printer/print/cancel")
 
     @pytest.mark.asyncio
     async def test_emergency_cancel(self, adapter):
@@ -144,10 +139,12 @@ class TestKlipperAdapter:
         mock_response.text = AsyncMock(return_value="OK")
 
         mock_session_instance = AsyncMock()
-        mock_session_instance.post = Mock(return_value=AsyncMock(
-            __aenter__=AsyncMock(return_value=mock_response),
-            __aexit__=AsyncMock(return_value=False),
-        ))
+        mock_session_instance.post = Mock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_response),
+                __aexit__=AsyncMock(return_value=False),
+            )
+        )
         mock_session_instance.__aenter__ = AsyncMock(return_value=mock_session_instance)
         mock_session_instance.__aexit__ = AsyncMock(return_value=False)
 
@@ -161,11 +158,7 @@ class TestKlipperAdapter:
         with patch.object(adapter, "_rest_request") as mock_request:
             mock_request.return_value = Mock(
                 status=CommandResultStatus.SUCCESS,
-                data={
-                    "gcode_move": {
-                        "homing_origin": [0.0, 0.0, 0.5]
-                    }
-                },
+                data={"gcode_move": {"homing_origin": [0.0, 0.0, 0.5]}},
             )
 
             z_offset = await adapter.get_z_offset()
@@ -189,6 +182,68 @@ class TestKlipperAdapter:
             )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["M112", "M410", "M80", "M81", "M23 test.gcode"])
+    async def test_run_gcode_blocks_dangerous_prefixes(self, adapter, command):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            result = await adapter.run_gcode(command)
+
+            assert result.status == CommandResultStatus.FAILURE
+            assert "blocked" in (result.message or "").lower()
+            mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_blocks_embedded_newlines(self, adapter):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            result = await adapter.run_gcode("G1 X10\nM104 S300")
+
+            assert result.status == CommandResultStatus.FAILURE
+            assert "single line" in (result.message or "").lower()
+            mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["M104 S301", "M109 S-1", "M140 S121", "M190 S130"])
+    async def test_run_gcode_enforces_temperature_bounds(self, adapter, command):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            result = await adapter.run_gcode(command)
+
+            assert result.status == CommandResultStatus.FAILURE
+            assert "must be" in (result.message or "")
+            mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["G1 X351", "G0 Y351", "G1 Z401", "G1 E101", "G1 E-11"])
+    async def test_run_gcode_enforces_axis_bounds(self, adapter, command):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            result = await adapter.run_gcode(command)
+
+            assert result.status == CommandResultStatus.FAILURE
+            assert "must be" in (result.message or "")
+            mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_rejects_invalid_structure(self, adapter):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            result = await adapter.run_gcode("G1 X10 @bad")
+
+            assert result.status == CommandResultStatus.FAILURE
+            assert "invalid g-code structure" in (result.message or "").lower()
+            mock_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_allows_valid_command_and_strips_comment(self, adapter):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = Mock(status=CommandResultStatus.SUCCESS, data={})
+
+            result = await adapter.run_gcode("G1 X100 Y100 Z10 E5 F1200 ; move")
+
+            assert result.status == CommandResultStatus.SUCCESS
+            mock_request.assert_called_once_with(
+                "POST",
+                "/printer/gcode/script",
+                json={"script": "G1 X100 Y100 Z10 E5 F1200"},
+            )
+
+    @pytest.mark.asyncio
     async def test_upload_file_success(self, adapter):
         """Test uploading file successfully"""
         with patch.object(adapter, "_rest_request") as mock_request:
@@ -200,9 +255,7 @@ class TestKlipperAdapter:
                         data={},
                     )
 
-                    result = await adapter.upload_file(
-                        "/tmp/test.gcode", "test.gcode"
-                    )
+                    result = await adapter.upload_file("/tmp/test.gcode", "test.gcode")
                     assert result.status == CommandResultStatus.SUCCESS
 
     @pytest.mark.asyncio
@@ -211,9 +264,7 @@ class TestKlipperAdapter:
         with patch("pathlib.Path.exists") as mock_exists:
             mock_exists.return_value = False
 
-            result = await adapter.upload_file(
-                "/tmp/nonexistent.gcode", "test.gcode"
-            )
+            result = await adapter.upload_file("/tmp/nonexistent.gcode", "test.gcode")
             assert result.status == CommandResultStatus.FAILURE
 
     @pytest.mark.asyncio
@@ -300,12 +351,8 @@ class TestKlipperAdapter:
         with patch("aiohttp.ClientSession") as mock_session:
             mock_response = AsyncMock()
             mock_response.status = 200
-            mock_response.json = AsyncMock(
-                return_value={"result": {"success": True}}
-            )
-            mock_session.return_value.request.return_value.__aenter__.return_value = (
-                mock_response
-            )
+            mock_response.json = AsyncMock(return_value={"result": {"success": True}})
+            mock_session.return_value.request.return_value.__aenter__.return_value = mock_response
 
             adapter._session = mock_session.return_value
             result = await adapter._rest_request("GET", "/test")
@@ -320,9 +367,7 @@ class TestKlipperAdapter:
             mock_response = AsyncMock()
             mock_response.status = 500
             mock_response.text = AsyncMock(return_value="Internal Server Error")
-            mock_session.return_value.request.return_value.__aenter__.return_value = (
-                mock_response
-            )
+            mock_session.return_value.request.return_value.__aenter__.return_value = mock_response
 
             adapter._session = mock_session.return_value
             result = await adapter._rest_request("GET", "/test")
@@ -333,9 +378,7 @@ class TestKlipperAdapter:
     async def test_rest_request_exception(self, adapter):
         """Test REST request exception"""
         with patch("aiohttp.ClientSession") as mock_session:
-            mock_session.return_value.request.side_effect = Exception(
-                "Connection error"
-            )
+            mock_session.return_value.request.side_effect = Exception("Connection error")
 
             adapter._session = mock_session.return_value
             result = await adapter._rest_request("GET", "/test")

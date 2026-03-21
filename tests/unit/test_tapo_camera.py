@@ -16,24 +16,33 @@ def config():
 @pytest.fixture
 def camera(config):
     cam = TapoCamera(config)
-    # Mock the internal pytapo instance
-    cam._tapo = MagicMock()
+    # Mock the ONVIF PTZ service and profile token
+    cam._ptz = MagicMock()
+    cam._profile_token = "mock_token"
     return cam
 
 
 class TestTapoCameraConnect:
     async def test_connect_creates_tapo_instance(self, config):
         cam = TapoCamera(config)
-        mock_tapo = MagicMock()
+        mock_cam = MagicMock()
+        mock_ptz = MagicMock()
+        mock_media = MagicMock()
+        mock_profiles = [MagicMock(token="test_token")]
         with patch("sensing_voxel.camera.tapo.asyncio") as mock_asyncio:
-            mock_asyncio.to_thread = AsyncMock(return_value=mock_tapo)
+            mock_asyncio.to_thread = AsyncMock(
+                side_effect=[mock_cam, mock_media, mock_ptz, mock_profiles]
+            )
+            mock_asyncio.sleep = AsyncMock()
             await cam.connect()
-            assert cam._tapo is mock_tapo
+            assert cam._cam is not None
+            assert cam._ptz is not None
+            assert cam._profile_token == "test_token"
 
-    async def test_disconnect_clears_tapo(self, camera):
-        assert camera._tapo is not None
+    async def test_disconnect_clears_ptz(self, camera):
+        assert camera._ptz is not None
         await camera.disconnect()
-        assert camera._tapo is None
+        assert camera._ptz is None
 
 
 class TestTapoCameraMoveStep:
@@ -69,7 +78,7 @@ class TestTapoCameraMoveTo:
 
 class TestTapoCameraPresets:
     async def test_get_presets(self, camera):
-        camera._tapo.getPresets = MagicMock(return_value={"1": "Home", "2": "Bed"})
+        camera._ptz.GetPresets = MagicMock(return_value=[])
         result = await camera.get_presets()
         assert "presets" in result
 

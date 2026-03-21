@@ -158,6 +158,7 @@ async def main() -> None:
             camera=tapo_camera,
             rtsp_url=config.dashboard.camera_rtsp_url,
             max_turns=config.llm.max_conversation_turns,
+            history_path=Path(config.storage.data_dir) / "chat_history.json",
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")

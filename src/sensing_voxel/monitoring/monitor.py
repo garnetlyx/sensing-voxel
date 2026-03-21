@@ -10,6 +10,9 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import datetime
+from typing import Any
+
+import numpy as np
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import (
@@ -22,12 +25,32 @@ from sensing_voxel.core.models import (
 from sensing_voxel.core.persistence import StatePersistence
 from sensing_voxel.core.state_machine import AgentStateMachine
 from sensing_voxel.monitoring.z_offset import ZOffsetController
-from sensing_voxel.vision.camera import CameraStream
-from sensing_voxel.vision.calibration import CameraCalibrator
-from sensing_voxel.vision.first_layer import FirstLayerClassifier
-from sensing_voxel.vision.NOTHING import NOTHING, NOTHING
 
 logger = logging.getLogger(__name__)
+
+try:
+    from sensing_voxel.vision.camera import CameraStream
+    from sensing_voxel.vision.calibration import CameraCalibrator
+    from sensing_voxel.vision.first_layer import FirstLayerClassifier
+    from sensing_voxel.vision.NOTHING import NOTHING, NOTHING
+    from sensing_voxel.vision.filament import FilamentMonitor
+
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    logger.warning("Vision modules not available, some features will be disabled")
+    FilamentMonitor = None  # type: ignore[misc,assignment]
+
+try:
+    from sensing_voxel.audio.detector import AudioAnomalyDetector, DetectionResult
+    from sensing_voxel.audio.baseline import BaselineManager
+
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    logger.warning("Audio modules not available, audio anomaly detection disabled")
+    AudioAnomalyDetector = None  # type: ignore[misc,assignment]
+    BaselineManager = None  # type: ignore[misc,assignment]
 
 
 class MonitoringOrchestrator:
@@ -38,6 +61,7 @@ class MonitoringOrchestrator:
     - External print detection (debounced)
     - Monitoring lifecycle for agent-started prints
     - State machine transitions based on printer events
+    - Audio anomaly detection for mechanical failures
     """
 
     def __init__(
@@ -50,12 +74,21 @@ class MonitoringOrchestrator:
         first_layer_classifier: FirstLayerClassifier | None = None,
         z_offset_controller: ZOffsetController | None = None,
         calibrator: CameraCalibrator | None = None,
+        audio_detector: AudioAnomalyDetector | None = None,
+        baseline_manager: BaselineManager | None = None,
+        filament_monitor: FilamentMonitor | None = None,
+        printer_id: str = "default",
         debounce_interval_seconds: int = 3,
         debounce_required_updates: int = 2,
+        enable_audio_monitoring: bool = True,
+        enable_filament_monitoring: bool = True,
     ):
         self.state_machine = state_machine
         self.adapter = adapter
         self.persistence = persistence
+        self.printer_id = printer_id
+        self.enable_audio_monitoring = enable_audio_monitoring and AUDIO_AVAILABLE
+        self.enable_filament_monitoring = enable_filament_monitoring and VISION_AVAILABLE
 
         # Vision components (optional — gracefully degrade if missing)
         self.camera = camera
@@ -63,6 +96,13 @@ class MonitoringOrchestrator:
         self.first_layer_classifier = first_layer_classifier
         self.z_offset_controller = z_offset_controller
         self.calibrator = calibrator
+
+        # Audio components (optional)
+        self.audio_detector = audio_detector
+        self.baseline_manager = baseline_manager
+
+        # Filament monitor (optional)
+        self.filament_monitor = filament_monitor
 
         self.debounce_interval = debounce_interval_seconds
         self.debounce_required_updates = debounce_required_updates
@@ -77,6 +117,8 @@ class MonitoringOrchestrator:
         self._monitoring_job_id: str | None = None
         self._NOTHING_task: asyncio.Task | None = None
         self._first_layer_task: asyncio.Task | None = None
+        self._audio_task: asyncio.Task | None = None
+        self._filament_task: asyncio.Task | None = None
 
         # Layer tracking
         self._current_layer: int | None = None
@@ -89,7 +131,8 @@ class MonitoringOrchestrator:
 
         logger.info(
             f"Monitoring orchestrator initialized with debounce: "
-            f"{debounce_required_updates} updates / {debounce_interval_seconds}s"
+            f"{debounce_required_updates} updates / {debounce_interval_seconds}s, "
+            f"audio={'enabled' if self.enable_audio_monitoring else 'disabled'}"
         )
 
     async def start(self):
@@ -129,6 +172,9 @@ class MonitoringOrchestrator:
 
         # Cancel vision tasks
         await self._cancel_vision_tasks()
+
+        # Cancel audio monitoring
+        await self._cancel_audio_monitoring()
 
         # Cancel debounce timer if active
         if self._debounce_timer and not self._debounce_timer.done():
@@ -439,10 +485,116 @@ class MonitoringOrchestrator:
         )
         logger.info(f"NOTHING monitoring started for job {job_context.job_id}")
 
+    async def _start_audio_monitoring(self, job_context: JobContext):
+        """Start audio anomaly monitoring."""
+        if not self.audio_detector or not AUDIO_AVAILABLE:
+            logger.info(
+                f"Audio not configured, monitoring unavailable for job {job_context.job_id}"
+            )
+            return
+
+        async def on_audio_detection(result: DetectionResult):
+            await self._handle_audio_anomaly(result)
+
+        self.audio_detector.set_on_detection_callback(on_audio_detection)
+
+        if self.baseline_manager:
+            baseline = self.baseline_manager.get_baseline_for_detector(self.printer_id)
+            if baseline:
+                self.audio_detector.set_baseline_profile(baseline)
+                logger.info(f"Loaded audio baseline for {self.printer_id}")
+            else:
+                logger.warning(f"No audio baseline for {self.printer_id}, using defaults")
+
+        async def audio_source():
+            return await self._get_audio_sample()
+
+        self._audio_task = asyncio.create_task(self.audio_detector.start_detection(audio_source))
+        logger.info(f"Audio monitoring started for job {job_context.job_id}")
+
+    async def _get_audio_sample(self) -> np.ndarray | None:
+        """Get audio sample from microphone."""
+        try:
+            import sounddevice as sd
+
+            duration = 1.0
+            sample_rate = self.audio_detector.sample_rate if self.audio_detector else 16000
+            samples = sd.rec(
+                int(duration * sample_rate),
+                samplerate=sample_rate,
+                channels=1,
+                dtype=np.float32,
+            )
+            sd.wait()
+            return samples.flatten()
+        except ImportError:
+            logger.debug("sounddevice not available for audio capture")
+            return None
+        except Exception as e:
+            logger.error(f"Audio capture error: {e}")
+            return None
+
+    async def _handle_audio_anomaly(self, result: DetectionResult):
+        """Handle audio anomaly detection."""
+        if not self._is_monitoring:
+            return
+
+        if result.requires_emergency_stop:
+            logger.critical(
+                f"AUDIO EMERGENCY: {result.anomaly_type.name} detected "
+                f"(confidence={result.confidence:.2f}) - triggering emergency stop"
+            )
+            await self._trigger_audio_emergency_stop(result)
+        else:
+            logger.warning(
+                f"Audio anomaly: {result.anomaly_type.name} detected "
+                f"(confidence={result.confidence:.2f})"
+            )
+
+    async def _trigger_audio_emergency_stop(self, result: DetectionResult):
+        """Trigger emergency stop on audio anomaly detection."""
+        if not self._is_monitoring:
+            return
+
+        try:
+            emergency_result = await self.adapter.emergency_cancel()
+            if emergency_result.status.value == "SUCCESS":
+                logger.critical("Emergency stop executed successfully due to audio anomaly")
+            else:
+                logger.error(f"Emergency stop failed: {emergency_result.message}")
+        except Exception as e:
+            logger.error(f"Emergency stop error: {e}")
+
+        await self.state_machine.transition_to(
+            AgentState.EMERGENCY_FAILED,
+            self.persistence,
+        )
+
+    async def _cancel_audio_monitoring(self):
+        """Cancel audio monitoring task."""
+        if self.audio_detector:
+            await self.audio_detector.stop_detection()
+
+        if self._audio_task and not self._audio_task.done():
+            self._audio_task.cancel()
+            try:
+                await self._audio_task
+            except asyncio.CancelledError:
+                pass
+        self._audio_task = None
+
     async def _start_full_monitoring(self, job_context: JobContext):
         """Start full monitoring (NOTHING + first-layer for agent-started prints)."""
+        if not VISION_AVAILABLE:
+            logger.warning("Vision modules not available, full monitoring disabled")
+            return
+
         # Always start NOTHING detection
         await self.NOTHING(job_context)
+
+        # Start audio monitoring if enabled
+        if self.enable_audio_monitoring and AUDIO_AVAILABLE:
+            await self._start_audio_monitoring(job_context)
 
         # Start first-layer monitoring if configured and calibrated
         if (
@@ -459,11 +611,11 @@ class MonitoringOrchestrator:
 
         calibration = None
         if self.calibrator:
-            calibration = CameraCalibrator.load_calibration(
+            calibration = CameraCalibrator.load_calibration(  # type: ignore[possibly-unbound]
                 self.persistence.state_file.parent / "calibration"
             )
 
-        if CameraCalibrator.check_validity(calibration) != CalibrationStatus.VALID:
+        if CameraCalibrator.check_validity(calibration) != CalibrationStatus.VALID:  # type: ignore[possibly-unbound]
             logger.warning("Camera calibration invalid/missing, first-layer monitoring disabled")
             return
 
@@ -476,36 +628,76 @@ class MonitoringOrchestrator:
         await self.z_offset_controller.start(self.adapter)
 
         # Compute ROI
-        roi = FirstLayerClassifier.compute_roi(
+        roi = FirstLayerClassifier.compute_roi(  # type: ignore[possibly-unbound]
             job_context.first_layer_bounds,
-            calibration.homography,
+            calibration.homography,  # type: ignore[union-attr]
         )
 
         # Start first-layer analysis loop
-        self._first_layer_task = asyncio.create_task(
-            self._first_layer_loop(roi)
-        )
+        self._first_layer_task = asyncio.create_task(self._first_layer_loop(roi))
         logger.info(f"First-layer monitoring started for job {job_context.job_id}")
+
+        # Start filament monitoring if enabled
+        if self.enable_filament_monitoring and self.filament_monitor:
+            await self._start_filament_monitoring(job_context)
+
+    async def _start_filament_monitoring(self, job_context: JobContext):
+        """Start filament spool monitoring."""
+        if not self.filament_monitor:
+            return
+
+        async def on_tangle_detection(result):
+            await self._handle_tangle_detection(result)
+
+        success = await self.filament_monitor.start(on_tangle_detection)
+        if success:
+            logger.info(f"Filament monitoring started for job {job_context.job_id}")
+        else:
+            logger.warning("Failed to start filament monitoring (disabled or camera error)")
+
+    async def _handle_tangle_detection(self, result):
+        """Handle tangle detection - pause print and notify."""
+        from sensing_voxel.core.models import TangleDecision
+
+        if not self._is_monitoring:
+            return
+
+        if result.severity == TangleDecision.CRITICAL:
+            logger.warning(
+                f"CRITICAL: Filament tangle detected (confidence={result.confidence:.2f}), pausing print"
+            )
+            await self.handle_print_pause()
+
+            # TODO: Send notification to user via Telegram or other channels
+            # This would typically be done through a notification callback
+            # set up during orchestrator initialization
+
+    async def _cancel_filament_monitoring(self):
+        """Cancel filament monitoring."""
+        if self.filament_monitor:
+            await self.filament_monitor.stop()
 
     async def _first_layer_loop(self, roi: tuple[int, int, int, int]):
         """Background loop for first-layer analysis and Z-offset correction."""
-        interval = self.z_offset_controller.config.evaluation_interval_seconds
+        if not VISION_AVAILABLE:
+            logger.warning("Vision modules not available, first-layer loop disabled")
+            return
+
+        interval = self.z_offset_controller.config.evaluation_interval_seconds  # type: ignore[union-attr]
 
         while self._is_monitoring:
             try:
-                frame = await self.camera.get_frame(timeout=interval)
+                frame = await self.camera.get_frame(timeout=interval)  # type: ignore[union-attr]
                 if frame is None:
                     continue
 
-                analysis = self.first_layer_classifier.analyze(frame, roi)
-                adjustment = self.z_offset_controller.evaluate(analysis)
+                analysis = self.first_layer_classifier.analyze(frame, roi)  # type: ignore[union-attr]
+                adjustment = self.z_offset_controller.evaluate(analysis)  # type: ignore[union-attr]
 
                 if adjustment is not None:
-                    await self.z_offset_controller.apply_correction(
-                        self.adapter, adjustment
-                    )
+                    await self.z_offset_controller.apply_correction(self.adapter, adjustment)  # type: ignore[union-attr]
 
-                if self.z_offset_controller.is_saturated:
+                if self.z_offset_controller.is_saturated:  # type: ignore[union-attr]
                     logger.warning("Z-offset saturated, pausing for user review")
                     await self.handle_print_pause()
                     return
@@ -530,12 +722,19 @@ class MonitoringOrchestrator:
         self._NOTHING_task = None
         self._first_layer_task = None
 
+    async def _cancel_filament_monitoring(self):
+        """Cancel filament monitoring."""
+        if self.filament_monitor:
+            await self.filament_monitor.stop()
+
     async def _handle_connection_lost(self):
         """Handle adapter disconnection during monitoring."""
         if not self._is_monitoring:
             return
-        logger.warning("Adapter connection lost during monitoring, pausing vision")
+        logger.warning("Adapter connection lost during monitoring, pausing vision and audio")
         await self._cancel_vision_tasks()
+        await self._cancel_audio_monitoring()
+        await self._cancel_filament_monitoring()
 
     async def _handle_connection_restored(self):
         """Handle adapter reconnection during monitoring."""

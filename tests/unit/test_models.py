@@ -4,7 +4,7 @@ Unit tests for core data models
 
 import pytest
 from datetime import datetime, timedelta
-from src.sensing_voxel.core.models import (
+from sensing_voxel.core.models import (
     # Enums
     AgentState,
     NormalizedPrinterState,

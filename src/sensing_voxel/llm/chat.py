@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -57,18 +56,20 @@ class ChatSession:
             self.messages.append({"role": "assistant", "content": content})
         self._trim()
 
-    def add_tool_result(self, tool_use_id: str, result: str | list) -> None:
+    def add_tool_result(self, tool_use_id: str, result: str | list | dict) -> None:
         """Add tool result message (str or content blocks list)."""
-        self.messages.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result,
-                }
-            ],
-        })
+        self.messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result,
+                    }
+                ],
+            }
+        )
 
     def get_messages(self) -> list[dict]:
         """Get message history for API call."""
@@ -116,6 +117,7 @@ class ChatManager:
         rtsp_url: str | None = None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
+        history_path: Path | None = None,
     ):
         self._client = client
         self._context_collector = context_collector
@@ -123,6 +125,7 @@ class ChatManager:
         self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
+        self._history_path = history_path or Path("data/chat_history.json")
         self._sessions: dict[int, ChatSession] = {}
 
         # Create tool executor if adapter is available
@@ -171,22 +174,36 @@ class ChatManager:
             session.add_assistant_message(content_blocks)
 
             # If no tool use, we're done
-            if response.stop_reason != "tool_use":
+            stop_reason = getattr(response, "stop_reason", None)
+            if stop_reason is None and isinstance(response, dict):
+                stop_reason = response.get("stop_reason", "end_turn")
+            if stop_reason != "tool_use":
                 self.save_history()
-                text = self._extract_text(response.content)
+                text = self._extract_text(
+                    response.content
+                    if hasattr(response, "content")
+                    else response.get("content", [])
+                )
                 return self._truncate(text)
 
             # Execute each tool call and append results
-            for block in response.content:
-                if block.type == "tool_use":
-                    logger.info(f"Tool call: {block.name}({block.input})")
-                    result = await self._tool_executor.execute(block.name, block.input)
+            content_blocks = (
+                response.content if hasattr(response, "content") else response.get("content", [])
+            )
+            for block in content_blocks:
+                block_type = block.type if hasattr(block, "type") else block.get("type")
+                if block_type == "tool_use":
+                    block_name = block.name if hasattr(block, "name") else block.get("name")
+                    block_input = block.input if hasattr(block, "input") else block.get("input")
+                    block_id = block.id if hasattr(block, "id") else block.get("id")
+                    logger.info(f"Tool call: {block_name}({block_input})")
+                    result = await self._tool_executor.execute(block_name, block_input)
                     if isinstance(result, dict) and "content" in result:
                         logger.info(f"Tool result: [image + text content blocks]")
-                        session.add_tool_result(block.id, result["content"])
+                        session.add_tool_result(block_id, result["content"])
                     else:
                         logger.info(f"Tool result: {result[:200]}")
-                        session.add_tool_result(block.id, result)
+                        session.add_tool_result(block_id, result)
 
         # Exhausted iterations
         return self._truncate(
@@ -205,26 +222,28 @@ class ChatManager:
         session = self._get_or_create_session(user_id)
         return session.get_messages()
 
-    def save_history(self, path: str = "data/chat_history.json") -> None:
+    def save_history(self, path: Path | str | None = None) -> None:
         """Save all sessions to disk."""
+        history_path = Path(path) if path is not None else self._history_path
         try:
             data = {str(uid): s.to_dict() for uid, s in self._sessions.items()}
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            with history_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save chat history: {e}")
 
-    def load_history(self, path: str = "data/chat_history.json") -> None:
+    def load_history(self, path: Path | str | None = None) -> None:
         """Load sessions from disk."""
-        if not os.path.exists(path):
+        history_path = Path(path) if path is not None else self._history_path
+        if not history_path.exists():
             return
         try:
-            with open(path, "r") as f:
+            with history_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             for uid_str, s_data in data.items():
                 self._sessions[int(uid_str)] = ChatSession.from_dict(s_data)
-            logger.info(f"Loaded {len(self._sessions)} chat sessions from {path}")
+            logger.info(f"Loaded {len(self._sessions)} chat sessions from {history_path}")
         except Exception as e:
             logger.error(f"Failed to load chat history: {e}")
 
@@ -242,27 +261,38 @@ class ChatManager:
     def _serialize_content(content) -> list[dict]:
         """Convert SDK content blocks to serializable dicts for message history."""
         blocks = []
-        for block in content:
-            if block.type == "text":
-                blocks.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                blocks.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
-            elif block.type == "thinking":
-                blocks.append({"type": "thinking", "thinking": block.thinking})
-            elif block.type == "image":
-                blocks.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": block.source.media_type,
-                        "data": block.source.data,
-                    },
-                })
+        # Handle both Anthropic SDK objects and Ollama dict responses
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    # Ollama/OpenAI format
+                    blocks.append(block)
+                else:
+                    # Anthropic SDK format
+                    if block.type == "text":
+                        blocks.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            }
+                        )
+                    elif block.type == "thinking":
+                        blocks.append({"type": "thinking", "thinking": block.thinking})
+                    elif block.type == "image":
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": block.source.media_type,
+                                    "data": block.source.data,
+                                },
+                            }
+                        )
         return blocks
 
     @staticmethod

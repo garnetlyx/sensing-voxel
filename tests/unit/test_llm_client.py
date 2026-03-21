@@ -3,13 +3,14 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from sensing_voxel.config import LlmConfig
-from sensing_voxel.llm.client import LlmClient
+from sensing_voxel.config import LlmConfig, LlmProvider
+from sensing_voxel.llm.client import LlmClient, AnthropicClient, OllamaClient
 
 
 @pytest.fixture
-def llm_config():
+def minimax_config():
     return LlmConfig(
+        provider=LlmProvider.MINIMAX,
         api_key="test-api-key",
         base_url="https://api.test.com",
         model="test-model",
@@ -21,24 +22,54 @@ def llm_config():
 
 
 @pytest.fixture
-def llm_client(llm_config):
-    return LlmClient(llm_config)
+def ollama_config():
+    return LlmConfig(
+        provider=LlmProvider.OLLAMA,
+        api_key=None,
+        base_url="http://localhost:11434/v1",
+        model="llama3.2",
+        max_tokens=1024,
+        temperature=0.5,
+        timeout_seconds=10,
+        enabled=True,
+    )
+
+
+@pytest.fixture
+def llm_client(minimax_config):
+    return LlmClient(minimax_config)
 
 
 class TestLlmClient:
     async def test_is_available_before_init(self, llm_client):
         assert llm_client.is_available is False
 
-    async def test_initialize_creates_client(self, llm_client):
+    async def test_initialize_selects_anthropic_for_minimax(self, minimax_config):
         with patch("sensing_voxel.llm.client.anthropic.AsyncAnthropic"):
-            await llm_client.initialize()
-            assert llm_client.is_available is True
+            client = LlmClient(minimax_config)
+            await client.initialize()
+            assert client.is_available is True
+            assert isinstance(client._impl, AnthropicClient)
 
-    async def test_initialize_without_api_key_raises(self):
-        config = LlmConfig(api_key=None)
+    async def test_initialize_selects_ollama_for_ollama_provider(self, ollama_config):
+        client = LlmClient(ollama_config)
+        await client.initialize()
+        assert client.is_available is True
+        assert isinstance(client._impl, OllamaClient)
+        await client.close()
+
+    async def test_initialize_without_api_key_raises_for_minimax(self):
+        config = LlmConfig(provider=LlmProvider.MINIMAX, api_key=None)
         client = LlmClient(config)
         with pytest.raises(ValueError, match="api_key is required"):
             await client.initialize()
+
+    async def test_ollama_no_api_key_required(self, ollama_config):
+        client = LlmClient(ollama_config)
+        # Should not raise
+        await client.initialize()
+        assert client.is_available is True
+        await client.close()
 
     async def test_send_message_returns_text(self, llm_client):
         mock_response = MagicMock()
@@ -47,10 +78,12 @@ class TestLlmClient:
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch("sensing_voxel.llm.client.anthropic.AsyncAnthropic", return_value=mock_anthropic):
+        with patch(
+            "sensing_voxel.llm.client.anthropic.AsyncAnthropic", return_value=mock_anthropic
+        ):
             await llm_client.initialize()
 
-        llm_client._client = mock_anthropic
+        llm_client._impl._client = mock_anthropic
         result = await llm_client.send_message(
             messages=[{"role": "user", "content": "hi"}],
             system_prompt="You are a test bot",
@@ -77,7 +110,8 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         await llm_client.send_message(
             messages=[{"role": "user", "content": "hi"}],
@@ -92,7 +126,8 @@ class TestLlmClient:
 
     async def test_close_cleans_up(self, llm_client):
         mock_anthropic = AsyncMock()
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         await llm_client.close()
         mock_anthropic.close.assert_called_once()
@@ -119,12 +154,19 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         result = await llm_client.send_message_with_tools(
             messages=[{"role": "user", "content": "What is the printer state?"}],
             system_prompt="You are a printer assistant",
-            tools=[{"name": "get_printer_state", "description": "Get state", "input_schema": {"type": "object"}}],
+            tools=[
+                {
+                    "name": "get_printer_state",
+                    "description": "Get state",
+                    "input_schema": {"type": "object"},
+                }
+            ],
         )
 
         assert result is mock_response
@@ -133,7 +175,11 @@ class TestLlmClient:
         call_kwargs = mock_anthropic.messages.create.call_args.kwargs
         assert call_kwargs["model"] == "test-model"
         assert call_kwargs["tools"] == [
-            {"name": "get_printer_state", "description": "Get state", "input_schema": {"type": "object"}}
+            {
+                "name": "get_printer_state",
+                "description": "Get state",
+                "input_schema": {"type": "object"},
+            }
         ]
 
     async def test_send_message_with_tools_without_init_raises(self, llm_client):
@@ -152,7 +198,8 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         await llm_client.send_message_with_tools(
             messages=[{"role": "user", "content": "hi"}],
@@ -170,7 +217,8 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         await llm_client.send_message_with_tools(
             messages=[{"role": "user", "content": "hi"}],
@@ -198,7 +246,8 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         result = await llm_client.send_message(
             messages=[{"role": "user", "content": "think hard"}],
@@ -214,7 +263,8 @@ class TestLlmClient:
 
         mock_anthropic = AsyncMock()
         mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
-        llm_client._client = mock_anthropic
+        llm_client._impl = AnthropicClient(llm_client._config)
+        llm_client._impl._client = mock_anthropic
 
         result = await llm_client.send_message(
             messages=[{"role": "user", "content": "hi"}],
@@ -222,3 +272,38 @@ class TestLlmClient:
         )
 
         assert result == ""
+
+
+class TestOllamaClient:
+    """Tests for Ollama client"""
+
+    async def test_ollama_initialization(self, ollama_config):
+        client = OllamaClient(ollama_config)
+        await client.initialize()
+        assert client.is_available is True
+        assert client._base_url == "http://localhost:11434/v1"
+        await client.close()
+
+    async def test_ollama_convert_messages(self, ollama_config):
+        client = OllamaClient(ollama_config)
+        openai_messages = client._convert_messages_to_openai(
+            [{"role": "user", "content": "Hello"}], "You are a helpful assistant"
+        )
+        assert len(openai_messages) == 2
+        assert openai_messages[0]["role"] == "system"
+        assert openai_messages[0]["content"] == "You are a helpful assistant"
+        assert openai_messages[1]["role"] == "user"
+
+    async def test_ollama_convert_tools(self, ollama_config):
+        client = OllamaClient(ollama_config)
+        anthropic_tools = [
+            {
+                "name": "get_printer_state",
+                "description": "Get printer state",
+                "input_schema": {"type": "object"},
+            }
+        ]
+        openai_tools = client._convert_tools_to_openai(anthropic_tools)
+        assert len(openai_tools) == 1
+        assert openai_tools[0]["type"] == "function"
+        assert openai_tools[0]["function"]["name"] == "get_printer_state"

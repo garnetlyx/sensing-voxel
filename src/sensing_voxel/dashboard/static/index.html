@@ -124,6 +124,57 @@
       </div>
     </section>
 
+    <section class="card job-history-panel">
+      <div class="card-header">
+        <span class="card-title">Job History</span>
+        <div class="job-history-filters">
+          <select id="job-status-filter" class="filter-select">
+            <option value="">All Status</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="cancelled">Cancelled</option>
+            <option value="running">Running</option>
+            <option value="pending">Pending</option>
+          </select>
+          <select id="job-printer-filter" class="filter-select">
+            <option value="">All Printers</option>
+          </select>
+        </div>
+      </div>
+      <div class="job-history-table-container">
+        <table class="job-history-table" id="job-history-table">
+          <thead>
+            <tr>
+              <th data-sort="file_name">File</th>
+              <th data-sort="printer_id">Printer</th>
+              <th data-sort="status">Status</th>
+              <th data-sort="started_at">Started</th>
+              <th data-sort="duration_seconds">Duration</th>
+              <th>Filament</th>
+            </tr>
+          </thead>
+          <tbody id="job-history-body">
+            <tr class="no-data"><td colspan="6">No jobs found</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="job-history-pagination">
+        <button id="job-prev-page" class="btn-icon" title="Previous page">&#9664;</button>
+        <span id="job-page-info">Page 1 of 1</span>
+        <button id="job-next-page" class="btn-icon" title="Next page">&#9654;</button>
+      </div>
+    </section>
+
+    <section class="card queue-panel">
+      <div class="card-header">
+        <span class="card-title">Print Queue</span>
+        <button class="btn-icon" onclick="clearQueue()" title="Clear queue">&#10005;</button>
+      </div>
+      <div class="queue-list" id="queue-list">
+        <p class="no-queue">Queue is empty</p>
+      </div>
+    </section>
+
     <!-- Chat panel -->
     <section class="card chat-panel">
       <div class="card-header">
@@ -138,12 +189,12 @@
       </div>
       <div class="chat-input-container">
         <div id="file-indicator" class="chat-file-indicator">
-          <span>📎</span>
+          <span>&#128206;</span>
           <span id="file-name">filename.gcode</span>
           <button class="chat-clear-btn" onclick="cancelUpload()" style="margin-left: auto">&times;</button>
         </div>
         <div class="chat-input-row">
-          <button class="btn-icon" onclick="document.getElementById('chat-file-input').click()" title="Attach file">📎</button>
+          <button class="btn-icon" onclick="document.getElementById('chat-file-input').click()" title="Attach file">&#128206;</button>
           <input type="file" id="chat-file-input" style="display: none" accept=".gcode,.bgcode">
           <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
           <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>

@@ -6,6 +6,7 @@ Adapted from OpenClaw's skills/lucakaufmann/snapmaker/scripts/snapmaker.py
 
 import asyncio
 import logging
+import math
 import random
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from sensing_voxel.core.models import (
     PrintProgress,
     TelemetryData,
 )
+from sensing_voxel.infra.gcode import _strip_gcode_comment, validate_gcode_command
 from sensing_voxel.infra.retry import BackoffPolicy
 
 logger = logging.getLogger(__name__)
@@ -93,7 +95,7 @@ class KlipperAdapter(PrinterAdapter):
         if self.api_key:
             headers["X-API-Key"] = self.api_key
 
-        self._session = aiohttp.ClientSession(headers=headers)
+        self._session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=30))
 
         # Start WebSocket connection task
         asyncio.create_task(self._ws_reconnect_loop())
@@ -143,8 +145,6 @@ class KlipperAdapter(PrinterAdapter):
 
             # Reconnect delay - cap attempts to prevent overflow
             # Calculate max useful attempts: log(max_delay / base_delay) / log(factor)
-            import math
-
             max_attempts_before_max_delay = (
                 int(
                     math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
@@ -204,20 +204,22 @@ class KlipperAdapter(PrinterAdapter):
 
     async def _ws_subscribe(self, ws: aiohttp.ClientWebSocketResponse):
         """Subscribe to Moonraker printer objects for live updates."""
-        await ws.send_json({
-            "jsonrpc": "2.0",
-            "method": "printer.objects.subscribe",
-            "params": {
-                "objects": {
-                    "print_stats": None,
-                    "heater_bed": None,
-                    "extruder": None,
-                    "toolhead": None,
-                    "display_status": None,
-                }
-            },
-            "id": 1,
-        })
+        await ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "method": "printer.objects.subscribe",
+                "params": {
+                    "objects": {
+                        "print_stats": None,
+                        "heater_bed": None,
+                        "extruder": None,
+                        "toolhead": None,
+                        "display_status": None,
+                    }
+                },
+                "id": 1,
+            }
+        )
         logger.debug("Subscribed to printer objects")
 
     async def _handle_ws_message(self, data: dict):
@@ -297,6 +299,7 @@ class KlipperAdapter(PrinterAdapter):
 
     def _handle_gcode_output(self, params: dict):
         """Handle G-code output notification from Klipper"""
+        # TODO: parse LAYER_CHANGE markers for monitoring orchestrator (ARCHITECTURE.md §4.8)
         message = params.get("message", "")
         if message:
             logger.debug(f"G-code output: {message}")
@@ -335,11 +338,7 @@ class KlipperAdapter(PrinterAdapter):
             # Prefer display_status.progress (updated by M73 / virtual_sdcard),
             # fall back to print_stats.progress
             display = status.get("display_status", {})
-            metadata["progress"] = (
-                display.get("progress")
-                or print_stats.get("progress")
-                or 0.0
-            )
+            metadata["progress"] = display.get("progress") or print_stats.get("progress") or 0.0
 
         if not temps and not position:
             return None
@@ -570,29 +569,28 @@ class KlipperAdapter(PrinterAdapter):
             gcode = "M107"
         else:
             gcode = f"M106 S{min(speed, 255)}"
-        return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": gcode}
-        )
+        return await self._rest_request("POST", "/printer/gcode/script", json={"script": gcode})
 
     async def run_gcode(self, command: str) -> CommandResult:
+        validation_error = validate_gcode_command(command)
+        if validation_error:
+            return CommandResult(CommandResultStatus.FAILURE, message=validation_error)
+
+        safe_command = _strip_gcode_comment(command)
         return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": command}
+            "POST", "/printer/gcode/script", json={"script": safe_command}
         )
 
     async def list_files(self) -> CommandResult:
         return await self._rest_request("GET", "/server/files/list?root=gcodes")
 
     async def delete_file(self, filename: str) -> CommandResult:
-        return await self._rest_request(
-            "DELETE", f"/server/files/gcodes/{filename}"
-        )
+        return await self._rest_request("DELETE", f"/server/files/gcodes/{filename}")
 
     async def get_file_metadata(self, filename: str) -> CommandResult:
         """Get file metadata — parse G-code header if Moonraker metadata is sparse."""
         # First try Moonraker's metadata endpoint
-        result = await self._rest_request(
-            "GET", f"/server/files/metadata?filename={filename}"
-        )
+        result = await self._rest_request("GET", f"/server/files/metadata?filename={filename}")
         if result.status == CommandResultStatus.SUCCESS and result.data:
             meta = result.data
             # If Moonraker already has layer_count, return as-is
@@ -612,7 +610,9 @@ class KlipperAdapter(PrinterAdapter):
         url = f"{self._rest_base_url}/server/files/gcodes/{filename}"
         try:
             headers = {"Range": "bytes=0-10240"}
-            async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self._session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 if resp.status not in (200, 206):
                     return CommandResult(
                         CommandResultStatus.FAILURE,
@@ -676,25 +676,23 @@ class KlipperAdapter(PrinterAdapter):
         if axis not in ("X", "Y", "Z"):
             return CommandResult(CommandResultStatus.FAILURE, message=f"Invalid axis: {axis}")
         gcode = f"G91\nG1 {axis}{distance:.3f} F{speed}\nG90"
-        return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": gcode}
-        )
+        return await self._rest_request("POST", "/printer/gcode/script", json={"script": gcode})
 
     async def extrude(self, length: float, speed: int = 300) -> CommandResult:
         gcode = f"M83\nG1 E{length:.2f} F{speed}\nM82"
-        return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": gcode}
-        )
+        return await self._rest_request("POST", "/printer/gcode/script", json={"script": gcode})
 
     async def set_speed_override(self, percent: int) -> CommandResult:
         return await self._rest_request(
-            "POST", "/printer/gcode/script",
+            "POST",
+            "/printer/gcode/script",
             json={"script": f"M220 S{percent}"},
         )
 
     async def set_flow_override(self, percent: int) -> CommandResult:
         return await self._rest_request(
-            "POST", "/printer/gcode/script",
+            "POST",
+            "/printer/gcode/script",
             json={"script": f"M221 S{percent}"},
         )
 
@@ -704,16 +702,12 @@ class KlipperAdapter(PrinterAdapter):
             return result
         objects = result.data.get("objects", [])
         macros = [
-            obj.replace("gcode_macro ", "")
-            for obj in objects
-            if obj.startswith("gcode_macro ")
+            obj.replace("gcode_macro ", "") for obj in objects if obj.startswith("gcode_macro ")
         ]
         return CommandResult(CommandResultStatus.SUCCESS, data=macros)
 
     async def execute_macro(self, name: str) -> CommandResult:
-        return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": name}
-        )
+        return await self._rest_request("POST", "/printer/gcode/script", json={"script": name})
 
     async def restart_firmware(self) -> CommandResult:
         return await self._rest_request("POST", "/printer/firmware_restart")
@@ -722,25 +716,24 @@ class KlipperAdapter(PrinterAdapter):
         return await self._rest_request("POST", "/printer/restart")
 
     async def get_system_info(self) -> CommandResult:
-        result = await self._rest_request(
-            "GET", "/printer/objects/query?system_stats&webhooks"
-        )
+        result = await self._rest_request("GET", "/printer/objects/query?system_stats&webhooks")
         if result.status != CommandResultStatus.SUCCESS or not result.data:
             return result
         status = result.data.get("status", result.data)
         sys_stats = status.get("system_stats", {})
         webhooks = status.get("webhooks", {})
-        return CommandResult(CommandResultStatus.SUCCESS, data={
-            "cpu_load": sys_stats.get("sysload"),
-            "memory_available_kb": sys_stats.get("memavail"),
-            "klipper_state": webhooks.get("state"),
-            "klipper_message": webhooks.get("state_message"),
-        })
+        return CommandResult(
+            CommandResultStatus.SUCCESS,
+            data={
+                "cpu_load": sys_stats.get("sysload"),
+                "memory_available_kb": sys_stats.get("memavail"),
+                "klipper_state": webhooks.get("state"),
+                "klipper_message": webhooks.get("state_message"),
+            },
+        )
 
     async def motors_off(self) -> CommandResult:
-        return await self._rest_request(
-            "POST", "/printer/gcode/script", json={"script": "M84"}
-        )
+        return await self._rest_request("POST", "/printer/gcode/script", json={"script": "M84"})
 
     # --- Queries ---
 
@@ -832,12 +825,8 @@ class KlipperAdapter(PrinterAdapter):
         effective_timeout = timeout if timeout else 30
         client_timeout = aiohttp.ClientTimeout(total=effective_timeout)
 
-        # Merge custom kwargs with timeout enforcement
-        request_kwargs = {"timeout": client_timeout}
-        request_kwargs.update(kwargs)
-
         try:
-            async with self._session.request(method, url, **request_kwargs) as resp:
+            async with self._session.request(method, url, timeout=client_timeout, **kwargs) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return CommandResult(

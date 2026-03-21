@@ -1,5 +1,5 @@
 /**
- * Sensing Voxel Dashboard — WebSocket client and DOM updates
+ * Sensing Voxel Dashboard - WebSocket client and DOM updates
  * Multi-printer aware: events carry printer_id, UI shows selected printer
  */
 
@@ -16,13 +16,30 @@
   const state = {
     agentState: "UNKNOWN",
     activePrinter: null,
-    selectedPrinter: null, // currently viewed in UI (dropdown)
-    printers: {},          // { pid: { connected, telemetry } }
+    selectedPrinter: null,
+    printers: {},
     job: null,
     alerts: [],
     decisionToken: null,
     decisionJobId: null,
     selectedFile: null,
+  };
+
+  const jobHistoryState = {
+    jobs: [],
+    page: 1,
+    perPage: 20,
+    total: 0,
+    sortField: "started_at",
+    sortDesc: true,
+    filterStatus: "",
+    filterPrinter: "",
+    loading: false,
+  };
+
+  const queueState = {
+    items: [],
+    loading: false,
   };
 
   // --- DOM refs ---
@@ -112,7 +129,6 @@
     }
     state.activePrinter = data.active_printer || null;
 
-    // Populate per-printer data
     if (data.printers) {
       state.printers = {};
       for (const p of data.printers) {
@@ -123,12 +139,12 @@
       }
     }
 
-    // Auto-select first printer if none selected
     if (!state.selectedPrinter && Object.keys(state.printers).length > 0) {
       state.selectedPrinter = state.activePrinter || Object.keys(state.printers)[0];
     }
 
     updatePrinterSelect();
+    updatePrinterFilters();
     updateAll();
     updateConnectionDot(true);
   }
@@ -144,7 +160,6 @@
     if (pid && state.printers[pid]) {
       state.printers[pid].telemetry = data;
     }
-    // Update temps panel if this is the selected printer
     if (pid === state.selectedPrinter) {
       updateTempsPanel();
     }
@@ -193,6 +208,22 @@
         const active = pid === state.activePrinter ? " *" : "";
         return `<option value="${escapeHtml(pid)}" ${pid === state.selectedPrinter ? "selected" : ""}>${dot} ${escapeHtml(pid)}${active}</option>`;
       })
+      .join("");
+  }
+
+  function updatePrinterFilters() {
+    const filter = $("#job-printer-filter");
+    if (!filter) return;
+
+    const printerIds = Object.keys(state.printers);
+    const currentVal = filter.value;
+
+    filter.innerHTML = '<option value="">All Printers</option>' +
+      printerIds.map(pid => `<option value="${escapeHtml(pid)}">${escapeHtml(pid)}</option>`).join("");
+
+    if (currentVal && printerIds.includes(currentVal)) {
+      filter.value = currentVal;
+    }
   }
 
   function onPrinterSelectChange(e) {
@@ -311,7 +342,7 @@
     const temps = tel.temperatures;
 
     if (nozzle) nozzle.textContent = (temps.extruder || 0).toFixed(1);
-    if (nozzleTarget) nozzleTarget.textContent = `/ ${(temps.extruder_target || 0).toFixed(0)}`;
+    if (nozzleTarget) nozzleTarget.textContent = ` / ${(temps.extruder_target || 0).toFixed(0)}`;
     if (nozzleBar) {
       const pct = temps.extruder_target > 0
         ? Math.min(100, (temps.extruder / temps.extruder_target) * 100)
@@ -320,7 +351,7 @@
     }
 
     if (bed) bed.textContent = (temps.bed || 0).toFixed(1);
-    if (bedTarget) bedTarget.textContent = `/ ${(temps.bed_target || 0).toFixed(0)}`;
+    if (bedTarget) bedTarget.textContent = ` / ${(temps.bed_target || 0).toFixed(0)}`;
     if (bedBar) {
       const pct = temps.bed_target > 0
         ? Math.min(100, (temps.bed / temps.bed_target) * 100)
@@ -400,7 +431,6 @@
   window.sendDecision = async function (action) {
     if (!state.decisionToken) return;
 
-    // Disable buttons during request
     $$(".decision-buttons .btn").forEach((b) => (b.disabled = true));
 
     try {
@@ -466,6 +496,26 @@
     }
   }
 
+  function formatDateTime(iso) {
+    if (!iso) return "--";
+    try {
+      const d = new Date(iso);
+      return d.toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return "--";
+    }
+  }
+
+  function formatDuration(seconds) {
+    if (!seconds) return "--";
+    return formatTime(seconds);
+  }
+
   function escapeHtml(str) {
     if (!str) return "";
     const div = document.createElement("div");
@@ -499,7 +549,6 @@
     const input = $("#chat-input");
     let message = input.value.trim();
 
-    // If we have a file and NO message, use a default message
     if (state.selectedFile && !message) {
       message = `I've uploaded ${state.selectedFile.name}. What can you do with it?`;
     }
@@ -510,11 +559,10 @@
     updateChatSendButton();
     input.value = "";
 
-    // Handle file upload first if present
     let uploadedFileInfo = null;
     if (state.selectedFile) {
       const fileToUpload = state.selectedFile;
-      updateFileIndicator(null); // Clear indicator early
+      updateFileIndicator(null);
       appendChatMessage("system", `Uploading ${fileToUpload.name}...`);
 
       uploadedFileInfo = await uploadFile(fileToUpload);
@@ -526,13 +574,10 @@
 
       appendChatMessage("system", `Uploaded ${fileToUpload.name} successfully.`);
 
-      // Add a hint to the message so the LLM knows it has a "local" file to work with
       const systemHint = `\n\n[System: User uploaded file '${uploadedFileInfo.filename}' to server storage. Use upload_to_printer to send it to the printer if requested.]`;
-      
-      // Append user message (clean version)
+
       appendChatMessage("user", message);
-      
-      // Send message with hint to API
+
       message += systemHint;
     } else {
       appendChatMessage("user", message);
@@ -574,7 +619,6 @@
     try {
       await fetch("/api/v1/chat/clear", { method: "POST" });
     } catch {
-      // Ignore
     }
   };
 
@@ -582,7 +626,6 @@
     const messages = $("#chat-messages");
     if (!messages) return;
 
-    // Remove welcome message
     const welcome = messages.querySelector(".chat-welcome");
     if (welcome) welcome.remove();
 
@@ -591,6 +634,7 @@
     el.textContent = text;
     messages.appendChild(el);
     scrollChatToBottom();
+    return el;
   }
 
   function scrollChatToBottom() {
@@ -605,7 +649,6 @@
 
     if (!messages || !fileInput) return;
 
-    // Drag events
     ["dragenter", "dragover"].forEach(name => {
       messages.addEventListener(name, (e) => {
         e.preventDefault();
@@ -641,7 +684,6 @@
     const ext = file.name.split(".").pop().toLowerCase();
     if (!["gcode", "bgcode"].includes(ext)) {
       addAlert("warning", "Only .gcode or .bgcode files are supported currently.");
-      // Still allow upload but warn
     }
 
     state.selectedFile = file;
@@ -706,7 +748,6 @@
           }
 
           if (text) {
-            // Remove the system hint from user messages if present
             const cleanText = text.replace(/\n\n\[System: .*\]/, "");
             if (cleanText.trim()) {
               appendChatMessage(msg.role, cleanText);
@@ -724,7 +765,246 @@
     if (btn) btn.disabled = chatPending;
   }
 
-  // --- Polling fallback (fetch status every 10s if WS down) ---
+  // --- Job History ---
+  async function loadJobHistory() {
+    if (jobHistoryState.loading) return;
+    jobHistoryState.loading = true;
+
+    try {
+      const params = new URLSearchParams({
+        page: jobHistoryState.page.toString(),
+        per_page: jobHistoryState.perPage.toString(),
+      });
+
+      if (jobHistoryState.filterStatus) {
+        params.append("status", jobHistoryState.filterStatus);
+      }
+      if (jobHistoryState.filterPrinter) {
+        params.append("printer_id", jobHistoryState.filterPrinter);
+      }
+
+      const resp = await fetch(`/api/v1/jobs/history?${params}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        jobHistoryState.jobs = data.jobs || [];
+        jobHistoryState.total = data.total || 0;
+        renderJobHistory();
+        updateJobPagination();
+      }
+    } catch (e) {
+      console.error("Failed to load job history:", e);
+    } finally {
+      jobHistoryState.loading = false;
+    }
+  }
+
+  function renderJobHistory() {
+    const tbody = $("#job-history-body");
+    if (!tbody) return;
+
+    if (jobHistoryState.jobs.length === 0) {
+      tbody.innerHTML = '<tr class="no-data"><td colspan="6">No jobs found</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = jobHistoryState.jobs.map(job => `
+      <tr>
+        <td class="job-filename-cell" title="${escapeHtml(job.file_name)}">${escapeHtml(job.file_name)}</td>
+        <td>${escapeHtml(job.printer_id)}</td>
+        <td><span class="job-status-badge ${job.status}">${job.status}</span></td>
+        <td>${formatDateTime(job.started_at)}</td>
+        <td>${formatDuration(job.duration_seconds)}</td>
+        <td>${job.filament_used_mm ? job.filament_used_mm.toFixed(1) + "mm" : "--"}</td>
+      </tr>
+    `).join("");
+  }
+
+  function updateJobPagination() {
+    const pageInfo = $("#job-page-info");
+    const prevBtn = $("#job-prev-page");
+    const nextBtn = $("#job-next-page");
+
+    if (pageInfo) {
+      const totalPages = Math.max(1, Math.ceil(jobHistoryState.total / jobHistoryState.perPage));
+      pageInfo.textContent = `Page ${jobHistoryState.page} of ${totalPages}`;
+    }
+
+    if (prevBtn) prevBtn.disabled = jobHistoryState.page <= 1;
+    if (nextBtn) {
+      const totalPages = Math.ceil(jobHistoryState.total / jobHistoryState.perPage);
+      nextBtn.disabled = jobHistoryState.page >= totalPages;
+    }
+  }
+
+  function initJobHistory() {
+    const statusFilter = $("#job-status-filter");
+    const printerFilter = $("#job-printer-filter");
+    const prevBtn = $("#job-prev-page");
+    const nextBtn = $("#job-next-page");
+
+    if (statusFilter) {
+      statusFilter.addEventListener("change", (e) => {
+        jobHistoryState.filterStatus = e.target.value;
+        jobHistoryState.page = 1;
+        loadJobHistory();
+      });
+    }
+
+    if (printerFilter) {
+      printerFilter.addEventListener("change", (e) => {
+        jobHistoryState.filterPrinter = e.target.value;
+        jobHistoryState.page = 1;
+        loadJobHistory();
+      });
+    }
+
+    if (prevBtn) {
+      prevBtn.addEventListener("click", () => {
+        if (jobHistoryState.page > 1) {
+          jobHistoryState.page--;
+          loadJobHistory();
+        }
+      });
+    }
+
+    if (nextBtn) {
+      nextBtn.addEventListener("click", () => {
+        const totalPages = Math.ceil(jobHistoryState.total / jobHistoryState.perPage);
+        if (jobHistoryState.page < totalPages) {
+          jobHistoryState.page++;
+          loadJobHistory();
+        }
+      });
+    }
+
+    const table = $("#job-history-table");
+    if (table) {
+      const headers = table.querySelectorAll("th[data-sort]");
+      headers.forEach(th => {
+        th.addEventListener("click", () => {
+          const field = th.dataset.sort;
+          if (jobHistoryState.sortField === field) {
+            jobHistoryState.sortDesc = !jobHistoryState.sortDesc;
+          } else {
+            jobHistoryState.sortField = field;
+            jobHistoryState.sortDesc = true;
+          }
+
+          headers.forEach(h => {
+            h.classList.remove("sort-asc", "sort-desc");
+          });
+          th.classList.add(jobHistoryState.sortDesc ? "sort-desc" : "sort-asc");
+
+          jobHistoryState.jobs.sort((a, b) => {
+            let va = a[field];
+            let vb = b[field];
+
+            if (field === "started_at") {
+              va = va ? new Date(va).getTime() : 0;
+              vb = vb ? new Date(vb).getTime() : 0;
+            }
+
+            if (va === null || va === undefined) va = "";
+            if (vb === null || vb === undefined) vb = "";
+
+            if (typeof va === "string") va = va.toLowerCase();
+            if (typeof vb === "string") vb = vb.toLowerCase();
+
+            if (va < vb) return jobHistoryState.sortDesc ? 1 : -1;
+            if (va > vb) return jobHistoryState.sortDesc ? -1 : 1;
+            return 0;
+          });
+
+          renderJobHistory();
+        });
+      });
+    }
+
+    loadJobHistory();
+    setInterval(loadJobHistory, 30000);
+  }
+
+  // --- Queue Management ---
+  async function loadQueueStatus() {
+    if (queueState.loading) return;
+    queueState.loading = true;
+
+    try {
+      const resp = await fetch("/api/v1/queue");
+      if (resp.ok) {
+        const data = await resp.json();
+        renderQueue(data.queues || []);
+      }
+    } catch (e) {
+      console.error("Failed to load queue:", e);
+    } finally {
+      queueState.loading = false;
+    }
+  }
+
+  function renderQueue(queues) {
+    const container = $("#queue-list");
+    if (!container) return;
+
+    const allItems = [];
+    queues.forEach(q => {
+      if (q.queue_size > 0) {
+        allItems.push({
+          printer_id: q.printer_id,
+          size: q.queue_size,
+          processing: q.processing,
+        });
+      }
+    });
+
+    if (allItems.length === 0) {
+      container.innerHTML = '<p class="no-queue">Queue is empty</p>';
+      return;
+    }
+
+    container.innerHTML = allItems.map(item => `
+      <div class="queue-item">
+        <span class="queue-handle">&#9776;</span>
+        <div class="queue-info">
+          <div class="queue-filename">Queue for ${escapeHtml(item.printer_id)}</div>
+          <div class="queue-printer">${item.size} pending ${item.processing ? "(processing)" : ""}</div>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  window.clearQueue = async function() {
+    const selectedPrinter = state.selectedPrinter;
+    if (!selectedPrinter) {
+      addAlert("warning", "No printer selected");
+      return;
+    }
+
+    try {
+      const resp = await fetch("/api/v1/queue/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ printer_id: selectedPrinter }),
+      });
+
+      if (resp.ok) {
+        addAlert("success", `Queue cleared for ${selectedPrinter}`);
+        loadQueueStatus();
+      } else {
+        const data = await resp.json().catch(() => ({}));
+        addAlert("error", data.error || "Failed to clear queue");
+      }
+    } catch (e) {
+      addAlert("error", `Failed to clear queue: ${e.message}`);
+    }
+  };
+
+  function initQueue() {
+    loadQueueStatus();
+    setInterval(loadQueueStatus, 10000);
+  }
+
+  // --- Polling fallback ---
   async function pollStatus() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
     try {
@@ -735,17 +1015,14 @@
         updateStatePanel();
       }
     } catch {
-      // Ignore - WS reconnect will handle it
     }
   }
 
   // --- Init ---
   function init() {
-    // Wire up printer dropdown
     const select = $("#printer-select");
     if (select) select.addEventListener("change", onPrinterSelectChange);
 
-    // Wire up chat input
     const chatInput = $("#chat-input");
     if (chatInput) {
       chatInput.addEventListener("keydown", (e) => {
@@ -759,10 +1036,11 @@
     connectWebSocket();
     initFileUpload();
     loadChatHistory();
+    initJobHistory();
+    initQueue();
 
     setInterval(pollStatus, 10000);
 
-    // Ping every 25s to keep WS alive
     setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "ping" }));

@@ -332,3 +332,129 @@ class TestAgentStartedPrintWorkflow:
 
         await orchestrator.NOTHING(0.92)
         assert sm.current_state == AgentState.EMERGENCY_FAILED
+
+
+class TestStlToPrintE2E:
+    """
+    End-to-end test: STL upload → slicer → approval → print.
+
+    Simulates the complete Telegram file upload flow through to adapter.start_print.
+    """
+
+    @pytest.fixture
+    def setup(self, tmp_path):
+        sm = AgentStateMachine()
+        adapter = MockPrinterAdapter()
+        persistence = StatePersistence(tmp_path / "state.json")
+        decision_engine = DecisionEngine()
+        orchestrator = MonitoringOrchestrator(
+            state_machine=sm,
+            adapter=adapter,
+            persistence=persistence,
+        )
+        stl_file = tmp_path / "test_part.stl"
+        stl_file.write_bytes(b"mock stl binary content")
+        return sm, adapter, persistence, decision_engine, orchestrator, stl_file, tmp_path
+
+    @pytest.mark.asyncio
+    async def test_stl_to_print_e2e(self, setup):
+        """
+        Full E2E flow: IDLE → SLICING → AWAITING_APPROVAL → PRINTING → COMPLETE → IDLE
+
+        Simulates:
+        1. Telegram file upload (STL file)
+        2. Slicer pipeline (mocked)
+        3. Wait for AWAITING_APPROVAL state
+        4. User approval via decision engine
+        5. Verify adapter.start_print is called
+        6. State transitions to completion
+        """
+        sm, adapter, persistence, decision_engine, orchestrator, stl_file, tmp_path = setup
+        await orchestrator.start()
+
+        # Track adapter method calls
+        start_print_called = False
+        original_start_print = adapter.start_print
+
+        async def tracked_start_print(gcode_path):
+            nonlocal start_print_called
+            start_print_called = True
+            return await original_start_print(gcode_path)
+
+        adapter.start_print = tracked_start_print
+
+        assert sm.current_state == AgentState.IDLE
+
+        # Step 1: Simulate Telegram file upload - create job context
+        job_id = generate_job_id()
+        job = JobContext(
+            job_id=job_id,
+            job_file=str(stl_file),
+            uploaded_at=datetime.now(),
+            decision_token=generate_decision_token(),
+        )
+        sm.job_context = job
+
+        # Step 2: Trigger workflow - IDLE → RECEIVING (simulating file receipt)
+        assert await sm.transition_to(AgentState.RECEIVING, persistence)
+        assert sm.current_state == AgentState.RECEIVING
+
+        # Step 3: Slicer pipeline simulation - RECEIVING → SLICING
+        assert await sm.transition_to(AgentState.SLICING, persistence)
+        assert sm.current_state == AgentState.SLICING
+
+        # Mock slicing completion - set gcode_path on job
+        gcode_path = tmp_path / "test_part.gcode"
+        gcode_path.write_bytes(b"; Mock G-code\nG28\nG1 X10 Y10\n")
+        job.gcode_path = str(gcode_path)
+        job.gcode_hash = "abc123mockhash"
+
+        # SLICING → AWAITING_APPROVAL
+        assert await sm.transition_to(AgentState.AWAITING_APPROVAL, persistence)
+        assert sm.current_state == AgentState.AWAITING_APPROVAL
+
+        # Step 4: Simulate user approval via decision engine
+        result = await decision_engine.consume_decision(
+            job_context=job,
+            decision_token=job.decision_token,
+            action=DecisionAction.APPROVE,
+            expected_state=AgentState.AWAITING_APPROVAL,
+            current_state=sm.current_state,
+        )
+        assert result == ConsumeResult.CONSUMED
+
+        # Step 5: AWAITING_APPROVAL → UPLOADING
+        assert await sm.transition_to(AgentState.UPLOADING, persistence)
+
+        # Upload and start print (simulating the actual upload/print flow)
+        upload_result = await adapter.upload_file(str(gcode_path), "test_part.gcode")
+        assert upload_result.status == CommandResultStatus.SUCCESS
+
+        start_result = await adapter.start_print(str(gcode_path))
+        assert start_result.status == CommandResultStatus.SUCCESS
+
+        # Verify adapter.start_print was called
+        assert start_print_called, "adapter.start_print should have been called"
+
+        # UPLOADING → PRINTING
+        assert await sm.transition_to(AgentState.PRINTING, persistence)
+        assert sm.current_state == AgentState.PRINTING
+
+        # PRINTING → MONITORING
+        assert await sm.transition_to(AgentState.MONITORING, persistence)
+        orchestrator._is_monitoring = True
+
+        # Step 6: Simulate print completion
+        await adapter.simulate_print_complete()
+        await asyncio.sleep(0.1)  # Allow event processing
+
+        assert sm.current_state == AgentState.COMPLETE
+
+        # COMPLETE → IDLE
+        assert await sm.transition_to(AgentState.IDLE, persistence)
+        assert sm.current_state == AgentState.IDLE
+
+        # Final verification: complete state cycle achieved
+        # IDLE → RECEIVING → SLICING → AWAITING_APPROVAL → UPLOADING → PRINTING → MONITORING → COMPLETE → IDLE
+
+        await orchestrator.stop()

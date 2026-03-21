@@ -29,14 +29,8 @@ class QueuedCommand:
 
     priority: int
     seq: int  # Sequence number for FIFO within same priority
-    command: Any  # Command payload
-    timestamp: datetime = field(default_factory=datetime.now)
-
-    def __init__(self, priority: int, seq: int, command: Any):
-        self.priority = priority
-        self.seq = seq
-        self.command = command
-        self.timestamp = datetime.now()
+    command: Any = field(compare=False)  # Command payload
+    timestamp: datetime = field(default_factory=datetime.now, compare=False)
 
 
 class CommandQueue:

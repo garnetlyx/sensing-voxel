@@ -5,7 +5,30 @@ Configuration management for Sensing Voxel
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
+from typing import Any
+
+
+class LlmProvider(Enum):
+    """LLM backend provider"""
+
+    MINIMAX = "minimax"
+    OLLAMA = "ollama"
+
+
+class ImageTo3DProvider(Enum):
+    """Image-to-3D API provider"""
+
+    TRIPOSR = "triposr"
+    MESHY = "meshy"
+    TRIPO3D = "tripo3d"
+
+
+class SlicerBackend(Enum):
+    AUTO = "auto"
+    PRUSASLICER = "prusaslicer"
+    ORCASLICER = "orcaslicer"
 
 
 @dataclass
@@ -75,10 +98,29 @@ class TapoCameraConfig:
 
 
 @dataclass
-class SlicerConfig:
-    """Slicer configuration"""
+class FilamentMonitorConfig:
+    """Filament spool monitor configuration"""
 
+    enabled: bool = False
+    usb_camera_index: int = 0
+    frame_width: int = 1280
+    frame_height: int = 720
+    fps: int = 5
+    check_interval_seconds: float = 30.0
+    spool_full_weight_g: float = 1000.0
+    spool_empty_weight_g: float = 250.0
+    filament_diameter_mm: float = 1.75
+    filament_density_g_cm3: float = 1.24
+    tangle_detection_threshold: float = 0.7
+    tangle_confirmation_frames: int = 3
+    min_filament_safety_margin_percent: float = 10.0
+
+
+@dataclass
+class SlicerConfig:
+    backend: SlicerBackend = SlicerBackend.AUTO
     prusaslicer_path: str = "prusa-slicer"
+    orcaslicer_path: str = "orca-slicer"
     profile_path: str | None = None
     output_dir: str = "data/sliced"
 
@@ -111,6 +153,7 @@ class DashboardConfig:
 class LlmConfig:
     """LLM API configuration (Anthropic-compatible)"""
 
+    provider: LlmProvider = LlmProvider.MINIMAX
     api_key: str | None = None
     base_url: str = "https://api.anthropic.com"
     model: str = "claude-sonnet-4-20250514"
@@ -119,6 +162,61 @@ class LlmConfig:
     timeout_seconds: int = 30
     max_conversation_turns: int = 20
     enabled: bool = False
+
+
+@dataclass
+class ImageTo3DConfig:
+    """Image-to-3D generation configuration"""
+
+    enabled: bool = False
+    default_provider: ImageTo3DProvider = ImageTo3DProvider.TRIPOSR
+    triposr_api_key: str | None = None
+    triposr_base_url: str = "https://api.stability.ai/v2beta/3d"
+    meshy_api_key: str | None = None
+    meshy_base_url: str = "https://api.meshy.ai/openapi/v2"
+    tripo3d_api_key: str | None = None
+    tripo3d_base_url: str = "https://api.tripo3d.ai/v2/openapi"
+    timeout_seconds: int = 300
+    enable_caching: bool = True
+    cache_ttl_seconds: int = 86400  # 1 day
+    enable_cost_tracking: bool = True
+    max_generation_cost: float = 1.0  # Max USD per generation
+    default_output_format: str = "obj"
+
+
+@dataclass
+class QueueConfig:
+    """Multi-printer job queue configuration"""
+
+    enabled: bool = False
+    max_queue_size: int = 100
+    default_priority: str = "NORMAL"
+    auto_assignment: bool = True
+    assignment_strategy: str = "OPTIMAL"
+    enable_load_balancing: bool = True
+    enable_priority_boost: bool = True
+    wait_time_boost_threshold_seconds: int = 1800  # 30 minutes
+    wait_time_boost_amount: int = 1
+    printer_timeout_seconds: float = 300.0  # Mark printer offline after 5 minutes
+    job_timeout_seconds: float = 86400.0  # 24 hours max wait time
+    max_retries: int = 3
+    cooldown_between_assignments_seconds: int = 5
+
+
+@dataclass
+class ModelingConfig:
+    """3D modeling and photo-to-print pipeline configuration"""
+
+    enabled: bool = False
+    image_to_3d: ImageTo3DConfig = field(default_factory=ImageTo3DConfig)
+    output_dir: str = "data/modeling"
+    auto_approve: bool = False  # For testing only
+    require_manual_approval: bool = True
+    max_file_size_mb: int = 50
+    supported_input_formats: list[str] = field(
+        default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp"]
+    )
+    temp_dir: str = "data/tmp"
 
 
 PrinterConfig = KlipperConfig | BambuConfig
@@ -134,16 +232,18 @@ class Config:
     """Main configuration"""
 
     printers: list[PrinterConfig] = field(default_factory=list)
-    # Legacy single-printer fields (auto-migrated to printers list)
     klipper: KlipperConfig | None = None
     bambu: BambuConfig | None = None
-    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    telegram: TelegramConfig = field(default_factory=lambda: TelegramConfig(bot_token=""))
     camera: CameraConfig | None = None
     tapo_camera: TapoCameraConfig | None = None
+    filament_monitor: FilamentMonitorConfig = field(default_factory=FilamentMonitorConfig)
     slicer: SlicerConfig = field(default_factory=SlicerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
+    modeling: ModelingConfig = field(default_factory=ModelingConfig)
+    queue: QueueConfig = field(default_factory=QueueConfig)
     debug: bool = False
 
     @classmethod
@@ -153,6 +253,7 @@ class Config:
             "telegram": TelegramConfig,
             "camera": CameraConfig,
             "tapo_camera": TapoCameraConfig,
+            "filament_monitor": FilamentMonitorConfig,
             "slicer": SlicerConfig,
             "storage": StorageConfig,
             "dashboard": DashboardConfig,
@@ -164,6 +265,16 @@ class Config:
                 parsed["printers"] = _parse_printers_list(value)
             elif key in ("klipper", "bambu") and isinstance(value, dict):
                 parsed[key] = PRINTER_TYPE_MAP[key](**value)
+            elif key == "modeling" and isinstance(value, dict):
+                # Handle nested image_to_3d config
+                modeling_data = value.copy()
+                if "image_to_3d" in modeling_data and isinstance(
+                    modeling_data["image_to_3d"], dict
+                ):
+                    modeling_data["image_to_3d"] = ImageTo3DConfig(**modeling_data["image_to_3d"])
+                parsed["modeling"] = ModelingConfig(**modeling_data)
+            elif key == "queue" and isinstance(value, dict):
+                parsed["queue"] = QueueConfig(**value)
             elif key in section_map and isinstance(value, dict):
                 parsed[key] = section_map[key](**value)
             else:

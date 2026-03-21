@@ -22,6 +22,7 @@ dependencies = [
     "filelock>=3.12",
     "paho-mqtt>=2.0",
     "anthropic>=0.40",
+    "trimesh>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +52,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test"]
 python_functions = ["test_"]
+markers = [
+    "qa_critical: marks tests as critical QA tests",
+]
 
 [tool.black]
 line-length = 100
