@@ -83,6 +83,7 @@ class StatePersistence:
             }
 
         return {
+            "schema_version": 1,
             "current_state": state_machine.current_state.name,
             "job_context": job_context_data,
             "last_error_summary": state_machine.last_error_summary,
@@ -96,6 +97,10 @@ class StatePersistence:
     def _from_dict(self, data: dict) -> AgentStateMachine:
         """Create state machine from dict"""
         from sensing_voxel.core.models import DecisionAction, JobContext
+
+        version = data.get("schema_version", 0)
+        if version != 1:
+            logger.warning(f"Loading state with schema version {version}, expected 1")
 
         # Validate required fields
         if "current_state" not in data:

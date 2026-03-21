@@ -70,6 +70,37 @@ class FileValidationStatus(Enum):
     INVALID_TYPE = auto()
     TOO_LARGE = auto()
     CORRUPT = auto()
+    CONVERSION_FAILED = auto()
+
+
+class ModelFileType(Enum):
+    """Supported 3D model file types"""
+
+    STL = auto()
+    STEP = auto()
+    STP = auto()
+    THREE_MF = auto()  # 3MF (3D Manufacturing Format)
+    GCODE = auto()
+
+    @classmethod
+    def from_extension(cls, ext: str) -> "ModelFileType | None":
+        """Get file type from extension (without dot)"""
+        ext_lower = ext.lower().lstrip(".")
+        mapping = {
+            "stl": cls.STL,
+            "step": cls.STEP,
+            "stp": cls.STP,
+            "3mf": cls.THREE_MF,
+            "gcode": cls.GCODE,
+            "g": cls.GCODE,
+            "gco": cls.GCODE,
+        }
+        return mapping.get(ext_lower)
+
+    @property
+    def is_slicable(self) -> bool:
+        """Whether this file type can be sliced (3D model vs G-code)"""
+        return self in {self.STL, self.STEP, self.STP, self.THREE_MF}
 
 
 class SlicingStatus(Enum):
@@ -124,12 +155,36 @@ class ZOffsetStatus(Enum):
     UNKNOWN = auto()
 
 
+class FilamentSpoolStatus(Enum):
+    """Filament spool status"""
+
+    SUFFICIENT = auto()  # Enough filament for estimated job
+    LOW = auto()  # Running low, warn user
+    INSUFFICIENT = auto()  # Not enough for job
+    UNKNOWN = auto()  # Cannot determine
+
+
+class TangleDecision(Enum):
+    """Tangle detection decision"""
+
+    NONE = auto()  # No tangle detected
+    WARNING = auto()  # Possible tangle, monitor
+    CRITICAL = auto()  # Clear tangle detected, pause print
+
+
 class CommandResultStatus(Enum):
     """Command execution status"""
 
     SUCCESS = auto()
     FAILURE = auto()
     NOT_SUPPORTED = auto()
+
+
+class LlmProvider(Enum):
+    """LLM backend provider"""
+
+    MINIMAX = "minimax"
+    OLLAMA = "ollama"
 
 
 @dataclass
@@ -391,14 +446,14 @@ class MonitoringStats:
 
 @dataclass
 class SlicingResult:
-    """Result of slicing operation"""
-
     gcode_path: Path
     gcode_hash: str
     first_layer_params: FirstLayerParams | None = None
     first_layer_bounds: FirstLayerBounds | None = None
     estimated_print_time: timedelta | None = None
     estimated_filament_mm: float | None = None
+    slicer_backend: str | None = None
+    slicer_version: str | None = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -451,6 +506,44 @@ class DecisionTimeout:
     timeout_seconds: int
     job_id: str
     scheduled_at: datetime = field(default_factory=datetime.now)
+
+
+# --- Filament Monitoring Models ---
+
+
+@dataclass
+class FilamentSpoolMeasurement:
+    """Filament spool measurement from vision analysis"""
+
+    estimated_diameter_mm: float
+    estimated_weight_g: float
+    confidence: float
+    timestamp: datetime = field(default_factory=datetime.now)
+    frame_id: int = 0
+
+
+@dataclass
+class TangleDetectionResult:
+    """Tangle detection result"""
+
+    detected: bool
+    confidence: float
+    severity: TangleDecision
+    bounding_boxes: list[tuple[float, float, float, float]] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
+    frame_id: int = 0
+
+
+@dataclass
+class FilamentCheckResult:
+    """Result of pre-print filament check"""
+
+    status: FilamentSpoolStatus
+    estimated_remaining_g: float
+    estimated_required_g: float
+    safety_margin_percent: float = 10.0
+    message: str = ""
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
 # --- Helper Functions ---

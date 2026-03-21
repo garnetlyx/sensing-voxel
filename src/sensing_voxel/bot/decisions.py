@@ -235,6 +235,8 @@ class DecisionUI:
         job_context: JobContext,
         job_summary: str,
         expires_at: datetime | None = None,
+        slicer_backend: str | None = None,
+        slicer_version: str | None = None,
     ) -> str:
         """
         Generate approval message text.
@@ -243,6 +245,8 @@ class DecisionUI:
             job_context: Job context
             job_summary: Formatted job summary from slicer
             expires_at: Optional expiration timestamp
+            slicer_backend: Optional slicer backend name (e.g., 'orcaslicer', 'prusaslicer')
+            slicer_version: Optional slicer version string
 
         Returns:
             Message text with HTML formatting
@@ -250,9 +254,19 @@ class DecisionUI:
         message = (
             "<b>🖨️ New Print Job Ready</b>\n\n"
             f"<b>File:</b> {job_context.job_file}\n"
-            f"<b>Job ID:</b> <code>{job_context.job_id[:8]}</code>\n\n"
-            f"{job_summary}\n\n"
-            "<i>Use the buttons below to approve or reject this print.</i>"
+            f"<b>Job ID:</b> <code>{job_context.job_id[:8]}</code>\n"
+        )
+
+        # Add slicer info if available
+        if slicer_backend:
+            slicer_name = "OrcaSlicer" if slicer_backend == "orcaslicer" else "PrusaSlicer"
+            if slicer_version:
+                message += f"<b>Sliced with:</b> {slicer_name} v{slicer_version}\n"
+            else:
+                message += f"<b>Sliced with:</b> {slicer_name}\n"
+
+        message += (
+            f"\n{job_summary}\n\n<i>Use the buttons below to approve or reject this print.</i>"
         )
 
         if expires_at:

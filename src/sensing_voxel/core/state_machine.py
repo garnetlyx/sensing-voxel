@@ -89,6 +89,25 @@ class AgentStateMachine:
         # Global lock to prevent concurrent state transitions (instance-level)
         self._global_lock = asyncio.Lock()
 
+    def __deepcopy__(self, memo):
+        """Custom deepcopy that excludes non-picklable asyncio.Lock"""
+        # Create new instance without calling __init__ (to avoid creating new lock)
+        new_obj = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new_obj
+
+        # Copy all attributes except _global_lock
+        for k, v in self.__dict__.items():
+            if k == "_global_lock":
+                # Create fresh lock for the copy
+                new_obj._global_lock = asyncio.Lock()
+            elif k in ("_on_enter_hooks", "_on_exit_hooks"):
+                # Shallow copy hooks (they're callable, not picklable)
+                setattr(new_obj, k, dict(v))
+            else:
+                setattr(new_obj, k, copy.deepcopy(v, memo))
+
+        return new_obj
+
     @classmethod
     async def load_or_create(cls, persistence) -> "AgentStateMachine":
         """Load state from persistence or create new instance"""
@@ -108,6 +127,10 @@ class AgentStateMachine:
 
         # Acquire global lock to prevent concurrent transitions
         async with self._global_lock:
+            # BUG-LOCK-1: Yield to event loop after acquiring lock
+            # This ensures concurrent tasks that were waiting can be scheduled
+            # before we proceed with the state check
+            await asyncio.sleep(0)
             if not self.can_transition_to(new_state):
                 logger.warning(f"Invalid transition: {self.current_state.name} -> {new_state.name}")
                 return False

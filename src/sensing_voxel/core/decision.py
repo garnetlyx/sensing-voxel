@@ -236,18 +236,8 @@ class DecisionEngine:
         if job_id in self._timeout_tasks:
             task = self._timeout_tasks[job_id]
             task.cancel()
-            try:
-                # Create a background task to wait for cancellation
-                # We don't block here since this is a sync method
-                # The task will clean itself up when done
-                pass
-            except (asyncio.CancelledError, RuntimeError):
-                # Task was cancelled or already finished - expected
-                pass
-            finally:
-                # Always clean up the reference
-                if job_id in self._timeout_tasks:
-                    del self._timeout_tasks[job_id]
+            # Remove from dict - actual task cleanup happens when task completes
+            del self._timeout_tasks[job_id]
             logger.debug(f"Cancelled timeout for job {job_id}")
 
     def set_timeouts(

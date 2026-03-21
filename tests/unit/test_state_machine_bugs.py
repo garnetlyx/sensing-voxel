@@ -1,112 +1,65 @@
-"""
-BUG TESTS: State Machine Issues
+from importlib import import_module
+from unittest.mock import AsyncMock, Mock
 
-These tests document critical bugs in the state machine implementation.
-Each test demonstrates a specific failure mode.
-"""
-
-import pytest
-from unittest.mock import Mock, AsyncMock
-from sensing_voxel.core.state_machine import AgentStateMachine
-from sensing_voxel.core.models import AgentState, JobContext
-from datetime import datetime
+pytest = import_module("pytest")
+AgentStateMachine = import_module("sensing_voxel.core.state_machine").AgentStateMachine
+AgentState = import_module("sensing_voxel.core.models").AgentState
 
 
 class TestStateMachineBugs:
-    """Tests exposing state machine bugs"""
-
     @pytest.mark.asyncio
-    async def test_enter_hook_exception_leaves_state_changed(self):
-        """
-        BUG: If enter hook raises exception, state has already changed
-        but hook failed. This leaves system in inconsistent state.
-
-        Expected: State transition should be atomic (state + hooks succeed/fail together).
-        Actual: State changes before hook runs, so hook failure = inconsistent state.
-        """
+    async def test_enter_hook_exception_rolls_back_state(self):
         sm = AgentStateMachine()
+        old_state = sm.current_state
 
         failing_hook = AsyncMock(side_effect=RuntimeError("Hook failed"))
         await sm.on_enter(AgentState.RECEIVING, failing_hook)
 
-        # This should NOT change state if hook fails
-        # But currently it WILL change state before calling hook
-        with pytest.raises(RuntimeError):
-            await sm.transition_to(AgentState.RECEIVING)
+        success = await sm.transition_to(AgentState.RECEIVING)
 
-        # BUG: State changed even though hook failed!
-        # This assertion documents the bug - it SHOULD be IDLE but is RECEIVING
-        assert sm.current_state == AgentState.RECEIVING, \
-            "BUG: State changed despite hook failure - inconsistent state!"
+        assert success is False
+        assert sm.current_state == old_state
 
     @pytest.mark.asyncio
-    async def test_exit_hook_exception_leaves_state_unchanged_but_hook_failed(self):
-        """
-        BUG: If exit hook raises exception, we never transition but
-        the exit hook's side effects may have partially executed.
-
-        This is less severe than enter hook failure but still inconsistent.
-        """
+    async def test_exit_hook_exception_does_not_block_transition(self):
         sm = AgentStateMachine()
         sm.current_state = AgentState.IDLE
 
         failing_hook = AsyncMock(side_effect=RuntimeError("Exit hook failed"))
         await sm.on_exit(AgentState.IDLE, failing_hook)
 
-        # This should transition but exit hook fails
-        with pytest.raises(RuntimeError):
-            await sm.transition_to(AgentState.RECEIVING)
+        success = await sm.transition_to(AgentState.RECEIVING)
 
-        # State should still be IDLE (transition didn't complete)
-        assert sm.current_state == AgentState.IDLE
+        assert success is True
+        assert sm.current_state == AgentState.RECEIVING
 
     @pytest.mark.asyncio
-    async def test_persistence_failure_not_rolled_back(self):
-        """
-        BUG: If persistence.save() fails during transition, state has already
-        changed in memory but wasn't persisted. On restart, system will be
-        in different state than expected.
-
-        Expected: Either persist before state change, or roll back on failure.
-        Actual: State changes, persistence fails, no rollback.
-        """
+    async def test_persistence_failure_returns_failure_without_state_change(self):
         sm = AgentStateMachine()
+        old_state = sm.current_state
 
         failing_persistence = Mock()
         failing_persistence.save = Mock(side_effect=IOError("Disk full"))
 
-        # Transition with failing persistence
         success = await sm.transition_to(AgentState.RECEIVING, failing_persistence)
 
-        # BUG: transition_to returns True (transition succeeded)
-        # but persistence failed! State is now different in memory vs on disk.
-        assert success is True, "Transition reported success"
-        assert sm.current_state == AgentState.RECEIVING, "State changed in memory"
-
-        # The persistence failure was logged but not propagated
-        # Next restart will load OLD state from disk (IDLE)
-        # but actual state is RECEIVING - INCONSISTENCY!
+        assert success is False
+        assert sm.current_state == old_state
 
     @pytest.mark.asyncio
-    async def test_hook_registration_not_validated(self):
-        """
-        BUG: Hooks can be registered for invalid states without error.
-
-        This allows typos or mistakes to go unnoticed until runtime.
-        """
+    async def test_hook_registration_validates_state_type(self):
         sm = AgentStateMachine()
 
         hook = AsyncMock()
 
-        # This should fail or warn - INVALID_STATE is not a real state
-        # But currently it silently accepts any state value
-        await sm.on_enter("INVALID_STATE", hook)  # type: ignore
-        await sm.on_exit(123, hook)  # type: ignore
+        with pytest.raises(TypeError):
+            await sm.on_enter("INVALID_STATE", hook)  # type: ignore[arg-type]
 
-        # No error was raised - hooks registered for invalid keys
-        # This will cause silent failures at runtime
-        assert "INVALID_STATE" in sm._on_enter_hooks
-        assert 123 in sm._on_exit_hooks
+        with pytest.raises(TypeError):
+            await sm.on_exit(123, hook)  # type: ignore[arg-type]
+
+        assert not sm._on_enter_hooks
+        assert not sm._on_exit_hooks
 
     @pytest.mark.asyncio
     async def test_missing_transition_in_error_recovery(self):

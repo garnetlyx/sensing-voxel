@@ -70,9 +70,9 @@ class TestCriticalDecisionEngineBugs:
                     expected_state=AgentState.AWAITING_APPROVAL,
                     current_state=AgentState.AWAITING_APPROVAL,
                 )
-                results.append(('user', result))
+                results.append(("user", result))
             except Exception as e:
-                exceptions.append(('user', e))
+                exceptions.append(("user", e))
 
         async def wait_timeout():
             """Let timeout handler run"""
@@ -111,9 +111,7 @@ class TestCriticalDecisionEngineBugs:
         lock2 = engine._get_lock("lock-test-job")
 
         # Should be the SAME lock instance (cached)
-        assert lock1 is lock2, (
-            "CRITICAL: _get_lock should return cached lock for same job_id"
-        )
+        assert lock1 is lock2, "CRITICAL: _get_lock should return cached lock for same job_id"
 
         # Verify lock is actually in the cache
         assert "lock-test-job" in engine._decision_locks
@@ -283,11 +281,13 @@ class TestCriticalStateMachineBugs:
             results.append((target, result, sm.current_state))
 
         # Start two transitions simultaneously from IDLE
-        # One to RECEIVING, one to ERROR
+        # Both target valid states that are mutually exclusive after the first transition
+        # Only one should succeed because after first transition to RECEIVING,
+        # transition to MONITORING is no longer valid from the new state
         await asyncio.gather(
             transition_and_track(AgentState.RECEIVING),
-            transition_and_track(AgentState.ERROR),
-            return_exceptions=True
+            transition_and_track(AgentState.MONITORING),
+            return_exceptions=True,
         )
 
         # With global lock, only one transition should succeed
@@ -312,33 +312,18 @@ class TestCriticalPersistenceBugs:
 
     def test_signal_handler_not_reentrant(self, tmp_path):
         """
-        BUG: _signal_handler in persistence.py is registered for SIGTERM and SIGINT.
-        If a signal arrives during signal handling, behavior is undefined.
+        The _signal_handler method was intentionally removed from StatePersistence.
+        Signal handling is no longer performed by this class.
 
-        Also, the signal handler just passes - it doesn't actually do cleanup!
-        The comment says "we rely on finally blocks" but those are in save/load,
-        not in the signal handler path.
-
-        Impact: Signal handling doesn't actually clean up locks.
-        Severity: MEDIUM
+        Previously: _signal_handler was registered for SIGTERM and SIGINT,
+        but had reentrancy issues and didn't actually perform cleanup.
         """
         state_file = tmp_path / "state.json"
         persistence = StatePersistence(state_file)
 
-        # Acquire a lock
-        persistence._acquire_lock()
-        assert persistence._lock_instance is not None
-
-        # Simulate signal
-        import signal
-        persistence._signal_handler(signal.SIGTERM, None)
-
-        # BUG: Lock is NOT released by signal handler!
-        # The handler just passes and relies on finally blocks,
-        # but if we're in a signal handler, we might not be in a try/finally
-        assert persistence._lock_instance is not None, (
-            "BUG: Signal handler doesn't release lock. "
-            "Lock may be leaked during signal handling."
+        # Verify the signal handler method was intentionally removed
+        assert not hasattr(persistence, "_signal_handler"), (
+            "_signal_handler should have been removed from StatePersistence"
         )
 
     def test_concurrent_save_corruption_possible(self, tmp_path):
@@ -379,10 +364,10 @@ class TestCriticalSecurityBugs:
 
         # All start with timestamp pattern
         for jid in job_ids:
-            parts = jid.split('_')
+            parts = jid.split("_")
             # Format: ['job', 'YYYYMMDD', 'HHMMSS', 'uuid8']
             assert len(parts) == 4, f"Unexpected format: {jid}"
-            assert parts[0] == 'job'
+            assert parts[0] == "job"
             # timestamp parts are predictable
             assert len(parts[1]) == 8  # YYYYMMDD
             assert len(parts[2]) == 6  # HHMMSS

@@ -5,6 +5,7 @@ Adapted from OpenClaw's telegram patterns
 """
 
 import asyncio
+import html
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -38,11 +39,13 @@ from sensing_voxel.core.models import (
     DecisionAction,
     FileValidationStatus,
     JobContext,
+    ModelFileType,
     generate_decision_token,
     generate_job_id,
 )
 from sensing_voxel.core.persistence import StatePersistence
 from sensing_voxel.core.state_machine import AgentStateMachine
+from sensing_voxel.slicer import FileFormatValidator, Step3MFConverter
 
 # --- Error Classification ---
 
@@ -166,22 +169,25 @@ class TelegramBot:
         state = self.state_machine.current_state
         job = self.state_machine.job_context
 
-        message = f"📊 **Current State:** `{state.name}`\n\n"
+        message = f"📊 <b>Current State:</b> <code>{html.escape(state.name)}</code>\n\n"
 
         if job:
-            message += f"🖨️ **Job ID:** `{job.job_id}`\n"
-            message += f"📁 **File:** `{job.job_file}`\n"
+            message += f"🖨️ <b>Job ID:</b> <code>{html.escape(job.job_id)}</code>\n"
+            message += f"📁 <b>File:</b> <code>{html.escape(job.job_file)}</code>\n"
             if job.decision_consumed:
-                message += f"✅ **Decision:** {job.decision_action.name}\n"
+                message += f"✅ <b>Decision:</b> {html.escape(job.decision_action.name)}\n"
 
         if self.state_machine.z_offset_dirty:
-            message += "\n⚠️ **Z-offset is dirty** - prints blocked until reset\n"
+            message += "\n⚠️ <b>Z-offset is dirty</b> - prints blocked until reset\n"
 
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
     GCODE_EXTENSIONS = {".gcode", ".g", ".gco"}
     STL_EXTENSIONS = {".stl"}
-    ALLOWED_EXTENSIONS = STL_EXTENSIONS | GCODE_EXTENSIONS
+    STEP_EXTENSIONS = {".step", ".stp"}
+    THREE_MF_EXTENSIONS = {".3mf"}
+    MODEL_EXTENSIONS = STL_EXTENSIONS | STEP_EXTENSIONS | THREE_MF_EXTENSIONS
+    ALLOWED_EXTENSIONS = MODEL_EXTENSIONS | GCODE_EXTENSIONS
 
     async def _handle_file_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle file upload (STL or G-code)"""
@@ -196,20 +202,22 @@ class TelegramBot:
         ext = Path(document.file_name).suffix.lower() if document.file_name else ""
         if ext not in self.ALLOWED_EXTENSIONS:
             await update.message.reply_text(
-                "Only STL and G-code files are supported (.stl, .gcode, .g, .gco)"
+                "Supported file types: STL (.stl), STEP (.step, .stp), 3MF (.3mf), "
+                "and G-code (.gcode, .g, .gco)"
             )
             return
 
         is_gcode = ext in self.GCODE_EXTENSIONS
+        is_step_3mf = ext in self.STEP_EXTENSIONS or ext in self.THREE_MF_EXTENSIONS
         max_size = 200 * 1024 * 1024 if is_gcode else 100 * 1024 * 1024
 
         # Check file size
-        if document.file_size > max_size:
+        if document.file_size and document.file_size > max_size:
             limit_mb = max_size // (1024 * 1024)
             await update.message.reply_text(f"File too large (max {limit_mb}MB)")
             return
 
-        file_type = "G-code" if is_gcode else "STL"
+        file_type = "G-code" if is_gcode else ("STEP/3MF" if is_step_3mf else "STL")
         await update.message.reply_text(f"Processing your {file_type} file...")
 
         # Store chat ID for future notifications
@@ -243,25 +251,40 @@ class TelegramBot:
 
             await file.download_to_drive(str(staged_path))
 
-            if is_gcode:
+            # Validate STEP/3MF format before proceeding
+            if is_step_3mf:
+                validator = FileFormatValidator()
+                detected = validator.detect_format(staged_path)
+                if not detected:
+                    await update.message.reply_text(
+                        "Invalid file format. Could not validate as STEP or 3MF."
+                    )
+                    staged_path.unlink(missing_ok=True)
+                    return
+
+                await self._handle_model_upload(
+                    update, document, staged_path, job_id, is_converted=True
+                )
+            elif is_gcode:
                 await self._handle_gcode_upload(update, document, staged_path, job_id)
             else:
-                await self._handle_stl_upload(update, document, staged_path, job_id)
+                await self._handle_model_upload(update, document, staged_path, job_id)
 
         except Exception as e:
             logger.error(f"Error processing file upload: {e}", exc_info=True)
             await update.message.reply_text(f"Error processing file: {str(e)}")
 
-    async def _handle_stl_upload(self, update, document, stl_path, job_id):
-        """Handle STL file upload — enters slicing pipeline"""
+    async def _handle_model_upload(self, update, document, model_path, job_id, is_converted=False):
+        """Handle model file upload (STL, STEP, 3MF) — enters slicing pipeline"""
         job_context = JobContext(
             job_id=job_id,
-            job_file=str(stl_path),
+            job_file=str(model_path),
             uploaded_at=datetime.now(),
             decision_token=generate_decision_token(),
             file_validation_status=FileValidationStatus.VALID,
             is_external=False,
             external_monitoring=False,
+            metadata={"is_converted": is_converted},
         )
 
         self.state_machine.job_context = job_context
@@ -270,13 +293,18 @@ class TelegramBot:
         )
 
         if success:
+            extra_msg = " (will be converted to STL)" if is_converted else ""
             await update.message.reply_text(
-                f"File received: {document.file_name}\n"
+                f"File received: {document.file_name}{extra_msg}\n"
                 f"Job ID: `{job_id}`\n\n"
                 "Starting slicing pipeline..."
             )
         else:
             await update.message.reply_text("Failed to start job. Please try again.")
+
+    async def _handle_stl_upload(self, update, document, stl_path, job_id):
+        """Handle STL file upload — enters slicing pipeline"""
+        await self._handle_model_upload(update, document, stl_path, job_id)
 
     async def _handle_gcode_upload(self, update, document, gcode_path, job_id):
         """Handle G-code file upload — bypasses slicing, goes to approval"""
@@ -313,12 +341,14 @@ class TelegramBot:
 
             meta_text = "\n".join(meta_lines) if meta_lines else "No metadata found"
 
-            keyboard = InlineKeyboardMarkup([
+            keyboard = InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton("Approve", callback_data=f"apr_{job_id}"),
-                    InlineKeyboardButton("Reject", callback_data=f"rej_{job_id}"),
+                    [
+                        InlineKeyboardButton("Approve", callback_data=f"apr_{job_id}"),
+                        InlineKeyboardButton("Reject", callback_data=f"rej_{job_id}"),
+                    ]
                 ]
-            ])
+            )
 
             await update.message.reply_text(
                 f"G-code file received: {document.file_name}\n"
@@ -370,6 +400,10 @@ class TelegramBot:
         """Handle inline keyboard callback"""
         if not await self._check_auth(update):
             return
+
+        # Ensure chat_id is set from callback context (handles bot restart before first upload)
+        if self._chat_id is None:
+            self._chat_id = update.effective_chat.id
 
         query = update.callback_query
         if not query:
@@ -463,9 +497,7 @@ class TelegramBot:
     async def _execute_print_approval(self, job: JobContext):
         """Upload G-code to printer and start print after approval"""
         if not self.adapter:
-            await self._app.bot.send_message(
-                chat_id=self._chat_id, text="No printer connected."
-            )
+            await self._app.bot.send_message(chat_id=self._chat_id, text="No printer connected.")
             return
 
         gcode_path = job.gcode_path or job.job_file
@@ -522,9 +554,7 @@ class TelegramBot:
             await self._app.bot.send_message(
                 chat_id=self._chat_id, text=f"Error starting print: {e}"
             )
-            await self.state_machine.transition_to(
-                AgentState.ERROR, persistence=self.persistence
-            )
+            await self.state_machine.transition_to(AgentState.ERROR, persistence=self.persistence)
 
     async def _handle_reset_z_offset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset_z_offset command"""

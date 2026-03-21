@@ -62,31 +62,31 @@ class TestStatePersistenceBugs:
         sm.current_state = AgentState.IDLE
 
         # Make json.dump fail
-        with patch('json.dump', side_effect=IOError("Disk full")):
-            with pytest.raises(IOError):
+        with patch("json.dump", side_effect=IOError("Disk full")):
+            with pytest.raises(Exception):  # StatePersistenceError wraps IOError
                 persistence.save(sm)
 
-        # BUG: Lock should be released even on exception
-        # After exception, lock should be None (released)
-        assert persistence._lock_fd is None, \
-            "Lock file descriptor not released after save exception - resource leak"
+        # Lock should be released even on exception
+        # After exception, lock should be None (released by finally block)
+        assert persistence._lock_instance is None, (
+            "Lock instance not released after save exception - resource leak"
+        )
 
-    def test_signal_handler_calls_exit_zero(self, persistence):
+    def test_signal_handler_removed_in_refactoring(self, persistence):
         """
-        BUG: _signal_handler calls exit(0) which terminates the entire Python process.
-        This is unacceptable in library code - it kills the application using the library.
+        FIXED: _signal_handler method was removed during refactoring.
+        Signal handling is now delegated to the main event loop and asyncio.
+        This test documents that the problematic method no longer exists.
 
-        Expected: Should raise a specific exception or set a flag for graceful shutdown.
+        The bug (exit(0) in signal handler) has been fixed by removing
+        the signal handler from StatePersistence entirely - it shouldn't
+        be the persistence layer's responsibility.
         """
-        # We can't actually test exit(0) without killing the test runner
-        # So we verify that exit IS called by mocking it
-
-        with patch('builtins.exit') as mock_exit:
-            # Simulate SIGTERM
-            persistence._signal_handler(signal.SIGTERM, None)
-
-            # BUG: exit(0) was called - this kills the process!
-            mock_exit.assert_called_once_with(0)
+        # Verify the method no longer exists
+        assert not hasattr(persistence, "_signal_handler"), (
+            "Signal handler should not exist in persistence layer - "
+            "should be handled at application level instead"
+        )
 
     def test_no_windows_compatibility(self):
         """
@@ -99,7 +99,7 @@ class TestStatePersistenceBugs:
         # the import dependency exists
         import platform
 
-        if platform.system() == 'Windows':
+        if platform.system() == "Windows":
             pytest.skip("Cannot test Windows compatibility on non-Windows system")
 
         # Verify fcntl is imported (which breaks Windows)
@@ -107,7 +107,7 @@ class TestStatePersistenceBugs:
         import sensing_voxel.core.persistence as persistence_module
 
         # Check if fcntl is in the module's namespace
-        has_fcntl = hasattr(persistence_module, 'fcntl')
+        has_fcntl = hasattr(persistence_module, "fcntl")
 
         if has_fcntl:
             pytest.fail(
@@ -135,18 +135,18 @@ class TestStatePersistenceBugs:
         # BUG: Returns None silently - caller has no way to know file was corrupted
         loaded = persistence.load()
 
-        assert loaded is None, \
-            "load() should return None for corrupted file (current behavior)"
+        assert loaded is None, "load() should return None for corrupted file (current behavior)"
 
     def test_load_returns_none_on_missing_required_fields(self, temp_dir):
         """
-        ISSUE: _from_dict doesn't validate required fields. If the JSON
-        is missing critical fields like 'current_state', it may crash
-        or produce invalid state machine.
+        FIXED: _from_dict now validates required fields and raises ValueError
+        with a clear error message instead of raising KeyError.
+
+        This test documents the fixed behavior: missing 'current_state' raises
+        ValueError (caught by load() which logs error and returns None gracefully).
         """
         state_file = temp_dir / "state.json"
 
-        # Create JSON missing required fields
         invalid_data = {
             "timestamp": datetime.now().isoformat(),
             # Missing "current_state" field!
@@ -156,7 +156,9 @@ class TestStatePersistenceBugs:
         state_file.write_text(json.dumps(invalid_data))
         persistence = StatePersistence(state_file)
 
-        # This should either raise an error or handle gracefully
-        # Currently it will crash when trying to access data["current_state"]
-        with pytest.raises((KeyError, TypeError)):
-            loaded = persistence.load()
+        # load() catches ValueError from _from_dict and returns None gracefully
+        loaded = persistence.load()
+
+        assert loaded is None, (
+            "load() should return None on validation error (ValueError caught and logged)"
+        )
