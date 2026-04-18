@@ -49,10 +49,15 @@ services:
       - sensing-voxel-data:/app/data
       - sensing-voxel-uploads:/app/uploads
       - sensing-voxel-models:/app/models
+
     ports:
       - "${SV_DASHBOARD_PORT:-8080}:8080"
-    networks:
-      - sensing-voxel-network
+
+    extra_hosts:
+      - "host.example:192.168.68.121"
+      - "printer.example:192.168.68.86"
+      - "printer.example:192.168.68.127"
+
     healthcheck:
       test: ["CMD", "python", "-c", "import sensing_voxel; print('OK')"]
       interval: 30s
@@ -67,7 +72,3 @@ volumes:
     driver: local
   sensing-voxel-models:
     driver: local
-
-networks:
-  sensing-voxel-network:
-    driver: bridge

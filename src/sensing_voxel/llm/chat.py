@@ -169,8 +169,12 @@ class ChatManager:
                 tools=self._tools,
             )
 
+            response_content = (
+                response.content if hasattr(response, "content") else response.get("content", [])
+            )
+
             # Serialize content blocks for session history
-            content_blocks = self._serialize_content(response.content)
+            content_blocks = self._serialize_content(response_content)
             session.add_assistant_message(content_blocks)
 
             # If no tool use, we're done
@@ -179,18 +183,11 @@ class ChatManager:
                 stop_reason = response.get("stop_reason", "end_turn")
             if stop_reason != "tool_use":
                 self.save_history()
-                text = self._extract_text(
-                    response.content
-                    if hasattr(response, "content")
-                    else response.get("content", [])
-                )
+                text = self._extract_text(response_content)
                 return self._truncate(text)
 
             # Execute each tool call and append results
-            content_blocks = (
-                response.content if hasattr(response, "content") else response.get("content", [])
-            )
-            for block in content_blocks:
+            for block in response_content:
                 block_type = block.type if hasattr(block, "type") else block.get("type")
                 if block_type == "tool_use":
                     block_name = block.name if hasattr(block, "name") else block.get("name")
@@ -301,6 +298,8 @@ class ChatManager:
         for block in content:
             if hasattr(block, "text"):
                 return block.text
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
         return ""
 
     @staticmethod

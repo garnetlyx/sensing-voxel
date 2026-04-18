@@ -34,7 +34,10 @@ dev = [
     "mypy>=1.5",
     "ruff>=0.1",
 ]
-camera = ["pytapo>=3.0"]
+camera = [
+    "pytapo>=3.0",
+    "onvif-zeep>=0.2.12",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
