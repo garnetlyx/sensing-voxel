@@ -75,7 +75,8 @@ services:
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080/
     volumes:
-      - searxng-data:/etc/searxng
+      - ./config/searxng:/etc/searxng
+      - searxng-data:/var/cache/searxng
 
 volumes:
   sensing-voxel-data:
