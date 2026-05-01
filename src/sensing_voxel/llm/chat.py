@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,20 @@ logger = logging.getLogger(__name__)
 
 # Telegram message limit
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+MAX_TOOL_PROGRESS_MESSAGE_LENGTH = 900
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "auth",
+    "bot_token",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@")
+
+ToolProgressCallback = Callable[[str], Awaitable[None]]
 
 
 class ChatSession:
@@ -122,6 +138,7 @@ class ChatManager:
         max_turns: int = 20,
         max_tool_iterations: int = 5,
         history_path: Path | None = None,
+        verbose_tool_use: bool = True,
     ):
         self._client = client
         self._context_collector = context_collector
@@ -131,6 +148,7 @@ class ChatManager:
         self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
+        self._verbose_tool_use = verbose_tool_use
         self._history_path = history_path or Path("data/chat_history.json")
         self._sessions: dict[int, ChatSession] = {}
 
@@ -156,7 +174,12 @@ class ChatManager:
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
 
-    async def chat(self, user_id: int, message: str) -> str:
+    async def chat(
+        self,
+        user_id: int,
+        message: str,
+        tool_progress_callback: ToolProgressCallback | None = None,
+    ) -> str:
         """Process user message and return AI response.
 
         If tools are available, runs an agentic loop: the LLM can call
@@ -211,7 +234,15 @@ class ChatManager:
                     block_input = block.input if hasattr(block, "input") else block.get("input")
                     block_id = block.id if hasattr(block, "id") else block.get("id")
                     logger.info(f"Tool call: {block_name}({block_input})")
+                    await self._emit_tool_progress(
+                        tool_progress_callback,
+                        self._format_tool_start(block_name, block_input),
+                    )
                     result = await self._tool_executor.execute(block_name, block_input)
+                    await self._emit_tool_progress(
+                        tool_progress_callback,
+                        self._format_tool_result(block_name, result),
+                    )
                     if isinstance(result, dict) and "content" in result:
                         logger.info(f"Tool result: [image + text content blocks]")
                         session.add_tool_result(block_id, result["content"])
@@ -220,10 +251,96 @@ class ChatManager:
                         session.add_tool_result(block_id, result)
 
         # Exhausted iterations
+        await self._emit_tool_progress(
+            tool_progress_callback,
+            "⚠️ Tool loop stopped: reached maximum tool-call iterations.",
+        )
         return self._truncate(
             "I've reached the maximum number of tool calls for this turn. "
             "Please try again or simplify your request."
         )
+
+    async def _emit_tool_progress(
+        self, callback: ToolProgressCallback | None, message: str
+    ) -> None:
+        """Emit user-visible tool progress without breaking the main chat."""
+        if not self._verbose_tool_use or callback is None:
+            return
+        try:
+            await callback(self._truncate(message))
+        except Exception as e:
+            logger.warning(f"Failed to emit tool progress: {e}")
+
+    @classmethod
+    def _format_tool_start(cls, name: str, tool_input: Any) -> str:
+        safe_input = cls._safe_preview(tool_input, max_chars=500)
+        return f"🔧 Tool use: {name}\ninput: {safe_input}"
+
+    @classmethod
+    def _format_tool_result(cls, name: str, result: Any) -> str:
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            return f"✅ Tool result: {name} returned content blocks (image/text)."
+
+        parsed = None
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                parsed = None
+
+        if isinstance(parsed, dict) and parsed.get("error"):
+            preview = cls._safe_preview(parsed["error"], max_chars=500)
+            return f"❌ Tool result: {name} error\n{preview}"
+        if isinstance(parsed, dict):
+            preview = cls._safe_preview(parsed, max_chars=650)
+            return f"✅ Tool result: {name}\n{preview}"
+
+        preview = cls._safe_preview(result, max_chars=650)
+        return f"✅ Tool result: {name}\n{preview}"
+
+    @classmethod
+    def _safe_preview(cls, value: Any, max_chars: int = MAX_TOOL_PROGRESS_MESSAGE_LENGTH) -> str:
+        safe_value = cls._redact(value)
+        try:
+            if isinstance(safe_value, str):
+                text = safe_value
+            else:
+                text = json.dumps(safe_value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = str(safe_value)
+        text = cls._redact_text(text).replace("\x00", "")
+        if len(text) > max_chars:
+            return text[: max_chars - 3] + "..."
+        return text
+
+    @classmethod
+    def _redact(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if any(part in key_text for part in SENSITIVE_KEY_PARTS):
+                    redacted[key] = "<redacted>"
+                else:
+                    redacted[key] = cls._redact(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact(item) for item in value[:20]]
+        if isinstance(value, tuple):
+            return tuple(cls._redact(item) for item in value[:20])
+        if isinstance(value, str):
+            return cls._redact_text(value)
+        return value
+
+    @staticmethod
+    def _redact_text(text: str) -> str:
+        text = _URL_CREDENTIALS_RE.sub(r"\1<redacted>:<redacted>@", text)
+        text = re.sub(
+            r'(?i)("(?:api[_-]?key|bot[_-]?token|password|secret|token|auth)"\s*:\s*")[^"]+("?)',
+            r"\1<redacted>\2",
+            text,
+        )
+        return text
 
     def clear_session(self, user_id: int) -> None:
         """Clear user's conversation history."""

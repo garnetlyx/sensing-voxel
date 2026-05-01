@@ -181,6 +181,7 @@ class LlmConfig:
     temperature: float = 0.7
     timeout_seconds: int = 30
     max_conversation_turns: int = 20
+    verbose_tool_use: bool = True
     enabled: bool = False
     shell: ShellToolConfig = field(default_factory=ShellToolConfig)
     web_search: WebSearchToolConfig = field(default_factory=WebSearchToolConfig)

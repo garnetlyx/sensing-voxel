@@ -162,6 +162,7 @@ async def main() -> None:
             web_search=config.llm.web_search,
             max_turns=config.llm.max_conversation_turns,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
+            verbose_tool_use=config.llm.verbose_tool_use,
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")

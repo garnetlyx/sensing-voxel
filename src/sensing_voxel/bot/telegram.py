@@ -872,8 +872,15 @@ class TelegramBot:
 
         await update.effective_chat.send_action("typing")
 
+        async def send_tool_progress(progress_message: str) -> None:
+            await update.message.reply_text(progress_message)
+
         try:
-            response = await self.chat_manager.chat(user_id, message)
+            response = await self.chat_manager.chat(
+                user_id,
+                message,
+                tool_progress_callback=send_tool_progress,
+            )
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"LLM chat error: {e}", exc_info=True)

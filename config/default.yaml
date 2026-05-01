@@ -85,6 +85,7 @@ slicer:
 #   temperature: 0.7
 #   timeout_seconds: 30
 #   max_conversation_turns: 20
+#   verbose_tool_use: true     # Send per-tool-use progress messages (default on)
 #   enabled: false
 #   shell:
 #     enabled: false          # Allow the AI to run short bash diagnostics inside the container

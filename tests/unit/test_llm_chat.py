@@ -288,6 +288,76 @@ class TestChatManagerToolUse:
         assert mock_tool_client.send_message_with_tools.call_count == 3
         assert mock_tool_executor.execute.call_count == 3
 
+    async def test_verbose_tool_use_emits_progress_messages(
+        self, chat_manager_with_tools, mock_tool_client, mock_tool_executor
+    ):
+        tool_response = MagicMock()
+        tool_use_block = MagicMock()
+        tool_use_block.type = "tool_use"
+        tool_use_block.id = "toolu_01"
+        tool_use_block.name = "run_bash"
+        tool_use_block.input = {
+            "cmd": ["echo", "hello"],
+            "password": "super-secret",
+        }
+        tool_response.content = [tool_use_block]
+        tool_response.stop_reason = "tool_use"
+
+        final_response = MagicMock()
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Done."
+        final_response.content = [text_block]
+        final_response.stop_reason = "end_turn"
+
+        mock_tool_client.send_message_with_tools = AsyncMock(
+            side_effect=[tool_response, final_response]
+        )
+        mock_tool_executor.execute = AsyncMock(return_value='{"stdout":"hello", "token":"abc123"}')
+
+        progress = []
+
+        async def capture(message: str):
+            progress.append(message)
+
+        result = await chat_manager_with_tools.chat(
+            user_id=1,
+            message="run a command",
+            tool_progress_callback=capture,
+        )
+
+        assert result == "Done."
+        assert len(progress) == 2
+        assert progress[0].startswith("🔧 Tool use: run_bash")
+        assert '"password": "<redacted>"' in progress[0]
+        assert "super-secret" not in "\n".join(progress)
+        assert progress[1].startswith("✅ Tool result: run_bash")
+        assert '"token": "<redacted>"' in progress[1]
+        assert "abc123" not in "\n".join(progress)
+
+    async def test_verbose_tool_use_can_be_disabled(
+        self, chat_manager_with_tools, mock_tool_client, mock_tool_executor
+    ):
+        chat_manager_with_tools._verbose_tool_use = False
+        block = MagicMock(type="tool_use", id="toolu_01", name="get_printer_state", input={})
+        tool_response = MagicMock(content=[block], stop_reason="tool_use")
+        text_block = MagicMock(type="text", text="Done.")
+        final_response = MagicMock(content=[text_block], stop_reason="end_turn")
+        mock_tool_client.send_message_with_tools = AsyncMock(
+            side_effect=[tool_response, final_response]
+        )
+
+        progress = []
+
+        async def capture(message: str):
+            progress.append(message)
+
+        await chat_manager_with_tools.chat(
+            user_id=1, message="status", tool_progress_callback=capture
+        )
+
+        assert progress == []
+
     async def test_tool_use_with_image_content_result(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """Tool executor returning dict with 'content' key passes content blocks to session."""
         tool_block = MagicMock(type="tool_use", id="toolu_01", name="take_snapshot", input={})
