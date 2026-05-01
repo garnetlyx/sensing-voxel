@@ -161,6 +161,7 @@ async def main() -> None:
             shell=config.llm.shell,
             web_search=config.llm.web_search,
             max_turns=config.llm.max_conversation_turns,
+            max_tool_iterations=config.llm.max_tool_iterations,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
             verbose_tool_use=config.llm.verbose_tool_use,
         )
