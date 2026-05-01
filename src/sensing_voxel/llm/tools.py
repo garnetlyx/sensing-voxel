@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -277,6 +278,39 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
         "name": "list_files",
         "description": "List all G-code files on the printer.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_printer_config_files",
+        "description": (
+            "List Klipper/Moonraker configuration files from the selected printer's remote "
+            "config root. Use this instead of run_bash when looking for printer.cfg or "
+            "other printer configuration files."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_printer_config_file",
+        "description": (
+            "Read a Klipper/Moonraker configuration file such as printer.cfg from the "
+            "selected printer's remote config root. This does not read files from the "
+            "Sensing Voxel container."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Config filename under Moonraker's config root, default printer.cfg",
+                    "default": "printer.cfg",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum bytes of file content to return, default 50000",
+                    "default": 50000,
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "delete_file",
@@ -573,6 +607,8 @@ class ToolExecutor:
             "get_z_offset": self._get_z_offset,
             "set_z_offset": self._set_z_offset,
             "list_files": self._list_files,
+            "list_printer_config_files": self._list_printer_config_files,
+            "get_printer_config_file": self._get_printer_config_file,
             "delete_file": self._delete_file,
             "get_file_metadata": self._get_file_metadata,
             "move_axis": self._move_axis,
@@ -635,8 +671,15 @@ class ToolExecutor:
 
         try:
             result = await handler(tool_input)
-            # Structured content (e.g. image blocks) — pass through as-is
-            if isinstance(result, dict) and "content" in result:
+            # Structured content (e.g. image blocks) — pass through as-is.
+            # Plain JSON tools may also have a string field named "content"
+            # (for example remote config file reads), so only pass through
+            # actual content-block lists.
+            if (
+                isinstance(result, dict)
+                and "content" in result
+                and isinstance(result["content"], list)
+            ):
                 return result
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
@@ -882,6 +925,61 @@ class ToolExecutor:
                 for f in files
             ],
             "count": len(files),
+        }
+
+    async def _list_printer_config_files(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        list_config_files = getattr(adapter, "list_config_files", None)
+        if list_config_files is None or not inspect.iscoroutinefunction(list_config_files):
+            return {
+                "printer_id": printer_id,
+                "error": "This printer adapter does not support remote config file listing",
+            }
+        cmd = await list_config_files()
+        if cmd.status != CommandResultStatus.SUCCESS:
+            return self._cmd_result(cmd)
+        files = cmd.data or []
+        return {
+            "printer_id": printer_id,
+            "files": [
+                {
+                    "filename": f.get("path", f.get("filename", f.get("name", ""))),
+                    "size_bytes": f.get("size"),
+                    "modified": f.get("modified"),
+                }
+                for f in files
+            ],
+            "count": len(files),
+            "note": "These are remote Moonraker/Klipper config files, not local /app files.",
+        }
+
+    async def _get_printer_config_file(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        get_config_file = getattr(adapter, "get_config_file", None)
+        if get_config_file is None or not inspect.iscoroutinefunction(get_config_file):
+            return {
+                "printer_id": printer_id,
+                "error": "This printer adapter does not support remote config file reads",
+            }
+        filename = tool_input.get("filename") or "printer.cfg"
+        max_bytes = int(tool_input.get("max_bytes") or 50000)
+        cmd = await get_config_file(filename=filename, max_bytes=max_bytes)
+        if cmd.status != CommandResultStatus.SUCCESS:
+            return self._cmd_result(cmd)
+        data = cmd.data or {}
+        return {
+            "printer_id": printer_id,
+            "filename": data.get("filename", filename),
+            "content": data.get("content", ""),
+            "size_bytes": data.get("size_bytes"),
+            "truncated": data.get("truncated", False),
+            "note": "Read from remote Moonraker/Klipper config root, not local /app.",
         }
 
     async def _delete_file(self, tool_input: dict) -> dict:

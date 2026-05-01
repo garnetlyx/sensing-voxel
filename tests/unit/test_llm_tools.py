@@ -88,6 +88,24 @@ def mock_adapter():
             ]
         )
     )
+    adapter.list_config_files = AsyncMock(
+        return_value=_success(
+            data=[
+                {"path": "printer.cfg", "size": 1234, "modified": 1700000100},
+                {"path": "macros/print_start.cfg", "size": 2345, "modified": 1700000101},
+            ]
+        )
+    )
+    adapter.get_config_file = AsyncMock(
+        return_value=_success(
+            data={
+                "filename": "printer.cfg",
+                "content": "[printer]\nkinematics: cartesian\n",
+                "size_bytes": 31,
+                "truncated": False,
+            }
+        )
+    )
     adapter.get_file_metadata = AsyncMock(
         return_value=_success(data={"layers": 123, "height_mm": 20.5})
     )
@@ -131,6 +149,8 @@ class TestToolCatalogAndDispatch:
         assert "run_gcode" in printer_names
         system_names = {tool["name"] for tool in SYSTEM_TOOLS}
         assert "upload_to_printer" in printer_names
+        assert "list_printer_config_files" in printer_names
+        assert "get_printer_config_file" in printer_names
         assert "run_bash" in system_names
         assert "web_search" in system_names
         assert "camera_snapshot" in camera_names
@@ -286,6 +306,42 @@ class TestPrinterQueryTools:
             await executor.execute("get_file_metadata", {"filename": "cube.gcode"})
         )
         assert payload["layers"] == 123
+
+
+    @pytest.mark.asyncio
+    async def test_list_printer_config_files_reads_remote_config_root(self, executor):
+        payload = _load_json(await executor.execute("list_printer_config_files", {}))
+
+        assert payload["printer_id"] == "default"
+        assert payload["count"] == 2
+        assert payload["files"][0]["filename"] == "printer.cfg"
+        assert "remote Moonraker" in payload["note"]
+
+    @pytest.mark.asyncio
+    async def test_get_printer_config_file_reads_remote_content(self, executor, mock_adapter):
+        payload = _load_json(
+            await executor.execute("get_printer_config_file", {"filename": "printer.cfg"})
+        )
+
+        assert payload["printer_id"] == "default"
+        assert payload["filename"] == "printer.cfg"
+        assert "[printer]" in payload["content"]
+        assert payload["truncated"] is False
+        assert "not local /app" in payload["note"]
+        mock_adapter.get_config_file.assert_awaited_once_with(
+            filename="printer.cfg", max_bytes=50000
+        )
+
+    @pytest.mark.asyncio
+    async def test_config_file_tools_report_unsupported_adapter(self):
+        adapter = MagicMock()
+        adapter.get_printer_state = AsyncMock(return_value=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT)
+        executor = ToolExecutor(adapter=adapter)
+
+        payload = _load_json(await executor.execute("get_printer_config_file", {}))
+
+        assert payload["printer_id"] == "default"
+        assert "does not support remote config file reads" in payload["error"]
 
     @pytest.mark.asyncio
     async def test_get_system_info(self, executor):

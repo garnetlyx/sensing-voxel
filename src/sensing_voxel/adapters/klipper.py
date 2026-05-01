@@ -10,6 +10,7 @@ import math
 import random
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 
@@ -588,6 +589,63 @@ class KlipperAdapter(PrinterAdapter):
 
     async def list_files(self) -> CommandResult:
         return await self._rest_request("GET", "/server/files/list?root=gcodes")
+
+    async def list_config_files(self) -> CommandResult:
+        """List Klipper/Moonraker configuration files via Moonraker's config root."""
+        return await self._rest_request("GET", "/server/files/list?root=config")
+
+    async def get_config_file(
+        self, filename: str = "printer.cfg", max_bytes: int = 50000
+    ) -> CommandResult:
+        """Read a Klipper configuration file from Moonraker's config root.
+
+        This reads the remote printer's config files, not files from the
+        Sensing Voxel container.  It is intentionally read-only.
+        """
+        if not self._session:
+            return CommandResult(CommandResultStatus.FAILURE, message="Not connected")
+
+        safe_filename = filename.strip().lstrip("/") or "printer.cfg"
+        if ".." in Path(safe_filename).parts:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message="filename must stay under Moonraker config root",
+            )
+
+        limit = max(1, min(int(max_bytes), 200000))
+        encoded = quote(safe_filename, safe="/")
+        url = f"{self._rest_base_url}/server/files/config/{encoded}"
+
+        try:
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    return CommandResult(
+                        CommandResultStatus.FAILURE,
+                        message=f"HTTP {resp.status}: {error_text}",
+                    )
+
+                raw = await resp.read()
+                truncated = len(raw) > limit
+                content = raw[:limit].decode(errors="replace")
+                return CommandResult(
+                    CommandResultStatus.SUCCESS,
+                    data={
+                        "filename": safe_filename,
+                        "content": content,
+                        "size_bytes": len(raw),
+                        "truncated": truncated,
+                    },
+                )
+        except TimeoutError:
+            return CommandResult(
+                CommandResultStatus.FAILURE, message="Request timeout after 10s"
+            )
+        except Exception as e:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message=f"Request failed: {str(e)}",
+            )
 
     async def delete_file(self, filename: str) -> CommandResult:
         return await self._rest_request("DELETE", f"/server/files/gcodes/{filename}")
