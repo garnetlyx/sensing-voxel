@@ -40,8 +40,10 @@ async def get_printers(request: web.Request) -> web.Response:
 
     printers = []
     for pid, adapter in adapters.items():
-        # Determine printer type from adapter class name
-        printer_type = type(adapter).__name__.replace("Adapter", "").lower()
+        printer_type = getattr(adapter, "printer_type", None)
+        if not printer_type:
+            # Determine printer type from adapter class name
+            printer_type = type(adapter).__name__.replace("Adapter", "").lower()
         printers.append(
             {
                 "id": pid,

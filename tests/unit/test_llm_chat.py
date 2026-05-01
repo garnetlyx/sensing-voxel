@@ -167,6 +167,41 @@ class TestChatManagerToolUse:
         manager._tools = [{"name": "get_printer_state", "description": "test"}]
         return manager
 
+
+    def test_constructs_tool_executor_with_all_adapters(self, mock_tool_client, mock_context_collector):
+        active_adapter = MagicMock()
+        other_adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapters={"neptune4max": active_adapter, "rpi-printer": other_adapter},
+            active_printer="neptune4max",
+            max_turns=20,
+        )
+
+        assert manager._tool_executor is not None
+        assert manager._tool_executor._adapters == {
+            "neptune4max": active_adapter,
+            "rpi-printer": other_adapter,
+        }
+        assert manager._tool_executor._active_printer == "neptune4max"
+        assert any(tool["name"] == "list_printers" for tool in manager._tools)
+
+    def test_legacy_single_adapter_defaults_to_active(self, mock_tool_client, mock_context_collector):
+        adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapter=adapter,
+            max_turns=20,
+        )
+
+        assert manager._tool_executor is not None
+        assert manager._tool_executor._adapters == {"default": adapter}
+        assert manager._tool_executor._active_printer == "default"
+
     async def test_tool_use_single_round(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """LLM calls a tool, gets the result, then produces a final text response."""
         # First response: tool_use

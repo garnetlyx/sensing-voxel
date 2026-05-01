@@ -7,7 +7,13 @@ import json
 import re
 
 import pytest
-from playwright.sync_api import Page, expect
+
+playwright_sync_api = pytest.importorskip(
+    "playwright.sync_api",
+    reason="Playwright is only required for live browser E2E tests",
+)
+Page = playwright_sync_api.Page
+expect = playwright_sync_api.expect
 
 
 BASE_URL = "http://localhost:8080"

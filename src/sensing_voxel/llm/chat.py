@@ -113,6 +113,8 @@ class ChatManager:
         client: LlmClient,
         context_collector: PrinterContextCollector,
         adapter: PrinterAdapter | None = None,
+        adapters: dict[str, PrinterAdapter] | None = None,
+        active_printer: str | None = None,
         camera=None,
         rtsp_url: str | None = None,
         max_turns: int = 20,
@@ -122,19 +124,26 @@ class ChatManager:
         self._client = client
         self._context_collector = context_collector
         self._adapter = adapter
+        self._adapters = adapters or ({active_printer or "default": adapter} if adapter else {})
+        self._active_printer = active_printer or next(iter(self._adapters), None)
         self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
         self._history_path = history_path or Path("data/chat_history.json")
         self._sessions: dict[int, ChatSession] = {}
 
-        # Create tool executor if adapter is available
+        # Create tool executor if at least one printer adapter is available
         self._tool_executor = None
         self._tools = None
-        if adapter:
+        if self._adapters:
             from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
 
-            self._tool_executor = ToolExecutor(adapter, camera=camera, rtsp_url=rtsp_url)
+            self._tool_executor = ToolExecutor(
+                adapters=self._adapters,
+                active_printer=self._active_printer,
+                camera=camera,
+                rtsp_url=rtsp_url,
+            )
             self._tools = list(PRINTER_TOOLS)
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)

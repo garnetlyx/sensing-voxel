@@ -144,25 +144,7 @@ class KlipperAdapter(PrinterAdapter):
                 break
 
             # Reconnect delay - cap attempts to prevent overflow
-            # Calculate max useful attempts: log(max_delay / base_delay) / log(factor)
-            max_attempts_before_max_delay = (
-                int(
-                    math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
-                    / math.log(self._reconnect_policy.factor)
-                )
-                + 1
-            )
-            capped_attempts = min(self._reconnect_attempts, max_attempts_before_max_delay)
-
-            delay = min(
-                self._reconnect_policy.base_delay
-                * (self._reconnect_policy.factor**capped_attempts),
-                self._reconnect_policy.max_delay,
-            )
-
-            # Add random jitter to prevent thundering herd (deterministic event_loop.time() removed)
-            if self._reconnect_policy.jitter > 0:
-                delay += delay * self._reconnect_policy.jitter * random.random()
+            delay = self._calculate_backoff_delay()
 
             logger.info(
                 f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts + 1}/{max_reconnect_attempts})"
@@ -172,6 +154,29 @@ class KlipperAdapter(PrinterAdapter):
                 break
             except TimeoutError:
                 self._reconnect_attempts += 1
+
+    def _calculate_backoff_delay(self) -> float:
+        """Calculate reconnect delay with capped exponential backoff."""
+        max_attempts_before_max_delay = (
+            int(
+                math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
+                / math.log(self._reconnect_policy.factor)
+            )
+            + 1
+        )
+        capped_attempts = min(self._reconnect_attempts, max_attempts_before_max_delay)
+
+        delay = min(
+            self._reconnect_policy.base_delay
+            * (self._reconnect_policy.factor**capped_attempts),
+            self._reconnect_policy.max_delay,
+        )
+
+        # Add random jitter to prevent thundering herd.
+        if self._reconnect_policy.jitter > 0:
+            delay += delay * self._reconnect_policy.jitter * random.random()
+
+        return delay
 
     async def _ws_connect_and_stream(self):
         """Connect WebSocket and stream events"""

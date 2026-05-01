@@ -96,15 +96,10 @@ class TestConcurrencyBugs:
         # Transition with failing persistence
         success = await sm.transition_to(AgentState.RECEIVING, failing_persistence)
 
-        # State changed in memory
-        assert sm.current_state == AgentState.RECEIVING
-
-        # But persistence failed - inconsistency!
-        # On restart, system will think it's IDLE but it's actually RECEIVING
-        assert success is True, (
-            "BUG: Transition reported success but persistence failed. "
-            "State is now inconsistent between memory and disk."
-        )
+        # Safe behavior: transition should fail and leave in-memory state unchanged
+        # when persistence cannot commit the new state.
+        assert sm.current_state == original_state
+        assert success is False
 
     @pytest.mark.asyncio
     async def test_decision_engine_lock_leak_on_exception(self):
@@ -145,14 +140,11 @@ class TestConcurrencyBugs:
                     expected_state=AgentState.AWAITING_APPROVAL,
                     current_state=AgentState.AWAITING_APPROVAL,
                 )
-            except RuntimeError:
-                pass  # Expected
+            except Exception:
+                pass  # Expected: the important behavior is cleanup
 
-        # After exception, lock should be released but entry remains
-        # BUG: The lock entry is never cleaned up
-        assert "leak-test" in engine._decision_locks, (
-            "BUG: Lock entry not cleaned up after exception. "
-            "Memory leak under error conditions."
+        assert "leak-test" not in engine._decision_locks, (
+            "Lock entry should be cleaned up after exception to avoid memory leaks."
         )
 
     @pytest.mark.asyncio
@@ -213,16 +205,12 @@ class TestConcurrencyBugs:
         # Simulate many reconnection attempts
         adapter._reconnect_attempts = 2**31 - 1  # Near int32 max
 
-        # Compute delay - this could theoretically overflow
-        delay = min(
-            adapter._reconnect_policy.base_delay
-            * (adapter._reconnect_policy.factor ** adapter._reconnect_attempts),
-            adapter._reconnect_policy.max_delay,
-        )
+        # Real code path should cap attempts before exponentiation, avoiding overflow.
+        delay = adapter._calculate_backoff_delay()
 
-        # Should be capped at max_delay, but the exponentiation might overflow
-        # before the min() is applied
-        assert delay <= adapter._reconnect_policy.max_delay
+        assert delay <= adapter._reconnect_policy.max_delay * (
+            1 + adapter._reconnect_policy.jitter
+        )
 
     @pytest.mark.asyncio
     async def test_timeout_task_cancellation_race(self):

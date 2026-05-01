@@ -81,6 +81,7 @@ async def retry_async[T](
     *,
     max_attempts: int = 3,
     policy: BackoffPolicy | None = None,
+    backoff_policy: BackoffPolicy | None = None,
     retryable_exceptions: tuple[type[Exception], ...] | None = None,
     on_retry: Callable[[int, Exception], None] | None = None,
 ) -> T:
@@ -91,6 +92,7 @@ async def retry_async[T](
         fn: Async function to retry
         max_attempts: Maximum number of attempts (including first)
         policy: Backoff policy configuration
+        backoff_policy: Backward-compatible alias for policy
         retryable_exceptions: Exception types to retry on. If None, retries on all exceptions
         on_retry: Callback invoked before each retry with attempt number and exception
 
@@ -100,8 +102,14 @@ async def retry_async[T](
     Raises:
         Exception: Last exception after all retries exhausted
     """
+    if max_attempts < 1:
+        raise TypeError("max_attempts must be at least 1")
+
+    if policy is not None and backoff_policy is not None:
+        raise TypeError("Specify only one of policy or backoff_policy")
+
     if policy is None:
-        policy = BackoffPolicy()
+        policy = backoff_policy or BackoffPolicy()
 
     if retryable_exceptions is None:
         retryable_exceptions = (Exception,)

@@ -152,43 +152,45 @@ class TestStateMachineChaos:
         # This behavior is acceptable but should be documented
 
     @pytest.mark.asyncio
-        @pytest.mark.asyncio
     @pytest.mark.xfail(reason="Testing hypothetical shallow copy bug")
     async def test_state_machine_deep_copy_vs_shallow(self):
-    """
-    BUG: Shallow copy of state machine may share mutable objects
-    between persisted and in-memory state.
-    
-    This test verifies that persistence uses deepcopy, not shallow copy.
-    """
-    sm = AgentStateMachine()
-    sm.job_context = JobContext(
-        job_id="test-job",
-        job_file="test.stl",
-        uploaded_at=datetime.now(),
-        decision_token="token123",
-    )
+        """
+        BUG: Shallow copy of state machine may share mutable objects
+        between persisted and in-memory state.
 
-    # Test actual persistence deepcopy behavior
-    import copy
-    sm2 = copy.deepcopy(sm)
-    
-    # Modify job_context in copy
-    sm2.job_context.decision_consumed = True
-    
-    # Original should NOT be affected because we used deepcopy
-    assert not sm.job_context.decision_consumed,             "BUG: deepcopy should create independent copy"
-    
-    # Also test that the copy has the modified value
-    assert sm2.job_context.decision_consumed,             "Copy should have modified value"
-    
-    # Test that persistence.to_dict() uses deepcopy
-    from sensing_voxel.core.persistence import StatePersistence
-    persistence = StatePersistence("test_state.json")
-    dict_repr = persistence._to_dict(sm)
-    
-    # The dict representation should be independent
-    # (This is testing the actual persistence code)
+        This test verifies that persistence uses deepcopy, not shallow copy.
+        """
+        sm = AgentStateMachine()
+        sm.job_context = JobContext(
+            job_id="test-job",
+            job_file="test.stl",
+            uploaded_at=datetime.now(),
+            decision_token="token123",
+        )
+
+        # Test actual persistence deepcopy behavior
+        import copy
+        sm2 = copy.deepcopy(sm)
+
+        # Modify job_context in copy
+        sm2.job_context.decision_consumed = True
+
+        # Original should NOT be affected because we used deepcopy
+        assert not sm.job_context.decision_consumed, (
+            "BUG: deepcopy should create independent copy"
+        )
+
+        # Also test that the copy has the modified value
+        assert sm2.job_context.decision_consumed, "Copy should have modified value"
+
+        # Test that persistence.to_dict() uses deepcopy
+        from sensing_voxel.core.persistence import StatePersistence
+        persistence = StatePersistence("test_state.json")
+        dict_repr = persistence._to_dict(sm)
+        assert dict_repr is not None
+
+        # The dict representation should be independent
+        # (This is testing the actual persistence code)
 class TestJobContextMutability:
     """Test mutability and immutability contracts"""
 

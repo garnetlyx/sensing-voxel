@@ -154,7 +154,8 @@ async def main() -> None:
         chat_manager = ChatManager(
             client=llm_client,
             context_collector=context_collector,
-            adapter=adapters.get(active_printer) if active_printer else None,
+            adapters=adapters,
+            active_printer=active_printer,
             camera=tapo_camera,
             rtsp_url=config.dashboard.camera_rtsp_url,
             max_turns=config.llm.max_conversation_turns,

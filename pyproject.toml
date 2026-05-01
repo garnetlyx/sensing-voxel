@@ -29,6 +29,7 @@ dependencies = [
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.21",
+    "pytest-aiohttp>=1.0",
     "pytest-cov>=4.1",
     "black>=23.9",
     "mypy>=1.5",

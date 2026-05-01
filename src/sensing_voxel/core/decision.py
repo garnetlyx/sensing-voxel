@@ -3,6 +3,7 @@ Decision idempotency engine with lock-guarded CAS
 """
 
 import asyncio
+import hmac
 import logging
 from datetime import datetime
 
@@ -128,6 +129,10 @@ class DecisionEngine:
         Returns:
             ConsumeResult indicating outcome
         """
+        if job_context is None:
+            logger.warning("Decision consume attempted without a job context")
+            return ConsumeResult.INVALID_JOB
+
         job_id = job_context.job_id
 
         # Acquire per-job lock
@@ -153,6 +158,24 @@ class DecisionEngine:
                         if job_id in self._timeout_tasks:
                             del self._timeout_tasks[job_id]
 
+                if job_context.decision_consumed:
+                    logger.info(f"Decision already consumed for job {job_id}")
+                    # Clean up resources for already-consumed job
+                    self._cleanup_job_resources(job_id)
+                    return ConsumeResult.ALREADY_HANDLED
+
+                expected_token = job_context.decision_token
+                if not expected_token or not decision_token:
+                    logger.warning(f"Missing decision token for job {job_id}")
+                    self._cleanup_job_resources(job_id)
+                    return ConsumeResult.INVALID_TOKEN
+
+                if not hmac.compare_digest(str(expected_token), str(decision_token)):
+                    logger.warning(f"Invalid decision token for job {job_id}")
+                    # Clean up lock before returning
+                    self._cleanup_job_resources(job_id)
+                    return ConsumeResult.INVALID_TOKEN
+
                 # Re-check guards (skip for timeout actions)
                 if action not in [
                     DecisionAction.TIMEOUT_APPROVAL,
@@ -174,18 +197,6 @@ class DecisionEngine:
                         # Clean up lock before returning
                         self._cleanup_job_resources(job_id)
                         return ConsumeResult.INVALID_STATE
-
-                if job_context.decision_consumed:
-                    logger.info(f"Decision already consumed for job {job_id}")
-                    # Clean up resources for already-consumed job
-                    self._cleanup_job_resources(job_id)
-                    return ConsumeResult.ALREADY_HANDLED
-
-                if job_context.decision_token != decision_token:
-                    logger.warning(f"Invalid decision token for job {job_id}")
-                    # Clean up lock before returning
-                    self._cleanup_job_resources(job_id)
-                    return ConsumeResult.INVALID_TOKEN
 
                 # All guards passed - consume decision
                 job_context.decision_consumed = True

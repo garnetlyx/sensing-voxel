@@ -26,6 +26,18 @@ BED_TEMP_MAX = 120
 
 PRINTER_TOOLS: list[dict[str, Any]] = [
     {
+        "name": "list_printers",
+        "description": (
+            "List all configured printers, their IDs, connection status, and which one is the default. "
+            "Use this before comparing printers or when the user does not specify which printer."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "get_printer_state",
         "description": "Get the current printer state (idle, printing, paused, error, etc.)",
         "input_schema": {
@@ -344,6 +356,30 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def _add_optional_printer_id_to_tools() -> None:
+    """Add a shared optional printer_id argument to all printer-specific tools."""
+    printer_id_schema = {
+        "type": "string",
+        "description": (
+            "Optional printer ID. Use list_printers to discover IDs. "
+            "If omitted, the current default/active printer is used."
+        ),
+    }
+    for tool in PRINTER_TOOLS:
+        if tool.get("name") == "list_printers":
+            continue
+        schema = tool.setdefault("input_schema", {"type": "object"})
+        props = schema.setdefault("properties", {})
+        props.setdefault("printer_id", printer_id_schema)
+        tool["description"] = (
+            f'{tool.get("description", "")} '
+            "Accepts optional printer_id to target a specific printer."
+        ).strip()
+
+
+_add_optional_printer_id_to_tools()
+
+
 CAMERA_TOOLS: list[dict[str, Any]] = [
     {
         "name": "camera_snapshot",
@@ -424,13 +460,30 @@ CAMERA_TOOLS: list[dict[str, Any]] = [
 
 
 class ToolExecutor:
-    """Dispatches tool calls to the printer adapter and optional camera."""
+    """Dispatches tool calls to one or more printer adapters and optional camera."""
 
-    def __init__(self, adapter: PrinterAdapter, camera=None, rtsp_url: str | None = None):
-        self._adapter = adapter
+    def __init__(
+        self,
+        adapter: PrinterAdapter | None = None,
+        camera=None,
+        rtsp_url: str | None = None,
+        adapters: dict[str, PrinterAdapter] | None = None,
+        active_printer: str | None = None,
+    ):
+        if adapters is None:
+            adapters = {}
+        if adapter is not None and not adapters:
+            adapter_id = active_printer or "default"
+            adapters = {adapter_id: adapter}
+            active_printer = adapter_id
+
+        self._adapters = adapters
+        self._active_printer = active_printer or next(iter(adapters), None)
+        self._adapter = adapters.get(self._active_printer) if self._active_printer else adapter
         self._camera: Any | None = camera
         self._rtsp_url: str | None = rtsp_url
         self._dispatch: dict[str, Any] = {
+            "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
             "get_print_progress": self._get_print_progress,
             "start_print": self._start_print,
@@ -471,8 +524,10 @@ class ToolExecutor:
         if rtsp_url:
             self._dispatch["camera_snapshot"] = self._camera_snapshot
 
-    async def execute(self, tool_name: str, tool_input: dict) -> str | dict:
+    async def execute(self, tool_name: str, tool_input: dict | None) -> str | dict:
         """Execute a tool call and return JSON string or structured content blocks."""
+        if tool_input is None:
+            tool_input = {}
         handler = self._dispatch.get(tool_name)
         if not handler:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
@@ -487,15 +542,56 @@ class ToolExecutor:
             logger.error(f"Tool execution error ({tool_name}): {e}", exc_info=True)
             return json.dumps({"error": str(e)})
 
+    def _select_adapter(self, tool_input: dict | None = None) -> tuple[str | None, PrinterAdapter | None]:
+        """Resolve target adapter from optional tool_input['printer_id']."""
+        if tool_input is None:
+            tool_input = {}
+        printer_id = tool_input.get("printer_id") or self._active_printer
+        if not printer_id:
+            return None, None
+        return printer_id, self._adapters.get(printer_id)
+
+    async def _list_printers_tool(self, _input: dict) -> dict:
+        return {
+            "active_printer": self._active_printer,
+            "printers": [
+                {
+                    "printer_id": pid,
+                    "active": pid == self._active_printer,
+                    "type": type(adapter).__name__.replace("Adapter", "").lower(),
+                }
+                for pid, adapter in self._adapters.items()
+            ],
+        }
+
+    def _require_adapter(self, tool_input: dict | None = None) -> tuple[str, PrinterAdapter] | dict:
+        printer_id, adapter = self._select_adapter(tool_input)
+        if adapter is None:
+            return {
+                "error": (
+                    f"Unknown printer_id '{printer_id}'. "
+                    f"Available printers: {', '.join(self._adapters) or 'none'}"
+                )
+            }
+        return printer_id or "default", adapter
+
     # --- Read-only tools ---
 
-    async def _get_printer_state(self, _input: dict) -> dict:
-        state = await self._adapter.get_printer_state()
-        return {"state": state.name}
+    async def _get_printer_state(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        state = await adapter.get_printer_state()
+        return {"printer_id": printer_id, "state": state.name}
 
-    async def _get_print_progress(self, _input: dict) -> dict:
-        progress = await self._adapter.get_print_progress()
-        result: dict[str, Any] = {"state": progress.state.name}
+    async def _get_print_progress(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        progress = await adapter.get_print_progress()
+        result: dict[str, Any] = {"printer_id": printer_id, "state": progress.state.name}
         if progress.filename:
             result["filename"] = progress.filename
         if progress.progress is not None:
@@ -519,22 +615,38 @@ class ToolExecutor:
     # --- Print lifecycle ---
 
     async def _start_print(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         filename = tool_input.get("filename", "")
         if not filename:
             return {"error": "filename is required"}
-        cmd = await self._adapter.start_print(filename)
+        cmd = await adapter.start_print(filename)
         return self._cmd_result(cmd)
 
-    async def _pause_print(self, _input: dict) -> dict:
-        cmd = await self._adapter.pause_print()
+    async def _pause_print(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.pause_print()
         return self._cmd_result(cmd)
 
-    async def _resume_print(self, _input: dict) -> dict:
-        cmd = await self._adapter.resume_print()
+    async def _resume_print(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.resume_print()
         return self._cmd_result(cmd)
 
-    async def _cancel_print(self, _input: dict) -> dict:
-        cmd = await self._adapter.cancel_print()
+    async def _cancel_print(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.cancel_print()
         result = self._cmd_result(cmd)
         result["warning"] = "Print has been cancelled. This cannot be undone."
         return result
@@ -542,34 +654,46 @@ class ToolExecutor:
     # --- Temperature & control ---
 
     async def _set_nozzle_temp(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         temp = tool_input.get("temperature")
         if temp is None:
             return {"error": "temperature is required"}
         temp = float(temp)
         if temp < 0 or temp > NOZZLE_TEMP_MAX:
             return {"error": f"Temperature must be 0-{NOZZLE_TEMP_MAX}°C, got {temp}"}
-        cmd = await self._adapter.set_nozzle_temp(temp)
+        cmd = await adapter.set_nozzle_temp(temp)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Nozzle temperature set to {int(temp)}°C"
         return result
 
     async def _set_bed_temp(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         temp = tool_input.get("temperature")
         if temp is None:
             return {"error": "temperature is required"}
         temp = float(temp)
         if temp < 0 or temp > BED_TEMP_MAX:
             return {"error": f"Temperature must be 0-{BED_TEMP_MAX}°C, got {temp}"}
-        cmd = await self._adapter.set_bed_temp(temp)
+        cmd = await adapter.set_bed_temp(temp)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Bed temperature set to {int(temp)}°C"
         return result
 
     async def _home_axes(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         axes = tool_input.get("axes", "")
-        cmd = await self._adapter.home_axes(axes)
+        cmd = await adapter.home_axes(axes)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             label = axes.upper() if axes.strip() else "all"
@@ -577,13 +701,17 @@ class ToolExecutor:
         return result
 
     async def _set_fan_speed(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         speed = tool_input.get("speed")
         if speed is None:
             return {"error": "speed is required"}
         speed = int(speed)
         if speed < 0 or speed > 255:
             return {"error": f"Speed must be 0-255, got {speed}"}
-        cmd = await self._adapter.set_fan_speed(speed)
+        cmd = await adapter.set_fan_speed(speed)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             pct = round(speed / 255 * 100)
@@ -591,6 +719,10 @@ class ToolExecutor:
         return result
 
     async def _run_gcode(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         command = tool_input.get("command", "").strip()
         if not command:
             return {"error": "command is required"}
@@ -598,35 +730,48 @@ class ToolExecutor:
         if validation_error:
             return {"error": validation_error}
         safe_command = _strip_gcode_comment(command)
-        cmd = await self._adapter.run_gcode(safe_command)
+        cmd = await adapter.run_gcode(safe_command)
         result = self._cmd_result(cmd)
         result["warning"] = f"Executed raw G-code: {safe_command}"
         return result
 
     # --- Z-offset ---
 
-    async def _get_z_offset(self, _input: dict) -> dict:
+    async def _get_z_offset(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
         try:
-            offset = await self._adapter.get_z_offset()
-            return {"z_offset_mm": round(offset, 4)}
+            offset = await adapter.get_z_offset()
+            return {"printer_id": printer_id, "z_offset_mm": round(offset, 4)}
         except Exception as e:
-            return {"error": str(e)}
+            return {"printer_id": printer_id, "error": str(e)}
 
     async def _set_z_offset(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         offset = tool_input.get("offset_mm")
         if offset is None:
             return {"error": "offset_mm is required"}
-        cmd = await self._adapter.set_z_offset(float(offset))
+        cmd = await adapter.set_z_offset(float(offset))
         return self._cmd_result(cmd)
 
     # --- File management ---
 
-    async def _list_files(self, _input: dict) -> dict:
-        cmd = await self._adapter.list_files()
+    async def _list_files(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        cmd = await adapter.list_files()
         if cmd.status != CommandResultStatus.SUCCESS:
             return self._cmd_result(cmd)
         files = cmd.data or []
         return {
+            "printer_id": printer_id,
             "files": [
                 {
                     "filename": f.get("path", f.get("filename", "")),
@@ -639,24 +784,39 @@ class ToolExecutor:
         }
 
     async def _delete_file(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         filename = tool_input.get("filename", "")
         if not filename:
             return {"error": "filename is required"}
-        cmd = await self._adapter.delete_file(filename)
+        cmd = await adapter.delete_file(filename)
         result = self._cmd_result(cmd)
         result["warning"] = f"Deleted file: {filename}"
         return result
 
     async def _get_file_metadata(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
         filename = tool_input.get("filename", "")
         if not filename:
             return {"error": "filename is required"}
-        cmd = await self._adapter.get_file_metadata(filename)
+        cmd = await adapter.get_file_metadata(filename)
         if cmd.status != CommandResultStatus.SUCCESS:
             return self._cmd_result(cmd)
-        return cmd.data or {}
+        result = cmd.data or {}
+        if isinstance(result, dict):
+            result.setdefault("printer_id", printer_id)
+        return result
 
     async def _upload_to_printer(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         filename = tool_input.get("filename", "")
         if not filename:
             return {"error": "filename is required"}
@@ -668,7 +828,7 @@ class ToolExecutor:
         if not local_path.exists():
             return {"error": f"File '{filename}' not found on server. Ask user to upload it first."}
 
-        cmd = await self._adapter.upload_file(str(local_path.absolute()), filename)
+        cmd = await adapter.upload_file(str(local_path.absolute()), filename)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Successfully uploaded '{filename}' to the printer."
@@ -677,6 +837,10 @@ class ToolExecutor:
     # --- Manual motion ---
 
     async def _move_axis(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         axis = tool_input.get("axis", "")
         distance = tool_input.get("distance")
         speed = tool_input.get("speed", 3000)
@@ -684,53 +848,69 @@ class ToolExecutor:
             return {"error": "axis and distance are required"}
         if abs(distance) > 200:
             return {"error": f"Distance too large: {distance}mm. Max 200mm per move."}
-        cmd = await self._adapter.move_axis(axis, float(distance), int(speed))
+        cmd = await adapter.move_axis(axis, float(distance), int(speed))
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Moved {axis.upper()} {distance:+.1f}mm"
         return result
 
     async def _extrude(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         length = tool_input.get("length")
         speed = tool_input.get("speed", 300)
         if length is None:
             return {"error": "length is required"}
         if abs(length) > 100:
             return {"error": f"Length too large: {length}mm. Max 100mm per extrude."}
-        cmd = await self._adapter.extrude(float(length), int(speed))
+        cmd = await adapter.extrude(float(length), int(speed))
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             action = "Extruded" if length > 0 else "Retracted"
             result["message"] = f"{action} {abs(length):.1f}mm"
         return result
 
-    async def _motors_off(self, _input: dict) -> dict:
-        cmd = await self._adapter.motors_off()
+    async def _motors_off(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.motors_off()
         return self._cmd_result(cmd)
 
     # --- Speed/flow override ---
 
     async def _set_speed_override(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         percent = tool_input.get("percent")
         if percent is None:
             return {"error": "percent is required"}
         percent = int(percent)
         if percent < 10 or percent > 300:
             return {"error": f"Percent must be 10-300, got {percent}"}
-        cmd = await self._adapter.set_speed_override(percent)
+        cmd = await adapter.set_speed_override(percent)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Speed override set to {percent}%"
         return result
 
     async def _set_flow_override(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         percent = tool_input.get("percent")
         if percent is None:
             return {"error": "percent is required"}
         percent = int(percent)
         if percent < 50 or percent > 200:
             return {"error": f"Percent must be 50-200, got {percent}"}
-        cmd = await self._adapter.set_flow_override(percent)
+        cmd = await adapter.set_flow_override(percent)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Flow override set to {percent}%"
@@ -738,17 +918,25 @@ class ToolExecutor:
 
     # --- Macros ---
 
-    async def _list_macros(self, _input: dict) -> dict:
-        cmd = await self._adapter.list_macros()
+    async def _list_macros(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        cmd = await adapter.list_macros()
         if cmd.status != CommandResultStatus.SUCCESS:
             return self._cmd_result(cmd)
-        return {"macros": cmd.data or []}
+        return {"printer_id": printer_id, "macros": cmd.data or []}
 
     async def _execute_macro(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
         name = tool_input.get("name", "").strip()
         if not name:
             return {"error": "name is required"}
-        cmd = await self._adapter.execute_macro(name)
+        cmd = await adapter.execute_macro(name)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
             result["message"] = f"Executed macro: {name}"
@@ -756,23 +944,38 @@ class ToolExecutor:
 
     # --- System ---
 
-    async def _restart_firmware(self, _input: dict) -> dict:
-        cmd = await self._adapter.restart_firmware()
+    async def _restart_firmware(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.restart_firmware()
         result = self._cmd_result(cmd)
         result["warning"] = "Firmware restart initiated"
         return result
 
-    async def _restart_service(self, _input: dict) -> dict:
-        cmd = await self._adapter.restart_service()
+    async def _restart_service(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        _printer_id, adapter = selected
+        cmd = await adapter.restart_service()
         result = self._cmd_result(cmd)
         result["warning"] = "Klipper service restart initiated"
         return result
 
-    async def _get_system_info(self, _input: dict) -> dict:
-        cmd = await self._adapter.get_system_info()
+    async def _get_system_info(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+        cmd = await adapter.get_system_info()
         if cmd.status != CommandResultStatus.SUCCESS:
             return self._cmd_result(cmd)
-        return cmd.data or {}
+        result = cmd.data or {}
+        if isinstance(result, dict):
+            result.setdefault("printer_id", printer_id)
+        return result
 
     # --- Camera tools ---
 

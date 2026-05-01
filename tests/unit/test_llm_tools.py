@@ -120,6 +120,7 @@ class TestToolCatalogAndDispatch:
     def test_catalog_includes_expected_tools(self):
         printer_names = {tool["name"] for tool in PRINTER_TOOLS}
         camera_names = {tool["name"] for tool in CAMERA_TOOLS}
+        assert "list_printers" in printer_names
         assert "run_gcode" in printer_names
         assert "upload_to_printer" in printer_names
         assert "camera_snapshot" in camera_names
@@ -157,7 +158,7 @@ class TestPrinterQueryTools:
     @pytest.mark.asyncio
     async def test_get_printer_state(self, executor):
         payload = _load_json(await executor.execute("get_printer_state", {}))
-        assert payload == {"state": "IDLE_NO_ACTIVE_PRINT"}
+        assert payload == {"printer_id": "default", "state": "IDLE_NO_ACTIVE_PRINT"}
 
     @pytest.mark.asyncio
     async def test_get_print_progress(self, executor):
@@ -178,7 +179,7 @@ class TestPrinterQueryTools:
     async def test_get_z_offset_error_path(self, executor, mock_adapter):
         mock_adapter.get_z_offset.side_effect = RuntimeError("sensor unavailable")
         payload = _load_json(await executor.execute("get_z_offset", {}))
-        assert payload == {"error": "sensor unavailable"}
+        assert payload == {"printer_id": "default", "error": "sensor unavailable"}
 
     @pytest.mark.asyncio
     async def test_list_files_transforms_data(self, executor):
@@ -204,12 +205,51 @@ class TestPrinterQueryTools:
     @pytest.mark.asyncio
     async def test_get_system_info(self, executor):
         payload = _load_json(await executor.execute("get_system_info", {}))
-        assert payload == {"cpu_load": 0.21, "state": "ready"}
+        assert payload == {"cpu_load": 0.21, "state": "ready", "printer_id": "default"}
 
     @pytest.mark.asyncio
     async def test_list_macros(self, executor):
         payload = _load_json(await executor.execute("list_macros", {}))
-        assert payload == {"macros": ["PRINT_START", "CANCEL_PRINT"]}
+        assert payload == {"printer_id": "default", "macros": ["PRINT_START", "CANCEL_PRINT"]}
+
+    @pytest.mark.asyncio
+    async def test_list_printers_and_target_non_active(self, mock_adapter):
+        other = MagicMock()
+        other.get_print_progress = AsyncMock(
+            return_value=PrintProgress(
+                state=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
+                filename=None,
+                progress=None,
+            )
+        )
+        executor = ToolExecutor(
+            adapters={"neptune4max": mock_adapter, "rpi-printer": other},
+            active_printer="neptune4max",
+        )
+
+        printers = _load_json(await executor.execute("list_printers", {}))
+        assert printers["active_printer"] == "neptune4max"
+        assert [p["printer_id"] for p in printers["printers"]] == ["neptune4max", "rpi-printer"]
+
+        default_payload = _load_json(await executor.execute("get_print_progress", {}))
+        assert default_payload["printer_id"] == "neptune4max"
+        mock_adapter.get_print_progress.assert_called_once()
+
+        other_payload = _load_json(
+            await executor.execute("get_print_progress", {"printer_id": "rpi-printer"})
+        )
+        assert other_payload["printer_id"] == "rpi-printer"
+        assert other_payload["state"] == "IDLE_NO_ACTIVE_PRINT"
+        other.get_print_progress.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_printer_id_returns_clear_error(self, mock_adapter):
+        executor = ToolExecutor(adapters={"neptune4max": mock_adapter}, active_printer="neptune4max")
+        payload = _load_json(
+            await executor.execute("get_print_progress", {"printer_id": "rpi-printer"})
+        )
+        assert "Unknown printer_id 'rpi-printer'" in payload["error"]
+        assert "neptune4max" in payload["error"]
 
 
 class TestPrinterControlTools:
