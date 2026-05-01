@@ -5,6 +5,10 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+
+from sensing_voxel.config import ShellToolConfig as ConfigShellToolConfig
+from sensing_voxel.config import WebSearchToolConfig as ConfigWebSearchToolConfig
 
 from sensing_voxel.core.models import (
     CommandResult,
@@ -16,7 +20,10 @@ from sensing_voxel.llm import tools as llm_tools
 from sensing_voxel.llm.tools import (
     CAMERA_TOOLS,
     PRINTER_TOOLS,
+    SYSTEM_TOOLS,
+    ShellToolConfig,
     ToolExecutor,
+    WebSearchToolConfig,
     validate_gcode_command,
 )
 
@@ -122,7 +129,10 @@ class TestToolCatalogAndDispatch:
         camera_names = {tool["name"] for tool in CAMERA_TOOLS}
         assert "list_printers" in printer_names
         assert "run_gcode" in printer_names
+        system_names = {tool["name"] for tool in SYSTEM_TOOLS}
         assert "upload_to_printer" in printer_names
+        assert "run_bash" in system_names
+        assert "web_search" in system_names
         assert "camera_snapshot" in camera_names
         assert "camera_move_to" in camera_names
 
@@ -152,6 +162,81 @@ class TestToolCatalogAndDispatch:
         result = await executor.execute("camera_snapshot", {})
         assert isinstance(result, dict)
         assert result["content"][0]["source"]["type"] == "base64"
+
+
+class TestSystemUtilityTools:
+    @pytest.mark.asyncio
+    async def test_run_bash_executes_harmless_command(self, tmp_path):
+        executor = ToolExecutor(
+            shell=ShellToolConfig(enabled=True, cwd=str(tmp_path), timeout_seconds=2)
+        )
+        payload = _load_json(await executor.execute("run_bash", {"command": "pwd && echo ok"}))
+
+        assert payload["exit_code"] == 0
+        assert payload["cwd"] == str(tmp_path.resolve())
+        assert "ok" in payload["stdout"]
+        assert payload["timed_out"] is False
+
+    def test_executor_accepts_config_dataclasses(self, tmp_path):
+        executor = ToolExecutor(
+            shell=ConfigShellToolConfig(enabled=True, cwd=str(tmp_path)),
+            web_search=ConfigWebSearchToolConfig(
+                enabled=True, searxng_url="http://searxng:8080"
+            ),
+        )
+
+        assert executor._shell_config.enabled is True
+        assert executor._shell_config.cwd == str(tmp_path)
+        assert executor._web_search_config.enabled is True
+        assert executor._web_search_config.searxng_url == "http://searxng:8080"
+
+    @pytest.mark.asyncio
+    async def test_run_bash_rejects_cwd_escape(self, tmp_path):
+        executor = ToolExecutor(shell=ShellToolConfig(enabled=True, cwd=str(tmp_path)))
+        payload = _load_json(await executor.execute("run_bash", {"command": "pwd", "cwd": ".."}))
+
+        assert "cwd must stay under" in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_web_search_returns_searxng_results(self, aiohttp_client):
+        async def handler(request):
+            assert request.query["q"] == "sensing voxel"
+            return web.json_response(
+                {
+                    "results": [
+                        {
+                            "title": "Result A",
+                            "url": "https://example.com/a",
+                            "content": "Snippet A",
+                            "engine": "mock",
+                        },
+                        {
+                            "title": "Result B",
+                            "url": "https://example.com/b",
+                            "content": "Snippet B",
+                        },
+                    ]
+                }
+            )
+
+        app = web.Application()
+        app.router.add_get("/search", handler)
+        client = await aiohttp_client(app)
+        executor = ToolExecutor(
+            web_search=WebSearchToolConfig(
+                enabled=True,
+                searxng_url=str(client.make_url("/")),
+                max_results=1,
+            )
+        )
+
+        payload = _load_json(
+            await executor.execute("web_search", {"query": "sensing voxel", "max_results": 5})
+        )
+
+        assert payload["query"] == "sensing voxel"
+        assert payload["count"] == 1
+        assert payload["results"][0]["title"] == "Result A"
 
 
 class TestPrinterQueryTools:

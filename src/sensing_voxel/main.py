@@ -158,6 +158,8 @@ async def main() -> None:
             active_printer=active_printer,
             camera=tapo_camera,
             rtsp_url=config.dashboard.camera_rtsp_url,
+            shell=config.llm.shell,
+            web_search=config.llm.web_search,
             max_turns=config.llm.max_conversation_turns,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
         )

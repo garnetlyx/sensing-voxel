@@ -9,9 +9,11 @@ import base64
 import json
 import logging
 import os
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import CommandResultStatus
@@ -22,6 +24,75 @@ logger = logging.getLogger(__name__)
 # Safety limits (kept for tool schema descriptions)
 NOZZLE_TEMP_MAX = 300
 BED_TEMP_MAX = 120
+
+
+@dataclass
+class ShellToolConfig:
+    """Configuration for the run_bash LLM tool."""
+
+    enabled: bool = False
+    cwd: str = "/app"
+    timeout_seconds: float = 10.0
+    max_output_chars: int = 8000
+
+
+@dataclass
+class WebSearchToolConfig:
+    """Configuration for the web_search LLM tool."""
+
+    enabled: bool = False
+    searxng_url: str | None = None
+    timeout_seconds: float = 10.0
+    max_results: int = 5
+
+
+SYSTEM_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "run_bash",
+        "description": (
+            "Run a short bash command inside the Sensing Voxel container for diagnostics, "
+            "file inspection, and harmless local automation. Do not use for destructive actions "
+            "unless the user explicitly confirms."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Bash command to run",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory under the configured shell root",
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "description": "Optional timeout in seconds",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web through a configured SearXNG JSON API instance.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return",
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional search language, e.g. en or zh",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+]
 
 
 PRINTER_TOOLS: list[dict[str, Any]] = [
@@ -469,6 +540,8 @@ class ToolExecutor:
         rtsp_url: str | None = None,
         adapters: dict[str, PrinterAdapter] | None = None,
         active_printer: str | None = None,
+        shell: ShellToolConfig | dict[str, Any] | None = None,
+        web_search: WebSearchToolConfig | dict[str, Any] | None = None,
     ):
         if adapters is None:
             adapters = {}
@@ -482,6 +555,8 @@ class ToolExecutor:
         self._adapter = adapters.get(self._active_printer) if self._active_printer else adapter
         self._camera: Any | None = camera
         self._rtsp_url: str | None = rtsp_url
+        self._shell_config = self._coerce_shell_config(shell)
+        self._web_search_config = self._coerce_web_search_config(web_search)
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
@@ -523,6 +598,32 @@ class ToolExecutor:
             )
         if rtsp_url:
             self._dispatch["camera_snapshot"] = self._camera_snapshot
+        if self._shell_config.enabled:
+            self._dispatch["run_bash"] = self._run_bash
+        if self._web_search_config.enabled:
+            self._dispatch["web_search"] = self._web_search
+
+    @staticmethod
+    def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
+        if config is None:
+            return ShellToolConfig()
+        if isinstance(config, ShellToolConfig):
+            return config
+        if is_dataclass(config):
+            return ShellToolConfig(**asdict(config))
+        return ShellToolConfig(**config)
+
+    @staticmethod
+    def _coerce_web_search_config(
+        config: WebSearchToolConfig | dict[str, Any] | None,
+    ) -> WebSearchToolConfig:
+        if config is None:
+            return WebSearchToolConfig()
+        if isinstance(config, WebSearchToolConfig):
+            return config
+        if is_dataclass(config):
+            return WebSearchToolConfig(**asdict(config))
+        return WebSearchToolConfig(**config)
 
     async def execute(self, tool_name: str, tool_input: dict | None) -> str | dict:
         """Execute a tool call and return JSON string or structured content blocks."""
@@ -976,6 +1077,101 @@ class ToolExecutor:
         if isinstance(result, dict):
             result.setdefault("printer_id", printer_id)
         return result
+
+
+    # --- System utility tools ---
+
+    async def _run_bash(self, tool_input: dict) -> dict:
+        command = str(tool_input.get("command", "")).strip()
+        if not command:
+            return {"error": "command is required"}
+
+        timeout = min(
+            float(tool_input.get("timeout_seconds") or self._shell_config.timeout_seconds),
+            self._shell_config.timeout_seconds,
+        )
+        root = Path(self._shell_config.cwd).resolve()
+        requested_cwd = tool_input.get("cwd") or "."
+        cwd = (root / str(requested_cwd)).resolve()
+        if cwd != root and root not in cwd.parents:
+            return {"error": f"cwd must stay under {root}"}
+        if not cwd.exists() or not cwd.is_dir():
+            return {"error": f"cwd does not exist: {cwd}"}
+
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            "-lc",
+            command,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            timed_out = True
+            proc.kill()
+            stdout_b, stderr_b = await proc.communicate()
+
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        truncated = False
+        max_chars = self._shell_config.max_output_chars
+        if len(stdout) > max_chars:
+            stdout = stdout[:max_chars] + "\n... [stdout truncated]"
+            truncated = True
+        if len(stderr) > max_chars:
+            stderr = stderr[:max_chars] + "\n... [stderr truncated]"
+            truncated = True
+
+        return {
+            "command": command,
+            "cwd": str(cwd),
+            "exit_code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+            "truncated": truncated,
+        }
+
+    async def _web_search(self, tool_input: dict) -> dict:
+        query = str(tool_input.get("query", "")).strip()
+        if not query:
+            return {"error": "query is required"}
+        if not self._web_search_config.searxng_url:
+            return {"error": "web_search is enabled but searxng_url is not configured"}
+
+        max_results = int(tool_input.get("max_results") or self._web_search_config.max_results)
+        max_results = max(1, min(max_results, self._web_search_config.max_results))
+        params = {"q": query, "format": "json"}
+        if tool_input.get("language"):
+            params["language"] = str(tool_input["language"])
+
+        base_url = self._web_search_config.searxng_url.rstrip("/") + "/"
+        url = urljoin(base_url, "search")
+        timeout = self._web_search_config.timeout_seconds
+
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return {"error": f"SearXNG request failed: HTTP {resp.status}", "details": text[:500]}
+                payload = await resp.json()
+
+        results = []
+        for item in payload.get("results", [])[:max_results]:
+            results.append(
+                {
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "content": item.get("content") or item.get("snippet"),
+                    "engine": item.get("engine"),
+                }
+            )
+        return {"query": query, "results": results, "count": len(results)}
 
     # --- Camera tools ---
 

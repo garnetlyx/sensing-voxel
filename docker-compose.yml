@@ -43,6 +43,9 @@ services:
       - SV_LLM_ENABLED=${SV_LLM_ENABLED:-false}
       - SV_LLM_API_KEY=${SV_LLM_API_KEY:-}
       - SV_LLM_MODEL=${SV_LLM_MODEL:-claude-sonnet-4-20250514}
+      - SV_LLM_SHELL_ENABLED=${SV_LLM_SHELL_ENABLED:-true}
+      - SV_LLM_WEB_SEARCH_ENABLED=${SV_LLM_WEB_SEARCH_ENABLED:-true}
+      - SV_LLM_SEARXNG_URL=${SV_LLM_SEARXNG_URL:-http://searxng:8080}
 
     volumes:
       - ./config:/app/config:ro
@@ -65,10 +68,21 @@ services:
       retries: 3
       start_period: 40s
 
+  searxng:
+    image: searxng/searxng:latest
+    container_name: sensing-voxel-searxng
+    restart: unless-stopped
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    volumes:
+      - searxng-data:/etc/searxng
+
 volumes:
   sensing-voxel-data:
     driver: local
   sensing-voxel-uploads:
     driver: local
   sensing-voxel-models:
+    driver: local
+  searxng-data:
     driver: local

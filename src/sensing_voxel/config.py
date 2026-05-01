@@ -150,6 +150,26 @@ class DashboardConfig:
 
 
 @dataclass
+class ShellToolConfig:
+    """LLM bash execution tool configuration."""
+
+    enabled: bool = False
+    cwd: str = "/app"
+    timeout_seconds: float = 10.0
+    max_output_chars: int = 8000
+
+
+@dataclass
+class WebSearchToolConfig:
+    """LLM web search tool configuration."""
+
+    enabled: bool = False
+    searxng_url: str | None = None
+    timeout_seconds: float = 10.0
+    max_results: int = 5
+
+
+@dataclass
 class LlmConfig:
     """LLM API configuration (Anthropic-compatible)"""
 
@@ -162,6 +182,8 @@ class LlmConfig:
     timeout_seconds: int = 30
     max_conversation_turns: int = 20
     enabled: bool = False
+    shell: ShellToolConfig = field(default_factory=ShellToolConfig)
+    web_search: WebSearchToolConfig = field(default_factory=WebSearchToolConfig)
 
 
 @dataclass
@@ -289,6 +311,10 @@ class Config:
                 llm_data = value.copy()
                 if isinstance(llm_data.get("provider"), str):
                     llm_data["provider"] = LlmProvider(llm_data["provider"])
+                if isinstance(llm_data.get("shell"), dict):
+                    llm_data["shell"] = ShellToolConfig(**llm_data["shell"])
+                if isinstance(llm_data.get("web_search"), dict):
+                    llm_data["web_search"] = WebSearchToolConfig(**llm_data["web_search"])
                 parsed["llm"] = LlmConfig(**llm_data)
             elif key in section_map and isinstance(value, dict):
                 parsed[key] = section_map[key](**value)

@@ -117,6 +117,8 @@ class ChatManager:
         active_printer: str | None = None,
         camera=None,
         rtsp_url: str | None = None,
+        shell=None,
+        web_search=None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
         history_path: Path | None = None,
@@ -132,19 +134,25 @@ class ChatManager:
         self._history_path = history_path or Path("data/chat_history.json")
         self._sessions: dict[int, ChatSession] = {}
 
-        # Create tool executor if at least one printer adapter is available
+        # Create tool executor when printer, camera, or system tools are available
         self._tool_executor = None
         self._tools = None
-        if self._adapters:
-            from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
+        if self._adapters or camera or rtsp_url or shell or web_search:
+            from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, SYSTEM_TOOLS, ToolExecutor
 
             self._tool_executor = ToolExecutor(
                 adapters=self._adapters,
                 active_printer=self._active_printer,
                 camera=camera,
                 rtsp_url=rtsp_url,
+                shell=shell,
+                web_search=web_search,
             )
-            self._tools = list(PRINTER_TOOLS)
+            self._tools = list(PRINTER_TOOLS) if self._adapters else []
+            if getattr(self._tool_executor._shell_config, "enabled", False):
+                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "run_bash"])
+            if getattr(self._tool_executor._web_search_config, "enabled", False):
+                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "web_search"])
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
 

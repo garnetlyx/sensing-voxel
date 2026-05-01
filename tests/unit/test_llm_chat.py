@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from sensing_voxel.llm.chat import ChatManager, ChatSession, MAX_TELEGRAM_MESSAGE_LENGTH
+from sensing_voxel.llm.tools import ShellToolConfig, WebSearchToolConfig
 
 
 class TestChatSession:
@@ -201,6 +202,22 @@ class TestChatManagerToolUse:
         assert manager._tool_executor is not None
         assert manager._tool_executor._adapters == {"default": adapter}
         assert manager._tool_executor._active_printer == "default"
+
+    def test_includes_enabled_system_tools(self, mock_tool_client, mock_context_collector):
+        adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapter=adapter,
+            shell=ShellToolConfig(enabled=True),
+            web_search=WebSearchToolConfig(enabled=True, searxng_url="http://searxng:8080"),
+            max_turns=20,
+        )
+
+        tool_names = {tool["name"] for tool in manager._tools}
+        assert "run_bash" in tool_names
+        assert "web_search" in tool_names
 
     async def test_tool_use_single_round(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """LLM calls a tool, gets the result, then produces a final text response."""
