@@ -201,40 +201,47 @@ This vision is delivered in phases:
 
 ### 4.1 Must Have (MVP)
 
-- [x] Telegram bot workflow with upload validation, inline decisions, configurable timeout handling, and **user allowlist authentication** (~70%).
-- [x] Klipper/Moonraker printer adapter with compatibility mode for older/modified Moonraker APIs (~90%).
-- [x] Bambu printer adapter (minimal): start, pause, cancel, status via local MQTT + FTP/FTPS (~80%).
+Legend: `[x]` wired into runtime · `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented. See `docs/ARCHITECTURE.md` §9 and `.project/TODO.md` for the wiring plan.
+
+- [x] Telegram bot workflow with upload validation, inline decisions, configurable timeout handling, and **user allowlist authentication**.
+- [x] Klipper/Moonraker printer adapter with compatibility mode for older/modified Moonraker APIs.
+- [x] Bambu printer adapter (minimal): start, pause, cancel, status via local MQTT + FTP/FTPS.
 - [x] Shared printer adapter interface contract (abstract base for Klipper and Bambu adapters).
-- [ ] STL slicing pipeline with parameter extraction (`FirstLayerParams`, `FirstLayerBounds`) for agent-started jobs.
-- [ ] Camera calibration lifecycle: checkerboard calibration, artifact storage, validity checking, `/calibrate_camera` command.
-- [ ] First-layer auto-correction for agent-started jobs only, with saturation exit behavior.
-- [ ] NOTHING detection with pause/cancel policy and emergency bypass path.
+- [~] STL/STEP/3MF slicing pipeline with parameter extraction (`FirstLayerParams`, `FirstLayerBounds`) for agent-started jobs. **Module-complete** (`slicer/`); not yet invoked from the Telegram upload flow.
+- [~] Camera calibration lifecycle: checkerboard calibration, artifact storage, validity checking, `/calibrate_camera` command. **Module-complete** (`vision/calibration.py`); not yet wired into `MonitoringOrchestrator`.
+- [~] First-layer auto-correction for agent-started jobs only, with saturation exit behavior. **Module-complete** (`vision/first_layer.py`, `monitoring/z_offset.py`); not yet wired.
+- [~] NOTHING detection with pause/cancel policy and emergency bypass path. **Module-complete** (`vision/NOTHING.py`); `MonitoringOrchestrator` not started by `main.py`.
 - [x] Decision idempotency with lock-guarded CAS helper across callbacks/timeouts/recovery.
 - [x] Persistent state snapshots (JSON) with safe IDLE reset policy preserving safety flags.
 - [x] Z-offset baseline capture/restore contract with verification, dirty-state print blocking, and `/reset_z_offset [target_mm]`.
 - [x] External print detection with NOTHING-only monitoring policy.
 - [x] Moonraker WebSocket reconnection with backoff and state reconciliation.
-- [x] **LLM chat with 31 tool-use functions** for natural language printer control (added post-PRD).
+- [x] **LLM chat with 31+ tool-use functions** for natural language printer control, including SearXNG-backed `web_search` (added post-PRD).
 - [x] **PTZ camera control** via ONVIF for Tapo C220 (added post-PRD).
 - [x] **Web dashboard API** with REST, WebSocket, MJPEG proxy (added post-PRD).
 
 ### 4.2 Phase 2 — Platform Maturity
 
-- [ ] STEP/3MF intake support alongside STL.
-- [ ] Audio anomaly detection (YAMNet): stepper skip, glass crack, filament grind/click → `M112` emergency stop (UC-03).
-- [ ] Closed-loop calibration tower scoring and `SAVE_CONFIG` injection of optimal temp/flow values (UC-05).
-- [ ] Filament spool monitoring: secondary USB camera estimates remaining spool volume to prevent runouts, and visually detects crossed-filament tangles to pause before extruder jam (UC-09).
-- [ ] Full Bambu adapter command parity and richer telemetry.
-- [ ] SQLite job history and analytics storage.
-- [ ] Multi-printer queue scheduling dashboard.
-- [ ] Predictive maintenance via `SHAPER_CALIBRATE` drift tracking (UC-06).
+Legend: `[x]` wired into runtime · `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented.
+
+- [~] STEP/3MF intake support alongside STL. **Module-complete** (`slicer/converter.py`); awaiting slicer wiring into upload flow.
+- [~] Audio anomaly detection (YAMNet): stepper skip, glass crack, filament grind/click → `M112` emergency stop (UC-03). **Module-complete** (`audio/`); no `AudioConfig` dataclass yet — see `.project/TODO.md` T2.1.
+- [~] Closed-loop calibration tower scoring and `SAVE_CONFIG` injection of optimal temp/flow values (UC-05). **Module-complete** (`calibration/`); not wired behind `/calibrate`.
+- [~] Filament spool monitoring: secondary USB camera estimates remaining spool volume to prevent runouts, and visually detects crossed-filament tangles to pause before extruder jam (UC-07). **Module-complete** (`vision/filament.py`, `vision/usb_camera.py`); not wired.
+- [x] Full Bambu adapter command parity and richer telemetry. Adapter is code-complete and lazy-instantiated; `default.yaml` does not enable a Bambu config section.
+- [~] SQLite job history and analytics storage. **Module-complete** (`storage/`); repositories not attached to dashboard app state.
+- [~] Multi-printer queue scheduling dashboard. **Module-complete** (`queue/`); `QueueManager` not attached to app state.
+- [~] Predictive maintenance via `SHAPER_CALIBRATE` drift tracking (UC-06). **Module-complete** (`monitoring/maintenance.py`); not wired to calibration events or storage.
 
 ### 4.3 Future (Phase 3) — Photo-to-Print
 
-- [ ] Image-to-3D generation via external AI model APIs (TripoSR, Meshy, Tripo3D, or equivalent).
-- [ ] Automated mesh repair pipeline: manifold repair, thin-wall thickening, orientation optimization.
-- [ ] Printability analysis and gate (reject unprintable meshes before slicing).
-- [ ] 3D preview rendering for Telegram (thumbnail of generated model before approval).
+Legend: `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented.
+
+- [~] Image-to-3D generation via external AI model APIs (TripoSR, Meshy, Tripo3D, or equivalent). **Module-complete** (`modeling/image_to_3d.py`); not wired behind feature flag.
+- [~] Automated mesh repair pipeline: manifold repair, thin-wall thickening, orientation optimization. **Module-complete** (`modeling/repair.py`, `modeling/orientation.py`, `modeling/support_analysis.py`); trimesh + Blender + MeshLab backends.
+- [~] Printability analysis and gate (reject unprintable meshes before slicing). **Module-complete** (`modeling/support_analysis.py`).
+- [~] 3D preview rendering for Telegram (thumbnail of generated model before approval). **Module-complete** (`modeling/preview.py`).
+- [~] End-to-end photo-to-print pipeline orchestration with Telegram approval flow. **Module-complete** (`modeling/pipeline.py`, 8 stages); not wired into Telegram photo handling.
 - [ ] Multi-view / text-prompt enhancement for higher-quality 3D generation.
 - [ ] Sketch-to-print support (hand-drawn sketches as input alongside photos).
 
@@ -267,10 +274,11 @@ This vision is delivered in phases:
 - **BambuLab P1SC, A1C, H2C**: Local MQTT + FTP/FTPS interface (no Klipper/Moonraker).
 
 ### Cameras
-- **Blurams PTZ Dome Security Camera**: IP camera, RTSP/WebRTC stream.
+- **Tapo C220**: Primary PTZ camera. ONVIF control via `camera/tapo.py`. RTSP stream for vision pipeline.
+- **Blurams PTZ Dome Security Camera**: IP camera, RTSP/WebRTC stream (RTSP fallback path).
 - **Wyze Camera**: IP camera, RTSP stream (via firmware or bridge).
 
-> Note: Vision module must support RTSP network streams. If native support is insufficient, USB webcam alternatives (e.g., Logitech C920/C270) should be considered as fallback.
+> Note: Vision module supports RTSP network streams. Tapo C220 is the only camera with first-class PTZ integration today; Blurams/Wyze operate as RTSP-only input. If native support is insufficient, USB webcam alternatives (e.g., Logitech C920/C270) are supported via `vision/usb_camera.py` for filament monitoring.
 
 ---
 
