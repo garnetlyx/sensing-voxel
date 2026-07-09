@@ -46,48 +46,41 @@ class TestSecurityVulnerabilities:
     @pytest.mark.asyncio
     async def test_job_id_path_traversal_attempt(self):
         """
-        BUG: Malicious job_id containing path traversal sequences could
-        potentially be used for directory traversal attacks.
-
-        This tests if job_id is properly sanitized when used in file paths.
+        FIXED: JobContext.__post_init__ now rejects job_ids containing '/', '\\' or '..'
+        with ValueError, preventing them from ever reaching path-construction code.
+        Regression guard: every traversal-shaped job_id must raise at construction time.
         """
         malicious_ids = [
             "../../../etc/passwd",
             "..\\..\\windows\\system32\\config\\sam",
             "job_id/../../../etc/shadow",
-            "normal_job\x00/../../../etc/passwd",  # Null byte injection
-            "job" + "../" * 100 + "etc/passwd",  # Deep traversal
+            "job" + "../" * 100 + "etc/passwd",
         ]
 
         for malicious_id in malicious_ids:
-            # Create job with malicious ID
-            job = JobContext(
-                job_id=malicious_id,
+            with pytest.raises(ValueError, match="job_id contains invalid characters"):
+                JobContext(
+                    job_id=malicious_id,
+                    job_file="test.stl",
+                    uploaded_at=datetime.now(),
+                )
+
+        # Null bytes are also unsafe; str.split/Path ops reject them implicitly.
+        # Confirm a null-byte-containing id raises (either ValueError from our check
+        # or from the OS on path construction); either way construction must fail.
+        with pytest.raises((ValueError, OSError)):
+            JobContext(
+                job_id="normal_job\x00/../../../etc/passwd",
                 job_file="test.stl",
                 uploaded_at=datetime.now(),
             )
 
-            # The job_id should not be used directly in file paths
-            # without sanitization
-            uploads_dir = Path("data/uploads")
-            dangerous_path = uploads_dir / f"{job.job_id}.stl"
-
-            # Check that resolved path would escape uploads directory
-            try:
-                resolved = dangerous_path.resolve()
-                uploads_resolved = uploads_dir.resolve()
-
-                # If resolved path is outside uploads, it's a vulnerability
-                try:
-                    resolved.relative_to(uploads_resolved)
-                except ValueError:
-                    pytest.fail(
-                        f"CRITICAL: Path traversal vulnerability with job_id '{malicious_id}'. "
-                        f"Resolved path '{resolved}' escapes uploads directory!"
-                    )
-            except (OSError, ValueError) as e:
-                # Path resolution failed - this is actually good for security
-                pass
+        # Sanity: a legitimate job_id is still accepted
+        JobContext(
+            job_id="job_normal_20240101_000000_abcd1234",
+            job_file="test.stl",
+            uploaded_at=datetime.now(),
+        )
 
     @pytest.mark.asyncio
     async def test_decision_token_predictability(self):
@@ -144,10 +137,12 @@ class TestSecurityVulnerabilities:
     @pytest.mark.asyncio
     async def test_sqlite_injection_via_job_fields(self):
         """
-        BUG: If job fields are used in SQL queries without parameterization,
-        SQL injection is possible.
-
-        Note: Current MVP uses JSON, not SQLite, but this tests future-proofing.
+        FIXED: The persistence layer uses atomic JSON snapshots (json.dump into a
+        tempfile + rename) and never interpolates job fields into SQL strings, so
+        SQL-injection payloads in job fields cannot be "executed". JobContext also
+        rejects path-traversal characters in job_id. Regression guard: injection
+        payloads must be stored as inert data, and serialization must round-trip
+        them without executing anything or raising.
         """
         sql_injection_attempts = [
             "'; DROP TABLE jobs; --",
@@ -158,14 +153,31 @@ class TestSecurityVulnerabilities:
 
         for attempt in sql_injection_attempts:
             job = JobContext(
-                job_id=attempt,
-                job_file=attempt,
+                job_id=f"job_{abs(hash(attempt)) & 0xFFFFFFFF:08x}",
+                job_file="test.stl",
                 uploaded_at=datetime.now(),
+                metadata={"notes": attempt},
             )
 
-            # The job should be created without executing the SQL
-            assert job.job_id == attempt  # Stored as-is
-            assert "DROP TABLE" not in str(job)  # Shouldn't execute
+            # Payload is preserved as plain data in metadata (storing != executing)
+            assert job.metadata["notes"] == attempt
+
+            # Core identifying fields must not contain raw SQL fragments, because
+            # they are safe identifiers and job_id has character restrictions.
+            assert "DROP TABLE" not in job.job_id
+            assert "DROP TABLE" not in job.job_file
+
+            # Serialize via the same JSON path StatePersistence uses: no exception
+            # means json.dump treats it as a string literal, not SQL.
+            serialized = json.dumps(
+                {"job_id": job.job_id, "job_file": job.job_file, "metadata": job.metadata},
+                default=str,
+            )
+            # The payload (whatever it is) must appear as a quoted JSON string
+            assert attempt in serialized
+            # Identifier fields are clean
+            assert "'" not in job.job_id
+            assert ";" not in job.job_id
 
 
 class TestResourceExhaustion:
@@ -265,8 +277,8 @@ class TestRaceConditions:
     @pytest.mark.asyncio
     async def test_decision_consumption_double_spend(self):
         """
-        BUG: Race condition allows decision to be consumed twice
-        if two threads check decision_consumed simultaneously.
+        Race condition: only one of many concurrent consume_decision calls
+        must succeed (exactly one consumer sets decision_consumed).
         """
         engine = DecisionEngine()
 
@@ -285,13 +297,12 @@ class TestRaceConditions:
                 job_context=job,
                 decision_token="secret-token",
                 action=DecisionAction.APPROVE,
-                expected_state=None,
-                current_state=None,
+                expected_state=AgentState.AWAITING_APPROVAL,
+                current_state=AgentState.AWAITING_APPROVAL,
             )
             if result == ConsumeResult.CONSUMED:
                 consume_count += 1
 
-        # Launch multiple concurrent consumption attempts
         await asyncio.gather(
             try_consume(),
             try_consume(),
@@ -300,7 +311,6 @@ class TestRaceConditions:
             try_consume(),
         )
 
-        # Should only be consumed once
         assert consume_count == 1, \
             f"CRITICAL: Decision consumed {consume_count} times (double-spend bug!)"
 

@@ -81,14 +81,13 @@ class TestDecisionEngineBugs:
     @pytest.mark.asyncio
     async def test_memory_leak_decision_locks_never_cleaned(self, engine):
         """
-        BUG: _decision_locks dictionary grows without bound.
-        Each unique job_id creates a lock that is never removed.
-
-        This test will fail because locks accumulate forever.
+        FIXED: DecisionEngine now cleans up per-job entries in _decision_locks
+        (and _timeout_tasks) after consume_decision completes, invalid-token returns,
+        or error paths. Regression guard: processing many jobs must not grow the map
+        without bound.
         """
         initial_count = len(engine._decision_locks)
 
-        # Simulate many jobs being processed
         for i in range(100):
             job_id = f"job-{i}"
             job_context = JobContext(
@@ -97,18 +96,33 @@ class TestDecisionEngineBugs:
                 uploaded_at=datetime.now(),
                 decision_token=f"token-{i}",
             )
-
-            # Get lock for this job
             lock = engine._get_lock(job_id)
             assert lock is not None
 
-        # BUG: After 100 jobs, we have 100 locks that will never be cleaned
-        final_count = len(engine._decision_locks)
+        # Locks were created for all 100 jobs via _get_lock
+        assert len(engine._decision_locks) == initial_count + 100
 
-        # This assertion will fail - locks are never cleaned
-        assert final_count < 50, (
-            f"BUG: Memory leak - {final_count} locks accumulated and never cleaned. "
-            "DecisionEngine._decision_locks grows without bound."
+        # Now consume decisions; locks must be cleaned up afterward
+        for i in range(100):
+            job_id = f"job-{i}"
+            job_context = JobContext(
+                job_id=job_id,
+                job_file="test.stl",
+                uploaded_at=datetime.now(),
+                decision_token=f"token-{i}",
+            )
+            await engine.consume_decision(
+                job_context=job_context,
+                decision_token=f"token-{i}",
+                action=DecisionAction.APPROVE,
+                expected_state=AgentState.AWAITING_APPROVAL,
+                current_state=AgentState.AWAITING_APPROVAL,
+            )
+
+        final_count = len(engine._decision_locks)
+        assert final_count == initial_count, (
+            f"Memory leak regression: {final_count} locks remain after consuming all jobs; "
+            "locks must be cleaned up when decisions are fully consumed."
         )
 
     @pytest.mark.asyncio
@@ -146,21 +160,17 @@ class TestDecisionEngineBugs:
     @pytest.mark.asyncio
     async def test_timeout_handler_missing_exception_handling(self, engine, job_context):
         """
-        BUG: _timeout_handler doesn't handle exceptions from consume_decision.
-        If consume_decision raises, the exception propagates and kills the task.
-
-        This test will fail because the exception is not caught.
+        _timeout_handler must swallow exceptions from consume_decision so that
+        a failing decision does not kill the background timeout task.
         """
-        # Patch consume_decision to raise an exception
+        engine._approval_timeout = 0.01
+
         with patch.object(engine, 'consume_decision', side_effect=RuntimeError("Simulated error")):
-            # Manually create and run timeout handler
             handler_task = asyncio.create_task(
                 engine._timeout_handler("test-123", job_context, DecisionAction.TIMEOUT_APPROVAL)
             )
 
-            # BUG: The exception will propagate and this will raise
-            with pytest.raises(RuntimeError, match="Simulated error"):
-                await handler_task
+            await asyncio.wait_for(handler_task, timeout=5)
 
     @pytest.mark.asyncio
     async def test_schedule_timeout_doesnt_check_task_done(self, engine, job_context):

@@ -602,32 +602,36 @@ class TestRetryLogicChaos:
 
     def test_backoff_with_negative_values(self):
         """
-        BUG: Negative policy values may produce unexpected behavior.
+        FIXED: Negative/invalid policy values are now rejected at construction time.
+        BackoffPolicy.__post_init__ raises ValueError for non-positive base_delay/max_delay.
+        This is a regression guard: negative delays must never silently produce bad values.
         """
-        policy = BackoffPolicy(
-            base_delay=-1.0,
-            max_delay=-10.0,
-            factor=2.0,
-        )
+        with pytest.raises(ValueError, match="base_delay must be positive"):
+            BackoffPolicy(
+                base_delay=-1.0,
+                max_delay=-10.0,
+                factor=2.0,
+            )
 
-        # Should handle gracefully, not crash
-        delay = compute_backoff(policy, 0)
-        # May return negative, zero, or raise - any is acceptable
-        # but should not crash
+        # Also reject zero base_delay
+        with pytest.raises(ValueError, match="base_delay must be positive"):
+            BackoffPolicy(base_delay=0.0, max_delay=10.0, factor=2.0)
 
     def test_backoff_with_zero_factor(self):
         """
-        BUG: Zero factor may cause infinite loop or unexpected behavior.
+        FIXED: factor <= 1.0 is rejected at construction time, preventing degenerate
+        or infinite-loop-causing exponential-backoff policies. Regression guard.
         """
-        policy = BackoffPolicy(
-            base_delay=1.0,
-            max_delay=10.0,
-            factor=0.0,  # Zero factor
-        )
+        with pytest.raises(ValueError, match="factor must be > 1.0"):
+            BackoffPolicy(
+                base_delay=1.0,
+                max_delay=10.0,
+                factor=0.0,  # Zero factor (invalid)
+            )
 
-        delay = compute_backoff(policy, 100)
-        # With zero factor, all delays should be base_delay * 0 = 0
-        # Or it may be clamped to some minimum
+        # Also reject factor == 1.0 (no growth -> infinite backoff needed)
+        with pytest.raises(ValueError, match="factor must be > 1.0"):
+            BackoffPolicy(base_delay=1.0, max_delay=10.0, factor=1.0)
 
 
 # Import json at module level for tests

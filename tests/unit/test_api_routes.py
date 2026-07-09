@@ -716,7 +716,9 @@ async def test_api_with_auth_token(aiohttp_client):
         "/api/v1/printers",
         headers={"Authorization": "Bearer wrong_token"},
     )
-    assert resp.status == 403
+    # Invalid bearer token is an authentication failure (401) per RFC 7235,
+    # not an authorization failure (403). 403 is for authenticated-but-forbidden.
+    assert resp.status == 401
 
     resp = await client.get(
         "/api/v1/printers",

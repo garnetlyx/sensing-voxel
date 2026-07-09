@@ -223,29 +223,16 @@ class TestPersistenceNewBugs:
 
     def test_signal_handler_systemexit_fixed(self):
         """
-        VERIFICATION: Signal handler SystemExit issue has been fixed.
-
-        Current implementation no longer raises SystemExit in signal handler.
-        Instead, it logs the signal and relies on finally blocks for cleanup.
-
-        This prevents unclean shutdown and data corruption risks.
+        FIXED: The buggy _signal_handler method has been removed from StatePersistence.
+        Signal handling responsibility moved to main.py, so the dangerous/incorrect
+        SystemExit-related code no longer exists on the class. Regression guard.
         """
         from sensing_voxel.core.persistence import StatePersistence
-        import inspect
 
-        # Check the signal handler implementation
-        source = inspect.getsource(StatePersistence._signal_handler)
-
-        # Verify it does NOT raise SystemExit
-        assert 'raise SystemExit' not in source, \
-            "Signal handler should not raise SystemExit"
-
-        assert 'SystemExit(' not in source, \
-            "Signal handler should not raise SystemExit"
-
-        # Verify it handles the signal gracefully
-        assert 'logger.info' in source or 'pass' in source, \
-            "Signal handler should log or pass gracefully"
+        assert not hasattr(StatePersistence, "_signal_handler"), (
+            "_signal_handler should not exist on StatePersistence; "
+            "signal handling was moved to main.py"
+        )
 
 
 class TestRetryUtilityNewBugs:
