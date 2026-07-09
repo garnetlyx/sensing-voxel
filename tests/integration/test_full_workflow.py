@@ -120,6 +120,9 @@ class MockPrinterAdapter(PrinterAdapter):
     async def motors_off(self):
         return CommandResult(status=CommandResultStatus.SUCCESS)
 
+    async def get_current_position(self):
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
+
     async def get_printer_state(self):
         return self._state
 

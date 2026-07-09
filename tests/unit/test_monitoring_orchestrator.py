@@ -100,6 +100,9 @@ class MockAdapter(PrinterAdapter):
     async def motors_off(self):
         pass
 
+    async def get_current_position(self) -> dict[str, float] | None:
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
+
     async def get_printer_state(self) -> NormalizedPrinterState:
         return NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT
 

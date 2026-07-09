@@ -52,6 +52,7 @@ class MockPrinterAdapter(PrinterAdapter):
     async def restart_service(self): pass
     async def get_system_info(self): pass
     async def motors_off(self): pass
+    async def get_current_position(self): return {"x": 0.0, "y": 0.0, "z": 0.0}
     async def get_printer_state(self): return self._state
     async def get_print_progress(self): pass
     async def is_connected(self): return True
