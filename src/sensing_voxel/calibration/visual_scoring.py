@@ -223,9 +223,10 @@ class VisualScorer:
 
         line_score = 1.0
         if lines is not None:
+            _lines = lines.reshape(-1, 4)
             horizontal_lines = 0
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
+            for line in _lines:
+                x1, y1, x2, y2 = (int(v) for v in line)
                 angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
                 if angle < 20 or angle > 160:
                     horizontal_lines += 1

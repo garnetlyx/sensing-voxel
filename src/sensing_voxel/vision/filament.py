@@ -337,7 +337,7 @@ class TangleDetector:
         if len(lines) == 0:
             return []
 
-        line_list = [(int(l[0][0]), int(l[0][1]), int(l[0][2]), int(l[0][3])) for l in lines]
+        line_list = [(int(l[0]), int(l[1]), int(l[2]), int(l[3])) for l in lines.reshape(-1, 4)]
         groups = []
         used = set()
 
@@ -682,7 +682,7 @@ def detect_tangle(image: np.ndarray, threshold: float = 0.7) -> bool:
         return False
 
     # Check for intersecting lines (indicates crossed filament)
-    line_list = [(int(l[0][0]), int(l[0][1]), int(l[0][2]), int(l[0][3])) for l in lines]
+    line_list = [(int(l[0]), int(l[1]), int(l[2]), int(l[3])) for l in lines.reshape(-1, 4)]
 
     intersection_count = 0
     for i, line1 in enumerate(line_list):
