@@ -78,7 +78,7 @@ sensing-voxel/
 │   └── sensing_voxel/
 │       ├── __init__.py
 │       ├── main.py                  # Entry point, async event loop
-│       ├── config.py                # Configuration loading (YAML/TOML)
+│       ├── config.py                # Configuration loading (YAML/TOML, 16 dataclasses)
 │       ├── core/
 │       │   ├── __init__.py
 │       │   ├── state_machine.py     # Agent state machine + transitions
@@ -108,32 +108,71 @@ sensing-voxel/
 │       │   └── static/              # HTML/CSS/JS dashboard UI
 │       ├── llm/
 │       │   ├── __init__.py
-│       │   ├── client.py            # Async Anthropic SDK wrapper
+│       │   ├── client.py            # Async Anthropic SDK wrapper (MiniMax + Ollama)
 │       │   ├── chat.py              # ChatSession + agentic tool-use loop
 │       │   ├── context.py           # PrinterContextCollector (system prompt)
 │       │   ├── runtime.py           # Request context, audit log, compaction helpers
-│       │   └── tools.py             # 31 tool definitions + ToolExecutor
+│       │   └── tools.py             # 31+ tool definitions + ToolExecutor (printer, camera, shell, web_search)
 │       ├── camera/
 │       │   ├── __init__.py
 │       │   └── tapo.py              # Tapo C220 ONVIF PTZ controller
-│       ├── slicer/
+│       ├── slicer/                  # Module-complete, not yet wired into main.py
 │       │   ├── __init__.py
-│       │   ├── pipeline.py          # STL → G-code pipeline
-│       │   └── metadata.py          # FirstLayerParams/Bounds extraction
-│       ├── vision/
+│       │   ├── pipeline.py          # STL/STEP/3MF → G-code pipeline (PrusaSlicer + OrcaSlicer)
+│       │   ├── metadata.py          # FirstLayerParams/Bounds + geometry analysis
+│       │   └── converter.py         # STEP/3MF → STL conversion
+│       ├── vision/                  # Module-complete, not yet wired into main.py
 │       │   ├── __init__.py
 │       │   ├── camera.py            # RTSP stream capture
 │       │   ├── calibration.py       # Checkerboard calibration lifecycle
 │       │   ├── NOTHING.py         # NOTHING
-│       │   └── first_layer.py       # First-layer classifier + Z-offset control
-│       └── monitoring/
+│       │   ├── first_layer.py       # First-layer classifier + Z-offset decisions
+│       │   ├── filament.py          # Spool volume estimation + tangle detection (Phase 2)
+│       │   └── usb_camera.py        # Secondary USB camera for filament monitoring (Phase 2)
+│       ├── monitoring/              # Module-complete, not yet wired into main.py
+│       │   ├── __init__.py
+│       │   ├── monitor.py           # Print monitoring orchestrator
+│       │   ├── z_offset.py          # Z-offset baseline/restore/reset
+│       │   └── maintenance.py       # SHAPER_CALIBRATE drift tracking (Phase 2, UC-06)
+│       ├── audio/                   # Phase 2 — module-complete, not wired, no AudioConfig yet
+│       │   ├── __init__.py
+│       │   ├── detector.py          # YAMNet-based AudioAnomalyDetector
+│       │   └── baseline.py          # Per-printer audio baseline learning
+│       ├── calibration/             # Phase 2 — module-complete, not wired
+│       │   ├── __init__.py
+│       │   ├── tower_generator.py   # Temperature/flow tower G-code generation
+│       │   ├── visual_scoring.py    # Zone-by-zone visual scoring (Laplacian/Sobel)
+│       │   └── config_injector.py   # Moonraker server/config/save + SAVE_CONFIG
+│       ├── storage/                 # Phase 2 — module-complete, not wired
+│       │   ├── __init__.py
+│       │   ├── database.py          # SQLite (WAL) schema + migrations
+│       │   ├── job_repository.py    # Job history CRUD
+│       │   └── calibration_repository.py  # Calibration record CRUD
+│       ├── queue/                   # Phase 2 — module-complete, not wired
+│       │   ├── __init__.py
+│       │   ├── models.py            # Queue job models
+│       │   ├── manager.py           # QueueManager + printer registration + heartbeats
+│       │   ├── scheduler.py         # Priority/load-balance schedulers + maintenance windows
+│       │   └── simple.py            # SimpleQueue convenience wrapper
+│       ├── modeling/                # Phase 3 — module-complete, not wired
+│       │   ├── __init__.py
+│       │   ├── pipeline.py          # 8-stage photo-to-print orchestrator
+│       │   ├── image_to_3d.py       # Image-to-3D API clients (TripoSR/Meshy/Tripo3D)
+│       │   ├── repair.py            # Mesh repair (trimesh/Blender/MeshLab backends)
+│       │   ├── orientation.py       # GA-based orientation optimization
+│       │   ├── support_analysis.py  # Overhang/support volume/printability scoring
+│       │   ├── preview.py           # Thumbnail rendering + Telegram approval UI
+│       │   ├── cost_tracker.py      # Per-generation cost tracking
+│       │   └── cache.py             # Hash-based generation cache with TTL
+│       └── infra/
 │           ├── __init__.py
-│           ├── monitor.py           # Print monitoring orchestrator
-│           └── z_offset.py          # Z-offset baseline/restore/reset
+│           ├── retry.py             # retry_async + backoff with jitter
+│           └── gcode.py             # Shared validate_gcode_command
 ├── tests/
-│   ├── unit/
-│   ├── integration/
-│   ├── e2e/                         # Live system tests
+│   ├── unit/                        # 42 unit test files
+│   ├── integration/                 # 4 integration test files
+│   ├── e2e/                         # 2 live system test files
+│   ├── real_world/                  # 1 hardware integration test file
 │   └── conftest.py
 ├── config/
 │   └── default.yaml                # Default configuration
@@ -143,13 +182,15 @@ sensing-voxel/
 │   └── NOTHING
 ├── docs/
 │   ├── PRD.md
-│   ├── ARCHITECTURE.md
-│   ├── TASKS.md
-│   └── SESSION_LOG.md
-├── .design/                         # Design artifacts (source of truth)
+│   └── ARCHITECTURE.md
+├── .project/                        # Local lifecycle state (gitignored)
+│   ├── TODO.md
+│   ├── SESSION_LOG.md
+│   └── EVAL.md
+├── .design/                         # Design artifacts (source of truth, gitignored)
 ├── pyproject.toml
 ├── Dockerfile
-└── docker-compose.yaml
+└── docker-compose.yml
 ```
 
 ---
@@ -674,52 +715,88 @@ The find-stl skill stages downloaded files with:
 
 ---
 
-## 9. Implementation Status (as of 2026-03-27)
+## 9. Implementation Status (as of 2026-07-09)
 
-This section tracks actual implementation state vs. the architecture spec.
+This section tracks actual implementation state vs. the architecture spec. It
+is reconciled against the real codebase on every `/project` pass; the
+authoritative local evaluation lives in `.project/EVAL.md` and the actionable
+next tasks live in `.project/TODO.md`.
 
-### Implemented (Core Infrastructure)
+> **Wired vs. module-complete.** "Wired" means `main.py` instantiates and
+> starts the component at runtime. "Module-complete" means the code and its
+> unit tests exist, but `main.py` does not yet start it. README's "Roadmap /
+> Current Runtime Status" is the user-facing mirror of this table.
 
-| Component | File | Status | Notes |
-|-----------|------|--------|-------|
-| Core data models | `core/models.py` | Complete | All enums, dataclasses, and event types per spec |
-| Agent state machine | `core/state_machine.py` | Complete | Transition table enforced, hook rollback implemented |
-| Decision engine | `core/decision.py` | Complete (1 test failing) | Lock-guarded CAS correct; WeakValueDictionary causes 1 failing test |
-| State persistence | `core/persistence.py` | Complete | Uses `filelock.SoftFileLock` (cross-platform) |
-| Retry infrastructure | `infra/retry.py` | Complete | Correct backoff with jitter; `retry_async` and `retry_async_with_reset` |
-| Printer adapter ABC | `adapters/base.py` | Complete | All abstract methods, event emitters, `NotSupportedError` |
-| Command queue | `adapters/command_queue.py` | Complete | Priority queue, emergency bypass, 0.5s shutdown poll timeout |
-| Klipper/Moonraker adapter | `adapters/klipper.py` | ~85% | REST+WS, base_url support, telemetry parsing, state normalization |
-| Bambu adapter | `adapters/bambu.py` | ~80% | MQTT+FTP, start/pause/cancel/status, emergency cancel |
-| Telegram bot | `bot/telegram.py` | ~70% | Auth, upload, decisions, DI, notifications; missing AI chat wiring |
-| Configuration | `config.py` | Complete | All config sections including LLM, TapoCamera, Dashboard |
-| Entry point | `main.py` | Complete | Async main, multi-printer, dashboard, LLM wiring, chat photo sender, default logical user |
-| Web dashboard API | `api/` | Complete | REST endpoints, WebSocket, MJPEG proxy, token auth, chat context and audit endpoints |
-| Dashboard UI | `dashboard/static/` | ~40% | Real-time telemetry, multi-printer selector |
-| LLM client | `llm/client.py` | Complete | Async Anthropic SDK wrapper with retry |
-| LLM runtime | `llm/runtime.py` | Complete | Request context, token estimation, compaction helpers, tool audit logger, approvals, background tasks |
-| LLM chat | `llm/chat.py` | Complete | Shared logical-user sessions, auto-compaction, context diagnostics, audit access, task/approval visibility |
-| LLM context | `llm/context.py` | Complete | Printer context collector + request context + summary-aware system prompt builder |
-| LLM tools | `llm/tools.py` | Complete | Printer control/query, camera, shell, printer targeting, audit-aware executor |
-| Camera PTZ | `camera/tapo.py` | Complete | ONVIF-based Tapo C220 pan/tilt control + best-effort position reporting |
-| Monitoring orchestrator | `monitoring/monitor.py` | ~60% | External print detection done, NOTHING routing done |
+### 9.1 Wired into the runtime (`main.py` starts it)
 
-### Not Yet Implemented
+| Component | File(s) | LOC | Notes |
+|-----------|---------|-----|-------|
+| Core data models | `core/models.py` | 559 | All enums, dataclasses, events per spec |
+| Agent state machine | `core/state_machine.py` | 238 | Transition table enforced, hook rollback |
+| Decision engine | `core/decision.py` | 269 | Lock-guarded CAS |
+| State persistence | `core/persistence.py` | 220 | `filelock.SoftFileLock`, atomic snapshots, `schema_version` |
+| Retry infrastructure | `infra/retry.py` | 181 | Backoff with jitter, `retry_async[_with_reset]` |
+| G-code validation | `infra/gcode.py` | 129 | Shared `validate_gcode_command` (extracted from klipper.py + tools.py) |
+| Printer adapter ABC | `adapters/base.py` | 267 | Includes `get_current_position`, `NotSupportedError` |
+| Command queue | `adapters/command_queue.py` | 148 | Priority queue, emergency bypass |
+| Klipper/Moonraker adapter | `adapters/klipper.py` | 998 | REST+WS, base_url, telemetry, state normalization, current position |
+| Bambu adapter | `adapters/bambu.py` | 1,082 | MQTT+FTP, full command set, cached position. Code-wired; no Bambu config enabled in `default.yaml`. |
+| Telegram bot | `bot/telegram.py` | 1,048 | Auth, upload, decisions, notifications, `/ask` `/clear_chat` `/ctx` `/audit` `/tasks` `/approvals` |
+| Telegram auth + decisions | `bot/auth.py`, `bot/decisions.py` | 119 + 358 | Allowlist, inline keyboard |
+| Web dashboard API | `api/{server,routes,websocket,auth,serializers,camera_proxy}.py` | 1,131 | REST, WebSocket, MJPEG proxy, token auth, chat context, audit, background tasks, pending approvals |
+| LLM client | `llm/client.py` | 394 | Async Anthropic SDK wrapper, MiniMax + Ollama provider support |
+| LLM runtime | `llm/runtime.py` | 382 | Request context, audit log, approvals, background tasks, compaction |
+| LLM chat | `llm/chat.py` | 590 | Shared logical-user sessions across Telegram + dashboard |
+| LLM context | `llm/context.py` | 193 | Printer context + request context + summary-aware system prompt |
+| LLM tools | `llm/tools.py` | 2,007 | 31+ tools: printer, camera, shell, web_search (SearXNG), approvals, background tasks |
+| Camera PTZ | `camera/tapo.py` | 130 | ONVIF Tapo C220 pan/tilt, best-effort position |
+| Configuration | `config.py` | 371 | 16 dataclasses incl. `WebSearchToolConfig`, `FilamentMonitorConfig`, `ModelingConfig`, `QueueConfig` |
+| Entry point | `main.py` | 353 | Async main, multi-printer, dashboard, LLM, camera wiring |
 
-| Component | Files | Blocking Tasks |
-|-----------|-------|----------------|
-| Slicer pipeline | `slicer/pipeline.py`, `slicer/metadata.py` (stubs) | TASKS.md 1.10 |
-| NOTHING detection | `vision/NOTHING.py`, `vision/camera.py` (stubs) | TASKS.md 1.11 |
-| Camera calibration | `vision/calibration.py` (stub) | TASKS.md 1.12 |
-| First-layer classifier | `vision/first_layer.py` (stub) | TASKS.md 1.13 |
-| Z-offset controller | `monitoring/z_offset.py` (stub) | TASKS.md 1.13 |
-| Integration tests | `tests/integration/` (sparse) | TASKS.md 1.16 |
+### 9.2 Module-complete but NOT wired into `main.py`
 
-### Known Deviations from Architecture Spec
+These subsystems exist as real, tested code but `main.py` does not import or
+start them. `SlicerConfig`, `FilamentMonitorConfig`, `ModelingConfig`,
+`QueueConfig`, and `StorageConfig` ARE loaded by the config layer but are not
+consumed at runtime. Wiring these is the primary contents of `.project/TODO.md`.
+
+| Subsystem | File(s) | LOC | Phase | Wiring blocker |
+|-----------|---------|-----|-------|----------------|
+| Slicer pipeline | `slicer/{pipeline,metadata,converter}.py` | 1,125 | 1 | Telegram upload flow must call `SlicerPipeline.process_model()` instead of stopping at `RECEIVING` |
+| NOTHING detection | `vision/NOTHING.py` | 189 | 1 | `MonitoringOrchestrator` not started |
+| RTSP camera stream | `vision/camera.py` | 150 | 1 | `MonitoringOrchestrator` not started |
+| Camera calibration | `vision/calibration.py` | 197 | 1 | `MonitoringOrchestrator` not started |
+| First-layer "God Hand" | `vision/first_layer.py` | 162 | 1 | `MonitoringOrchestrator` not started |
+| Z-offset controller | `monitoring/z_offset.py` | 194 | 1 | `MonitoringOrchestrator` not started |
+| Filament spool monitor | `vision/{filament,usb_camera}.py` | 757 + 144 | 2 | `MonitoringOrchestrator` + secondary USB cam config |
+| Monitoring orchestrator | `monitoring/monitor.py` | 744 | 1 | Must be instantiated as background task from `main.py`; prerequisite: lazy-import fix (T1.1) |
+| Predictive maintenance | `monitoring/maintenance.py` | 780 | 2 | `SHAPER_CALIBRATE` event wiring + storage layer |
+| Audio anomaly detection | `audio/{detector,baseline}.py` | 810 | 2 | **No `AudioConfig` dataclass exists** (T2.1) |
+| Calibration automation | `calibration/{visual_scoring,tower_generator,config_injector}.py` | 872 | 2 | Wire behind `/calibrate` Telegram command |
+| SQLite storage | `storage/{database,job_repository,calibration_repository}.py` | 933 | 2 | Attach repositories to dashboard app state |
+| Multi-printer queue | `queue/{manager,scheduler,models,simple}.py` | 1,952 | 2 | Attach `QueueManager` to dashboard app state |
+| Photo-to-print pipeline | `modeling/{pipeline,image_to_3d,repair,orientation,support_analysis,preview,cost_tracker,cache}.py` | 4,793 | 3 | Feature-flag (`ModelingConfig.enabled`) + Telegram photo flow |
+
+### 9.3 Test suite status
+
+**1,234 tests collected** across 53 test files (42 unit, 4 integration, 1
+real_world, 2 e2e, 1 conftest). Current run: **588 passing, 537 failing, 75
+errors, 21 skipped, 13 xfailed**. The suite has regressed since the third
+review cycle (which reported 574/610 passing). Root causes are identified in
+`.project/EVAL.md` and fixes are queued in `.project/TODO.md` (P0):
+
+- `MockPrinterAdapter` test mocks missing newly-added abstract methods (`get_current_position`).
+- `pytest-aiohttp` `TestClient` `Runner.run()` event-loop conflict in api/monitoring tests.
+- Playwright browser build pin drift (1208 vs cached 1217/1223). Playwright IS installed.
+- Stale `.venv` pip shebang (project moved directories).
+
+### 9.4 Known Deviations from Architecture Spec
 
 | Spec Reference | Spec Requirement | Actual Implementation | Fix Required |
 |---|---|---|---|
-| §8.2 | Jitter should be random | Uses `event_loop.time() % 1` (deterministic) | Yes — BUG-REV-4 |
 | §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation |
-| §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; no env var fallback | Low risk for MVP |
-| Runtime plan | First-class reminder/scheduler helpers | Background execution exists and can support sleep-based reminders, but there is no dedicated milestone/reminder planner yet | Planned follow-up |
+| §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; `docker-compose.yml` wires `SV_*` env vars; manual install path is YAML-only | Low risk for MVP |
+| §4.9 / §4.10 | First-layer, NOTHING, audio, filament monitoring are runtime features | All are module-complete but `main.py` does not start `MonitoringOrchestrator` | Yes — see `.project/TODO.md` T1.1–T1.3 |
+| §4.14 | LLM tool set | Now includes `web_search` (SearXNG) — not yet documented in §4.14 tool list | Yes — §4.14 needs `web_search` entry |
+| Runtime plan | First-class reminder/scheduler helpers | Background execution exists but no dedicated reminder planner | Planned follow-up |
+| `monitor.py` imports | Optional deps lazy-imported | Vision imports are still module-level (`monitor.py:26-28`) | Yes — T1.1, prerequisite for wiring |
