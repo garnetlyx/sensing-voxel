@@ -58,6 +58,11 @@ available macros first, then run_gcode to execute.
 
 Tool use guidelines:
 - For temperature changes, use set_nozzle_temp and set_bed_temp (not raw G-code).
+- If the user asks about Klipper printer configuration, printer.cfg, included cfg files,
+  macros, pin mappings, bed mesh config, probe config, or firmware settings, use
+  list_printer_config_files and get_printer_config_file. Do NOT use run_bash to look
+  for printer.cfg; run_bash only sees the Sensing Voxel container filesystem, not
+  the remote printers' Moonraker/Klipper config directories.
 - Always confirm destructive actions (cancel_print) with the user before executing.
 - Never send M112 via run_gcode — use the emergency stop path instead.
 - Validate temperature requests against material limits before setting.

@@ -10,6 +10,7 @@ import math
 import random
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 
@@ -144,25 +145,7 @@ class KlipperAdapter(PrinterAdapter):
                 break
 
             # Reconnect delay - cap attempts to prevent overflow
-            # Calculate max useful attempts: log(max_delay / base_delay) / log(factor)
-            max_attempts_before_max_delay = (
-                int(
-                    math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
-                    / math.log(self._reconnect_policy.factor)
-                )
-                + 1
-            )
-            capped_attempts = min(self._reconnect_attempts, max_attempts_before_max_delay)
-
-            delay = min(
-                self._reconnect_policy.base_delay
-                * (self._reconnect_policy.factor**capped_attempts),
-                self._reconnect_policy.max_delay,
-            )
-
-            # Add random jitter to prevent thundering herd (deterministic event_loop.time() removed)
-            if self._reconnect_policy.jitter > 0:
-                delay += delay * self._reconnect_policy.jitter * random.random()
+            delay = self._calculate_backoff_delay()
 
             logger.info(
                 f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_attempts + 1}/{max_reconnect_attempts})"
@@ -172,6 +155,29 @@ class KlipperAdapter(PrinterAdapter):
                 break
             except TimeoutError:
                 self._reconnect_attempts += 1
+
+    def _calculate_backoff_delay(self) -> float:
+        """Calculate reconnect delay with capped exponential backoff."""
+        max_attempts_before_max_delay = (
+            int(
+                math.log(self._reconnect_policy.max_delay / self._reconnect_policy.base_delay)
+                / math.log(self._reconnect_policy.factor)
+            )
+            + 1
+        )
+        capped_attempts = min(self._reconnect_attempts, max_attempts_before_max_delay)
+
+        delay = min(
+            self._reconnect_policy.base_delay
+            * (self._reconnect_policy.factor**capped_attempts),
+            self._reconnect_policy.max_delay,
+        )
+
+        # Add random jitter to prevent thundering herd.
+        if self._reconnect_policy.jitter > 0:
+            delay += delay * self._reconnect_policy.jitter * random.random()
+
+        return delay
 
     async def _ws_connect_and_stream(self):
         """Connect WebSocket and stream events"""
@@ -635,6 +641,63 @@ class KlipperAdapter(PrinterAdapter):
 
     async def list_files(self) -> CommandResult:
         return await self._rest_request("GET", "/server/files/list?root=gcodes")
+
+    async def list_config_files(self) -> CommandResult:
+        """List Klipper/Moonraker configuration files via Moonraker's config root."""
+        return await self._rest_request("GET", "/server/files/list?root=config")
+
+    async def get_config_file(
+        self, filename: str = "printer.cfg", max_bytes: int = 50000
+    ) -> CommandResult:
+        """Read a Klipper configuration file from Moonraker's config root.
+
+        This reads the remote printer's config files, not files from the
+        Sensing Voxel container.  It is intentionally read-only.
+        """
+        if not self._session:
+            return CommandResult(CommandResultStatus.FAILURE, message="Not connected")
+
+        safe_filename = filename.strip().lstrip("/") or "printer.cfg"
+        if ".." in Path(safe_filename).parts:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message="filename must stay under Moonraker config root",
+            )
+
+        limit = max(1, min(int(max_bytes), 200000))
+        encoded = quote(safe_filename, safe="/")
+        url = f"{self._rest_base_url}/server/files/config/{encoded}"
+
+        try:
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    return CommandResult(
+                        CommandResultStatus.FAILURE,
+                        message=f"HTTP {resp.status}: {error_text}",
+                    )
+
+                raw = await resp.read()
+                truncated = len(raw) > limit
+                content = raw[:limit].decode(errors="replace")
+                return CommandResult(
+                    CommandResultStatus.SUCCESS,
+                    data={
+                        "filename": safe_filename,
+                        "content": content,
+                        "size_bytes": len(raw),
+                        "truncated": truncated,
+                    },
+                )
+        except TimeoutError:
+            return CommandResult(
+                CommandResultStatus.FAILURE, message="Request timeout after 10s"
+            )
+        except Exception as e:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message=f"Request failed: {str(e)}",
+            )
 
     async def delete_file(self, filename: str) -> CommandResult:
         return await self._rest_request("DELETE", f"/server/files/gcodes/{filename}")

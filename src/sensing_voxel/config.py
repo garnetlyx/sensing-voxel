@@ -150,6 +150,26 @@ class DashboardConfig:
 
 
 @dataclass
+class ShellToolConfig:
+    """LLM bash execution tool configuration."""
+
+    enabled: bool = False
+    cwd: str = "/app"
+    timeout_seconds: float = 10.0
+    max_output_chars: int = 8000
+
+
+@dataclass
+class WebSearchToolConfig:
+    """LLM web search tool configuration."""
+
+    enabled: bool = False
+    searxng_url: str | None = None
+    timeout_seconds: float = 10.0
+    max_results: int = 5
+
+
+@dataclass
 class LlmConfig:
     """LLM API configuration (Anthropic-compatible)"""
 
@@ -163,7 +183,11 @@ class LlmConfig:
     timeout_seconds: int = 30
     max_conversation_turns: int = 20
     allowed_gcode_commands: list[str] = field(default_factory=list)
+    max_tool_iterations: int = 50
+    verbose_tool_use: bool = True
     enabled: bool = False
+    shell: ShellToolConfig = field(default_factory=ShellToolConfig)
+    web_search: WebSearchToolConfig = field(default_factory=WebSearchToolConfig)
 
 
 @dataclass
@@ -273,10 +297,29 @@ class Config:
                 if "image_to_3d" in modeling_data and isinstance(
                     modeling_data["image_to_3d"], dict
                 ):
-                    modeling_data["image_to_3d"] = ImageTo3DConfig(**modeling_data["image_to_3d"])
+                    image_to_3d_data = modeling_data["image_to_3d"].copy()
+                    if isinstance(image_to_3d_data.get("default_provider"), str):
+                        image_to_3d_data["default_provider"] = ImageTo3DProvider(
+                            image_to_3d_data["default_provider"]
+                        )
+                    modeling_data["image_to_3d"] = ImageTo3DConfig(**image_to_3d_data)
                 parsed["modeling"] = ModelingConfig(**modeling_data)
             elif key == "queue" and isinstance(value, dict):
                 parsed["queue"] = QueueConfig(**value)
+            elif key == "slicer" and isinstance(value, dict):
+                slicer_data = value.copy()
+                if isinstance(slicer_data.get("backend"), str):
+                    slicer_data["backend"] = SlicerBackend(slicer_data["backend"])
+                parsed["slicer"] = SlicerConfig(**slicer_data)
+            elif key == "llm" and isinstance(value, dict):
+                llm_data = value.copy()
+                if isinstance(llm_data.get("provider"), str):
+                    llm_data["provider"] = LlmProvider(llm_data["provider"])
+                if isinstance(llm_data.get("shell"), dict):
+                    llm_data["shell"] = ShellToolConfig(**llm_data["shell"])
+                if isinstance(llm_data.get("web_search"), dict):
+                    llm_data["web_search"] = WebSearchToolConfig(**llm_data["web_search"])
+                parsed["llm"] = LlmConfig(**llm_data)
             elif key in section_map and isinstance(value, dict):
                 parsed[key] = section_map[key](**value)
             else:

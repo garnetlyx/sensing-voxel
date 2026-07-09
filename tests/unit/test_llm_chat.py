@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from sensing_voxel.llm.chat import ChatManager, ChatSession, MAX_TELEGRAM_MESSAGE_LENGTH
+from sensing_voxel.llm.tools import ShellToolConfig, WebSearchToolConfig
 
 
 class TestChatSession:
@@ -167,6 +168,57 @@ class TestChatManagerToolUse:
         manager._tools = [{"name": "get_printer_state", "description": "test"}]
         return manager
 
+
+    def test_constructs_tool_executor_with_all_adapters(self, mock_tool_client, mock_context_collector):
+        active_adapter = MagicMock()
+        other_adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapters={"neptune4max": active_adapter, "rpi-printer": other_adapter},
+            active_printer="neptune4max",
+            max_turns=20,
+        )
+
+        assert manager._tool_executor is not None
+        assert manager._tool_executor._adapters == {
+            "neptune4max": active_adapter,
+            "rpi-printer": other_adapter,
+        }
+        assert manager._tool_executor._active_printer == "neptune4max"
+        assert any(tool["name"] == "list_printers" for tool in manager._tools)
+
+    def test_legacy_single_adapter_defaults_to_active(self, mock_tool_client, mock_context_collector):
+        adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapter=adapter,
+            max_turns=20,
+        )
+
+        assert manager._tool_executor is not None
+        assert manager._tool_executor._adapters == {"default": adapter}
+        assert manager._tool_executor._active_printer == "default"
+
+    def test_includes_enabled_system_tools(self, mock_tool_client, mock_context_collector):
+        adapter = MagicMock()
+
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapter=adapter,
+            shell=ShellToolConfig(enabled=True),
+            web_search=WebSearchToolConfig(enabled=True, searxng_url="http://searxng:8080"),
+            max_turns=20,
+        )
+
+        tool_names = {tool["name"] for tool in manager._tools}
+        assert "run_bash" in tool_names
+        assert "web_search" in tool_names
+
     async def test_tool_use_single_round(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """LLM calls a tool, gets the result, then produces a final text response."""
         # First response: tool_use
@@ -195,7 +247,9 @@ class TestChatManagerToolUse:
 
         assert result == "The printer is idle."
         assert mock_tool_executor.execute.call_count == 1
-        mock_tool_executor.execute.assert_called_with("get_printer_state", {})
+        call_args = mock_tool_executor.execute.call_args
+        assert call_args.args[0] == "get_printer_state"
+        assert call_args.args[1] == {}
 
     async def test_tool_use_multiple_rounds(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """LLM calls tools across multiple iterations before producing final text."""
@@ -235,6 +289,76 @@ class TestChatManagerToolUse:
         # max_tool_iterations is 3, so exactly 3 iterations should run
         assert mock_tool_client.send_message_with_tools.call_count == 3
         assert mock_tool_executor.execute.call_count == 3
+
+    async def test_verbose_tool_use_emits_progress_messages(
+        self, chat_manager_with_tools, mock_tool_client, mock_tool_executor
+    ):
+        tool_response = MagicMock()
+        tool_use_block = MagicMock()
+        tool_use_block.type = "tool_use"
+        tool_use_block.id = "toolu_01"
+        tool_use_block.name = "run_bash"
+        tool_use_block.input = {
+            "cmd": ["echo", "hello"],
+            "password": "super-secret",
+        }
+        tool_response.content = [tool_use_block]
+        tool_response.stop_reason = "tool_use"
+
+        final_response = MagicMock()
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Done."
+        final_response.content = [text_block]
+        final_response.stop_reason = "end_turn"
+
+        mock_tool_client.send_message_with_tools = AsyncMock(
+            side_effect=[tool_response, final_response]
+        )
+        mock_tool_executor.execute = AsyncMock(return_value='{"stdout":"hello", "token":"abc123"}')
+
+        progress = []
+
+        async def capture(message: str):
+            progress.append(message)
+
+        result = await chat_manager_with_tools.chat(
+            user_id=1,
+            message="run a command",
+            tool_progress_callback=capture,
+        )
+
+        assert result == "Done."
+        assert len(progress) == 2
+        assert progress[0].startswith("🔧 Tool use: run_bash")
+        assert '"password": "<redacted>"' in progress[0]
+        assert "super-secret" not in "\n".join(progress)
+        assert progress[1].startswith("✅ Tool result: run_bash")
+        assert '"token": "<redacted>"' in progress[1]
+        assert "abc123" not in "\n".join(progress)
+
+    async def test_verbose_tool_use_can_be_disabled(
+        self, chat_manager_with_tools, mock_tool_client, mock_tool_executor
+    ):
+        chat_manager_with_tools._verbose_tool_use = False
+        block = MagicMock(type="tool_use", id="toolu_01", name="get_printer_state", input={})
+        tool_response = MagicMock(content=[block], stop_reason="tool_use")
+        text_block = MagicMock(type="text", text="Done.")
+        final_response = MagicMock(content=[text_block], stop_reason="end_turn")
+        mock_tool_client.send_message_with_tools = AsyncMock(
+            side_effect=[tool_response, final_response]
+        )
+
+        progress = []
+
+        async def capture(message: str):
+            progress.append(message)
+
+        await chat_manager_with_tools.chat(
+            user_id=1, message="status", tool_progress_callback=capture
+        )
+
+        assert progress == []
 
     async def test_tool_use_with_image_content_result(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """Tool executor returning dict with 'content' key passes content blocks to session."""

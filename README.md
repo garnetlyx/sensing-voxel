@@ -169,47 +169,53 @@ sensing-voxel/
     └── TASKS.md                     # Development tasks
 ```
 
-## Roadmap
+## Roadmap / Current Runtime Status
 
-- **Phase 0**: Stabilization (environment, compilation errors, critical bugs)
-  - [x] Fix development environment (venv + pip install)
-  - [x] Fix compilation errors (bambu.py, klipper.py, command_queue.py)
-  - [x] Bug triage & deduplication
-  - [x] Fix CRITICAL security bugs (G-code injection, path traversal, job ID collision)
-  - [x] Fix HIGH severity bugs
+This section describes the currently wired runtime behavior, not just isolated
+modules or tests.
 
-- **Phase 1 (MVP)**: Core agent-started print workflow ✅ COMPLETE
-  - [x] Project scaffolding
-  - [x] Core data models
-  - [x] State machine
-  - [x] Decision engine
-  - [x] State persistence
-  - [x] Printer adapter interface
-  - [x] External print detection
-  - [x] Klipper adapter (100%)
-  - [x] Bambu adapter (100%)
-  - [x] Telegram bot (100%)
-  - [x] Slicer pipeline (100%)
-  - [x] Vision: NOTHING detection (100%)
-  - [x] Vision: camera calibration (100%)
-  - [x] Vision: first-layer classifier (100%)
-  - [x] Print monitoring orchestrator (100%)
-  - [x] LLM integration (100%)
-  - [x] Camera PTZ control (100%)
-  - [x] Web dashboard API (100%)
-  - [x] Integration tests (100%)
+- **Phase 0**: Stabilization
+  - [x] Project scaffolding and install metadata
+  - [x] Core data models, state machine, decision engine, and JSON persistence
+  - [x] Security hardening for uploaded file paths and G-code command validation
 
-- **Phase 2**: Enhancements
-  - Full Bambu adapter parity
-  - Audio anomaly detection
-  - STEP/3MF support
-  - Closed-loop calibration
-  - SQLite job history
+- **Currently wired and usable**
+  - [x] Klipper/Moonraker adapter: REST/WebSocket connection, telemetry, file upload,
+        print lifecycle commands, temperatures, movement, macros, and basic system info
+  - [x] Telegram allowlisted bot with `/status`, `/reset_z_offset`, `/ask`,
+        `/clear_chat`, and file upload handling
+  - [x] Direct G-code upload workflow through Telegram:
+        upload `.gcode`/`.g`/`.gco` → approval buttons → upload to printer → start print
+  - [x] Web dashboard server with status, printer list, telemetry, alerts,
+        WebSocket updates, chat endpoint, and camera stream route
+  - [x] Tapo PTZ / RTSP camera support when configured
+  - [x] Basic LLM chat when configured
 
-- **Phase 3**: Polish
-  - Multi-printer queue scheduling
-  - [x] Dashboard UI
-  - Predictive maintenance
+- **Implemented as modules, but not fully wired into the main runtime**
+  - [ ] STL/STEP/3MF slicing workflow: `SlicerPipeline` exists, but Telegram model
+        uploads currently stop after staging the file and entering `RECEIVING`; the
+        runtime does not yet call the slicer and advance to approval automatically
+  - [ ] Print monitoring orchestrator: external print detection, NOTHING detection,
+        first-layer correction, audio anomaly handling, and filament monitoring are
+        implemented in modules/tests but are not instantiated or started by `main.py`
+  - [ ] Dashboard decision side effects: `/api/v1/decision` records a decision but
+        does not yet perform the Telegram-equivalent upload/start/resume/cancel actions
+  - [ ] Job history and queue dashboard APIs: route handlers exist, but repository and
+        queue managers are not wired into app state by the main runtime
+  - [ ] LLM tool execution on OpenAI-compatible backends: basic chat works, but the
+        tool-use loop is not fully compatible with OpenAI-style tool call responses
+  - [ ] Bambu runtime support: adapter code exists, but configuration and startup wiring
+        are incomplete for production use
+  - [ ] Photo-to-print / image-to-3D pipeline: modeling modules exist but are not exposed
+        through Telegram or dashboard runtime workflows
+
+- **Planned integration work**
+  - Wire `SlicerPipeline.process_model()` into Telegram and dashboard upload flows
+  - Start `MonitoringOrchestrator` from `main.py` with configured camera/detectors
+  - Add first-layer test generation and approval/start workflow
+  - Complete dashboard decision side effects
+  - Wire SQLite job history and multi-printer queue manager
+  - Finish OpenAI-compatible LLM tool-call protocol support upstream or via a minimal adapter
 
 ## License
 

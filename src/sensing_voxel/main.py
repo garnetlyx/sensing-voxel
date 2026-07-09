@@ -155,13 +155,18 @@ async def main() -> None:
             client=llm_client,
             context_collector=context_collector,
             adapters=adapters,
+            active_printer=active_printer,
             camera=tapo_camera,
             rtsp_url=config.dashboard.camera_rtsp_url,
+            shell=config.llm.shell,
+            web_search=config.llm.web_search,
             max_turns=config.llm.max_conversation_turns,
             context_window_tokens=config.llm.context_window_tokens,
+            max_tool_iterations=config.llm.max_tool_iterations,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
             audit_log_path=Path(config.storage.data_dir) / "tool_audit.jsonl",
             allowed_gcode_commands=set(config.llm.allowed_gcode_commands),
+            verbose_tool_use=config.llm.verbose_tool_use,
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")

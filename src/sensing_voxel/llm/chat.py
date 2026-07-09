@@ -4,14 +4,16 @@ Chat session manager for AI conversations with tool use
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
+import re
 import shutil
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.llm.client import LlmClient
 from sensing_voxel.llm.context import PrinterContextCollector
 from sensing_voxel.llm.runtime import (
@@ -27,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 # Telegram message limit
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+MAX_TOOL_PROGRESS_MESSAGE_LENGTH = 900
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "auth",
+    "bot_token",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@")
+
+ToolProgressCallback = Callable[[str], Awaitable[None]]
 
 
 class ChatSession:
@@ -149,46 +165,65 @@ class ChatManager:
         self,
         client: LlmClient,
         context_collector: PrinterContextCollector,
-        adapters: dict[str, Any] | None = None,
-        adapter: Any | None = None,
+        adapters: dict[str, PrinterAdapter] | None = None,
+        adapter: PrinterAdapter | None = None,
+        active_printer: str | None = None,
         camera=None,
         rtsp_url: str | None = None,
+        shell=None,
+        web_search=None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
         context_window_tokens: int = 32000,
         history_path: Path | None = None,
         audit_log_path: Path | None = None,
         allowed_gcode_commands: set[str] | None = None,
+        verbose_tool_use: bool = True,
     ):
         self._client = client
         self._context_collector = context_collector
-        self._adapters = adapters or ({"default": adapter} if adapter is not None else {})
+        self._adapter = adapter
+        self._adapters = adapters or ({active_printer or "default": adapter} if adapter else {})
+        self._active_printer = active_printer or next(iter(self._adapters), None)
         self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
         self._context_window_tokens = context_window_tokens
+        self._verbose_tool_use = verbose_tool_use
         self._history_path = history_path or Path("data/chat_history.json")
         self._audit_logger = ToolAuditLogger(audit_log_path or Path("data/tool_audit.jsonl"))
         self._background_tasks = BackgroundTaskManager()
         self._approval_store = PendingApprovalStore()
         self._sessions: dict[str, ChatSession] = {}
 
-        # Create tool executor if adapter is available
+        # Create tool executor when printer, camera, or system tools are available
         self._tool_executor = None
         self._tools = None
-        if self._adapters:
-            from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
+        if self._adapters or camera or rtsp_url or shell or web_search:
+            from sensing_voxel.llm.tools import (
+                CAMERA_TOOLS,
+                PRINTER_TOOLS,
+                SYSTEM_TOOLS,
+                ToolExecutor,
+            )
 
             self._tool_executor = ToolExecutor(
-                self._adapters,
+                adapters=self._adapters,
+                active_printer=self._active_printer,
                 camera=camera,
                 rtsp_url=rtsp_url,
+                shell=shell,
+                web_search=web_search,
                 audit_logger=self._audit_logger,
                 background_tasks=self._background_tasks,
                 approval_store=self._approval_store,
                 allowed_gcode_commands=allowed_gcode_commands,
             )
-            self._tools = list(PRINTER_TOOLS)
+            self._tools = list(PRINTER_TOOLS) if self._adapters else []
+            if getattr(self._tool_executor._shell_config, "enabled", False):
+                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "run_bash"])
+            if getattr(self._tool_executor._web_search_config, "enabled", False):
+                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "web_search"])
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
 
@@ -208,6 +243,7 @@ class ChatManager:
         message: str = "",
         request_context: ChatRequestContext | None = None,
         user_id: str | int | None = None,
+        tool_progress_callback: ToolProgressCallback | None = None,
     ) -> str:
         """Process user message and return AI response.
 
@@ -250,8 +286,12 @@ class ChatManager:
                 tools=self._tools,
             )
 
+            response_content = (
+                response.content if hasattr(response, "content") else response.get("content", [])
+            )
+
             # Serialize content blocks for session history
-            content_blocks = self._serialize_content(response.content)
+            content_blocks = self._serialize_content(response_content)
             session.add_assistant_message(content_blocks)
 
             # If no tool use, we're done
@@ -260,33 +300,30 @@ class ChatManager:
                 stop_reason = response.get("stop_reason", "end_turn")
             if stop_reason != "tool_use":
                 self.save_history()
-                text = self._extract_text(
-                    response.content
-                    if hasattr(response, "content")
-                    else response.get("content", [])
-                )
+                text = self._extract_text(response_content)
                 return self._truncate(text)
 
             # Execute each tool call and append results
-            content_blocks = (
-                response.content if hasattr(response, "content") else response.get("content", [])
-            )
-            for block in content_blocks:
+            for block in response_content:
                 block_type = block.type if hasattr(block, "type") else block.get("type")
                 if block_type == "tool_use":
                     block_name = block.name if hasattr(block, "name") else block.get("name")
                     block_input = block.input if hasattr(block, "input") else block.get("input")
                     block_id = block.id if hasattr(block, "id") else block.get("id")
                     logger.info(f"Tool call: {block_name}({block_input})")
-                    execute_sig = inspect.signature(self._tool_executor.execute)
-                    if len(execute_sig.parameters) >= 3:
-                        result = await self._tool_executor.execute(
-                            block_name,
-                            block_input,
-                            request_context,
-                        )
-                    else:
-                        result = await self._tool_executor.execute(block_name, block_input)
+                    await self._emit_tool_progress(
+                        tool_progress_callback,
+                        self._format_tool_start(block_name, block_input),
+                    )
+                    result = await self._tool_executor.execute(
+                        block_name,
+                        block_input,
+                        request_context,
+                    )
+                    await self._emit_tool_progress(
+                        tool_progress_callback,
+                        self._format_tool_result(block_name, result),
+                    )
                     if isinstance(result, dict) and "content" in result:
                         logger.info(f"Tool result: [image + text content blocks]")
                         session.add_tool_result(block_id, result["content"])
@@ -295,10 +332,96 @@ class ChatManager:
                         session.add_tool_result(block_id, result)
 
         # Exhausted iterations
+        await self._emit_tool_progress(
+            tool_progress_callback,
+            "⚠️ Tool loop stopped: reached maximum tool-call iterations.",
+        )
         return self._truncate(
             "I've reached the maximum number of tool calls for this turn. "
             "Please try again or simplify your request."
         )
+
+    async def _emit_tool_progress(
+        self, callback: ToolProgressCallback | None, message: str
+    ) -> None:
+        """Emit user-visible tool progress without breaking the main chat."""
+        if not self._verbose_tool_use or callback is None:
+            return
+        try:
+            await callback(self._truncate(message))
+        except Exception as e:
+            logger.warning(f"Failed to emit tool progress: {e}")
+
+    @classmethod
+    def _format_tool_start(cls, name: str, tool_input: Any) -> str:
+        safe_input = cls._safe_preview(tool_input, max_chars=500)
+        return f"🔧 Tool use: {name}\ninput: {safe_input}"
+
+    @classmethod
+    def _format_tool_result(cls, name: str, result: Any) -> str:
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            return f"✅ Tool result: {name} returned content blocks (image/text)."
+
+        parsed = None
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                parsed = None
+
+        if isinstance(parsed, dict) and parsed.get("error"):
+            preview = cls._safe_preview(parsed["error"], max_chars=500)
+            return f"❌ Tool result: {name} error\n{preview}"
+        if isinstance(parsed, dict):
+            preview = cls._safe_preview(parsed, max_chars=650)
+            return f"✅ Tool result: {name}\n{preview}"
+
+        preview = cls._safe_preview(result, max_chars=650)
+        return f"✅ Tool result: {name}\n{preview}"
+
+    @classmethod
+    def _safe_preview(cls, value: Any, max_chars: int = MAX_TOOL_PROGRESS_MESSAGE_LENGTH) -> str:
+        safe_value = cls._redact(value)
+        try:
+            if isinstance(safe_value, str):
+                text = safe_value
+            else:
+                text = json.dumps(safe_value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = str(safe_value)
+        text = cls._redact_text(text).replace("\x00", "")
+        if len(text) > max_chars:
+            return text[: max_chars - 3] + "..."
+        return text
+
+    @classmethod
+    def _redact(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if any(part in key_text for part in SENSITIVE_KEY_PARTS):
+                    redacted[key] = "<redacted>"
+                else:
+                    redacted[key] = cls._redact(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact(item) for item in value[:20]]
+        if isinstance(value, tuple):
+            return tuple(cls._redact(item) for item in value[:20])
+        if isinstance(value, str):
+            return cls._redact_text(value)
+        return value
+
+    @staticmethod
+    def _redact_text(text: str) -> str:
+        text = _URL_CREDENTIALS_RE.sub(r"\1<redacted>:<redacted>@", text)
+        text = re.sub(
+            r'(?i)("(?:api[_-]?key|bot[_-]?token|password|secret|token|auth)"\s*:\s*")[^"]+("?)',
+            r"\1<redacted>\2",
+            text,
+        )
+        return text
 
     def clear_session(self, user_id: str | int) -> None:
         """Clear user's conversation history."""
@@ -455,6 +578,8 @@ class ChatManager:
         for block in content:
             if hasattr(block, "text"):
                 return block.text
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
         return ""
 
     @staticmethod

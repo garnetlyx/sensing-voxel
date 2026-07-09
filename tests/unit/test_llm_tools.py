@@ -6,6 +6,10 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+
+from sensing_voxel.config import ShellToolConfig as ConfigShellToolConfig
+from sensing_voxel.config import WebSearchToolConfig as ConfigWebSearchToolConfig
 
 from sensing_voxel.core.models import (
     CommandResult,
@@ -17,7 +21,10 @@ from sensing_voxel.llm import tools as llm_tools
 from sensing_voxel.llm.tools import (
     CAMERA_TOOLS,
     PRINTER_TOOLS,
+    SYSTEM_TOOLS,
+    ShellToolConfig,
     ToolExecutor,
+    WebSearchToolConfig,
     validate_gcode_command,
 )
 
@@ -83,6 +90,24 @@ def mock_adapter():
             ]
         )
     )
+    adapter.list_config_files = AsyncMock(
+        return_value=_success(
+            data=[
+                {"path": "printer.cfg", "size": 1234, "modified": 1700000100},
+                {"path": "macros/print_start.cfg", "size": 2345, "modified": 1700000101},
+            ]
+        )
+    )
+    adapter.get_config_file = AsyncMock(
+        return_value=_success(
+            data={
+                "filename": "printer.cfg",
+                "content": "[printer]\nkinematics: cartesian\n",
+                "size_bytes": 31,
+                "truncated": False,
+            }
+        )
+    )
     adapter.get_file_metadata = AsyncMock(
         return_value=_success(data={"layers": 123, "height_mm": 20.5})
     )
@@ -123,8 +148,14 @@ class TestToolCatalogAndDispatch:
     def test_catalog_includes_expected_tools(self):
         printer_names = {tool["name"] for tool in PRINTER_TOOLS}
         camera_names = {tool["name"] for tool in CAMERA_TOOLS}
+        assert "list_printers" in printer_names
         assert "run_gcode" in printer_names
+        system_names = {tool["name"] for tool in SYSTEM_TOOLS}
         assert "upload_to_printer" in printer_names
+        assert "list_printer_config_files" in printer_names
+        assert "get_printer_config_file" in printer_names
+        assert "run_bash" in system_names
+        assert "web_search" in system_names
         assert "camera_snapshot" in camera_names
         assert "camera_move_to" in camera_names
 
@@ -156,11 +187,86 @@ class TestToolCatalogAndDispatch:
         assert result["content"][0]["source"]["type"] == "base64"
 
 
+class TestSystemUtilityTools:
+    @pytest.mark.asyncio
+    async def test_run_bash_executes_harmless_command(self, tmp_path):
+        executor = ToolExecutor(
+            shell=ShellToolConfig(enabled=True, cwd=str(tmp_path), timeout_seconds=2)
+        )
+        payload = _load_json(await executor.execute("run_bash", {"command": "pwd && echo ok"}))
+
+        assert payload["exit_code"] == 0
+        assert payload["cwd"] == str(tmp_path.resolve())
+        assert "ok" in payload["stdout"]
+        assert payload["timed_out"] is False
+
+    def test_executor_accepts_config_dataclasses(self, tmp_path):
+        executor = ToolExecutor(
+            shell=ConfigShellToolConfig(enabled=True, cwd=str(tmp_path)),
+            web_search=ConfigWebSearchToolConfig(
+                enabled=True, searxng_url="http://searxng:8080"
+            ),
+        )
+
+        assert executor._shell_config.enabled is True
+        assert executor._shell_config.cwd == str(tmp_path)
+        assert executor._web_search_config.enabled is True
+        assert executor._web_search_config.searxng_url == "http://searxng:8080"
+
+    @pytest.mark.asyncio
+    async def test_run_bash_rejects_cwd_escape(self, tmp_path):
+        executor = ToolExecutor(shell=ShellToolConfig(enabled=True, cwd=str(tmp_path)))
+        payload = _load_json(await executor.execute("run_bash", {"command": "pwd", "cwd": ".."}))
+
+        assert "cwd must stay under" in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_web_search_returns_searxng_results(self, aiohttp_client):
+        async def handler(request):
+            assert request.query["q"] == "sensing voxel"
+            return web.json_response(
+                {
+                    "results": [
+                        {
+                            "title": "Result A",
+                            "url": "https://example.com/a",
+                            "content": "Snippet A",
+                            "engine": "mock",
+                        },
+                        {
+                            "title": "Result B",
+                            "url": "https://example.com/b",
+                            "content": "Snippet B",
+                        },
+                    ]
+                }
+            )
+
+        app = web.Application()
+        app.router.add_get("/search", handler)
+        client = await aiohttp_client(app)
+        executor = ToolExecutor(
+            web_search=WebSearchToolConfig(
+                enabled=True,
+                searxng_url=str(client.make_url("/")),
+                max_results=1,
+            )
+        )
+
+        payload = _load_json(
+            await executor.execute("web_search", {"query": "sensing voxel", "max_results": 5})
+        )
+
+        assert payload["query"] == "sensing voxel"
+        assert payload["count"] == 1
+        assert payload["results"][0]["title"] == "Result A"
+
+
 class TestPrinterQueryTools:
     @pytest.mark.asyncio
     async def test_get_printer_state(self, executor):
         payload = _load_json(await executor.execute("get_printer_state", {}))
-        assert payload == {"state": "IDLE_NO_ACTIVE_PRINT"}
+        assert payload == {"printer_id": "default", "state": "IDLE_NO_ACTIVE_PRINT"}
 
     @pytest.mark.asyncio
     async def test_get_print_progress(self, executor):
@@ -181,7 +287,7 @@ class TestPrinterQueryTools:
     async def test_get_z_offset_error_path(self, executor, mock_adapter):
         mock_adapter.get_z_offset.side_effect = RuntimeError("sensor unavailable")
         payload = _load_json(await executor.execute("get_z_offset", {}))
-        assert payload == {"error": "sensor unavailable"}
+        assert payload == {"printer_id": "default", "error": "sensor unavailable"}
 
     @pytest.mark.asyncio
     async def test_list_files_transforms_data(self, executor):
@@ -204,15 +310,90 @@ class TestPrinterQueryTools:
         )
         assert payload["layers"] == 123
 
+
+    @pytest.mark.asyncio
+    async def test_list_printer_config_files_reads_remote_config_root(self, executor):
+        payload = _load_json(await executor.execute("list_printer_config_files", {}))
+
+        assert payload["printer_id"] == "default"
+        assert payload["count"] == 2
+        assert payload["files"][0]["filename"] == "printer.cfg"
+        assert "remote Moonraker" in payload["note"]
+
+    @pytest.mark.asyncio
+    async def test_get_printer_config_file_reads_remote_content(self, executor, mock_adapter):
+        payload = _load_json(
+            await executor.execute("get_printer_config_file", {"filename": "printer.cfg"})
+        )
+
+        assert payload["printer_id"] == "default"
+        assert payload["filename"] == "printer.cfg"
+        assert "[printer]" in payload["content"]
+        assert payload["truncated"] is False
+        assert "not local /app" in payload["note"]
+        mock_adapter.get_config_file.assert_awaited_once_with(
+            filename="printer.cfg", max_bytes=50000
+        )
+
+    @pytest.mark.asyncio
+    async def test_config_file_tools_report_unsupported_adapter(self):
+        adapter = MagicMock()
+        adapter.get_printer_state = AsyncMock(return_value=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT)
+        executor = ToolExecutor(adapter=adapter)
+
+        payload = _load_json(await executor.execute("get_printer_config_file", {}))
+
+        assert payload["printer_id"] == "default"
+        assert "does not support remote config file reads" in payload["error"]
+
     @pytest.mark.asyncio
     async def test_get_system_info(self, executor):
         payload = _load_json(await executor.execute("get_system_info", {}))
-        assert payload == {"cpu_load": 0.21, "state": "ready"}
+        assert payload == {"cpu_load": 0.21, "state": "ready", "printer_id": "default"}
 
     @pytest.mark.asyncio
     async def test_list_macros(self, executor):
         payload = _load_json(await executor.execute("list_macros", {}))
-        assert payload == {"macros": ["PRINT_START", "CANCEL_PRINT"]}
+        assert payload == {"printer_id": "default", "macros": ["PRINT_START", "CANCEL_PRINT"]}
+
+    @pytest.mark.asyncio
+    async def test_list_printers_and_target_non_active(self, mock_adapter):
+        other = MagicMock()
+        other.get_print_progress = AsyncMock(
+            return_value=PrintProgress(
+                state=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
+                filename=None,
+                progress=None,
+            )
+        )
+        executor = ToolExecutor(
+            adapters={"neptune4max": mock_adapter, "rpi-printer": other},
+            active_printer="neptune4max",
+        )
+
+        printers = _load_json(await executor.execute("list_printers", {}))
+        assert printers["active_printer"] == "neptune4max"
+        assert [p["printer_id"] for p in printers["printers"]] == ["neptune4max", "rpi-printer"]
+
+        default_payload = _load_json(await executor.execute("get_print_progress", {}))
+        assert default_payload["printer_id"] == "neptune4max"
+        mock_adapter.get_print_progress.assert_called_once()
+
+        other_payload = _load_json(
+            await executor.execute("get_print_progress", {"printer_id": "rpi-printer"})
+        )
+        assert other_payload["printer_id"] == "rpi-printer"
+        assert other_payload["state"] == "IDLE_NO_ACTIVE_PRINT"
+        other.get_print_progress.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_printer_id_returns_clear_error(self, mock_adapter):
+        executor = ToolExecutor(adapters={"neptune4max": mock_adapter}, active_printer="neptune4max")
+        payload = _load_json(
+            await executor.execute("get_print_progress", {"printer_id": "rpi-printer"})
+        )
+        assert "Unknown printer_id 'rpi-printer'" in payload["error"]
+        assert "neptune4max" in payload["error"]
 
 
 class TestPrinterControlTools:

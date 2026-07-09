@@ -186,12 +186,16 @@ class OllamaClient(BaseLlmClient):
         super().__init__(config)
         self._client: httpx.AsyncClient | None = None
         self._base_url = config.base_url or "http://localhost:11434/v1"
+        self._headers = {}
+        if config.api_key:
+            self._headers["Authorization"] = f"Bearer {config.api_key}"
 
     async def initialize(self) -> None:
         """Initialize the Ollama HTTP client."""
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._config.timeout_seconds,
+            headers=self._headers,
         )
         logger.info(
             f"Ollama client initialized: model={self._config.model}, base_url={self._base_url}"

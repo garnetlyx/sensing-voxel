@@ -1,0 +1,16 @@
+# SearXNG settings for Sensing Voxel's internal web_search tool.
+# This instance is intended for Docker-internal access by the app, not public exposure.
+use_default_settings: true
+
+search:
+  # JSON must be explicitly enabled; SearXNG's default template only allows HTML.
+  formats:
+    - html
+    - json
+
+server:
+  # The LLM tool calls /search with GET query parameters.
+  method: "GET"
+  limiter: false
+  public_instance: false
+  secret_key: "replace-with-random-secret"

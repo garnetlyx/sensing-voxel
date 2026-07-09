@@ -86,7 +86,18 @@ slicer:
 #   temperature: 0.7
 #   timeout_seconds: 30
 #   max_conversation_turns: 20
+#   verbose_tool_use: true     # Send per-tool-use progress messages (default on)
 #   enabled: false
+#   shell:
+#     enabled: false          # Allow the AI to run short bash diagnostics inside the container
+#     cwd: "/app"             # Root working directory for bash tool
+#     timeout_seconds: 10
+#     max_output_chars: 8000
+#   web_search:
+#     enabled: false          # Requires a SearXNG instance with JSON enabled
+#     searxng_url: "http://searxng:8080"
+#     timeout_seconds: 10
+#     max_results: 5
 
 # Storage Configuration
 storage:

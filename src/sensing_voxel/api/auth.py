@@ -38,7 +38,10 @@ def create_auth_middleware(api_token: str | None):
         token = auth_header[7:]  # Strip "Bearer "
         if token != api_token:
             logger.warning(f"Invalid API token from {request.remote}")
-            raise web.HTTPForbidden(text="Invalid API token")
+            raise web.HTTPUnauthorized(
+                text="Invalid API token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
         return await handler(request)
 
