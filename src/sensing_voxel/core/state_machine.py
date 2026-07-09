@@ -86,8 +86,13 @@ class AgentStateMachine:
         self._on_enter_hooks: dict[AgentState, Callable[[], Awaitable[None]] | None] = {}
         self._on_exit_hooks: dict[AgentState, Callable[[], Awaitable[None]] | None] = {}
 
-        # Global lock to prevent concurrent state transitions (instance-level)
+        # Global lock to prevent concurrent state transitions (instance-level).
+        # We track the owning task and recursion depth so that hooks fired during a
+        # transition can safely call transition_to again without deadlocking
+        # (re-entrant locking within the same task).
         self._global_lock = asyncio.Lock()
+        self._global_lock_owner: object | None = None
+        self._global_lock_depth: int = 0
 
     def __deepcopy__(self, memo):
         """Custom deepcopy that excludes non-picklable asyncio.Lock"""
@@ -95,11 +100,16 @@ class AgentStateMachine:
         new_obj = self.__class__.__new__(self.__class__)
         memo[id(self)] = new_obj
 
-        # Copy all attributes except _global_lock
+        # Copy all attributes except the non-picklable lock fields.
+        # _global_lock_owner holds an asyncio.Task (not picklable); the owner and
+        # depth are reset alongside the fresh lock below.
         for k, v in self.__dict__.items():
             if k == "_global_lock":
-                # Create fresh lock for the copy
                 new_obj._global_lock = asyncio.Lock()
+                new_obj._global_lock_owner = None
+                new_obj._global_lock_depth = 0
+            elif k in ("_global_lock_owner", "_global_lock_depth"):
+                continue
             elif k in ("_on_enter_hooks", "_on_exit_hooks"):
                 # Shallow copy hooks (they're callable, not picklable)
                 setattr(new_obj, k, dict(v))
@@ -125,8 +135,15 @@ class AgentStateMachine:
     async def transition_to(self, new_state: AgentState, persistence=None) -> bool:
         """Transition to new state if valid"""
 
-        # Acquire global lock to prevent concurrent transitions
-        async with self._global_lock:
+        current_task = asyncio.current_task()
+        is_owner = self._global_lock_owner is current_task
+        if not is_owner:
+            await self._global_lock.acquire()
+            self._global_lock_owner = current_task
+            assert self._global_lock_depth == 0
+        self._global_lock_depth += 1
+
+        try:
             # BUG-LOCK-1: Yield to event loop after acquiring lock
             # This ensures concurrent tasks that were waiting can be scheduled
             # before we proceed with the state check
@@ -184,6 +201,11 @@ class AgentStateMachine:
                 # If persistence or anything else fails, state may have been changed
                 logger.error(f"Error during transition to {new_state.name}: {e}")
                 return False
+        finally:
+            self._global_lock_depth -= 1
+            if self._global_lock_depth == 0:
+                self._global_lock_owner = None
+                self._global_lock.release()
 
     async def on_enter(self, state: AgentState, hook: Callable[[], Awaitable[None]]):
         """Register hook for entering state"""
