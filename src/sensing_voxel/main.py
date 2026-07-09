@@ -154,11 +154,14 @@ async def main() -> None:
         chat_manager = ChatManager(
             client=llm_client,
             context_collector=context_collector,
-            adapter=adapters.get(active_printer) if active_printer else None,
+            adapters=adapters,
             camera=tapo_camera,
             rtsp_url=config.dashboard.camera_rtsp_url,
             max_turns=config.llm.max_conversation_turns,
+            context_window_tokens=config.llm.context_window_tokens,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
+            audit_log_path=Path(config.storage.data_dir) / "tool_audit.jsonl",
+            allowed_gcode_commands=set(config.llm.allowed_gcode_commands),
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")
@@ -180,6 +183,8 @@ async def main() -> None:
             persistence=persistence,
             chat_manager=chat_manager,
         )
+        if chat_manager:
+            chat_manager.set_photo_sender(bot.send_photo)
     else:
         logger.info("Telegram bot disabled (no token configured)")
 
@@ -198,6 +203,24 @@ async def main() -> None:
             chat_manager=chat_manager,
             camera=tapo_camera,
         )
+        if dashboard_runner.app:
+            default_logical_user_id = (
+                str(config.telegram.allowed_users[0])
+                if config.telegram.allowed_users
+                else "dashboard-user"
+            )
+            dashboard_runner.app["app_state"]["default_logical_user_id"] = default_logical_user_id
+
+    if chat_manager:
+        async def notify_chat_runtime(request_context, message: str, level: str = "info", data=None):
+            data = data or {}
+            if request_context.channel == "telegram" and bot and request_context.chat_id is not None:
+                await bot.send_message(request_context.chat_id, message)
+                return
+            if ws_manager:
+                await ws_manager.broadcast_alert(level, message, data=data)
+
+        chat_manager.set_text_notifier(notify_chat_runtime)
 
         # Wire per-printer adapter events to WebSocket broadcast
         if adapters and ws_manager:

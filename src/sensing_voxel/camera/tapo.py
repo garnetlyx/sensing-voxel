@@ -107,3 +107,24 @@ class TapoCamera:
             {"ProfileToken": self._profile_token, "PresetToken": str(preset_id)},
         )
         return {"status": "ok", "preset_id": preset_id}
+
+    async def get_position(self) -> dict | None:
+        """Get current PTZ position when supported by the ONVIF backend."""
+        if not self._ptz:
+            return None
+        try:
+            status = await asyncio.to_thread(
+                self._ptz.GetStatus,
+                {"ProfileToken": self._profile_token},
+            )
+        except Exception:
+            return None
+
+        position = getattr(status, "Position", None)
+        pan_tilt = getattr(position, "PanTilt", None)
+        if pan_tilt is None:
+            return None
+        return {
+            "pan": getattr(pan_tilt, "x", None),
+            "tilt": getattr(pan_tilt, "y", None),
+        }

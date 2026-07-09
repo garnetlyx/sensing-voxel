@@ -4,14 +4,24 @@ Chat session manager for AI conversations with tool use
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.llm.client import LlmClient
 from sensing_voxel.llm.context import PrinterContextCollector
+from sensing_voxel.llm.runtime import (
+    BackgroundTaskManager,
+    ChatRequestContext,
+    PendingApprovalStore,
+    ToolAuditLogger,
+    estimate_token_count,
+    summarize_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +32,12 @@ MAX_TELEGRAM_MESSAGE_LENGTH = 4000
 class ChatSession:
     """Per-user chat session with conversation history."""
 
-    def __init__(self, user_id: int, max_turns: int = 20):
+    def __init__(self, user_id: str, max_turns: int = 20):
         self.user_id = user_id
         self.max_turns = max_turns
         self.messages: list[dict] = []
+        self.summary: str | None = None
+        self.last_compacted_at: str | None = None
 
     def to_dict(self) -> dict:
         """Convert session to serializable dict."""
@@ -33,6 +45,8 @@ class ChatSession:
             "user_id": self.user_id,
             "max_turns": self.max_turns,
             "messages": self.messages,
+            "summary": self.summary,
+            "last_compacted_at": self.last_compacted_at,
         }
 
     @classmethod
@@ -40,6 +54,8 @@ class ChatSession:
         """Create session from dict."""
         session = cls(data["user_id"], data.get("max_turns", 20))
         session.messages = data.get("messages", [])
+        session.summary = data.get("summary")
+        session.last_compacted_at = data.get("last_compacted_at")
         return session
 
     def add_user_message(self, content: str) -> None:
@@ -78,6 +94,27 @@ class ChatSession:
     def clear(self) -> None:
         """Clear conversation history."""
         self.messages.clear()
+        self.summary = None
+        self.last_compacted_at = None
+
+    def compact_if_needed(self, context_window_tokens: int) -> bool:
+        """Compact older turns into a summary when the estimate crosses threshold."""
+        if estimate_token_count(self.messages, self.summary) <= int(context_window_tokens * 0.7):
+            return False
+
+        keep_messages = self.messages[-12:]
+        old_messages = self.messages[:-12]
+        if not old_messages:
+            return False
+
+        new_summary = summarize_messages(old_messages)
+        if self.summary:
+            self.summary = f"{self.summary}\n{new_summary}"[:2400]
+        else:
+            self.summary = new_summary
+        self.messages = keep_messages
+        self.last_compacted_at = datetime.now().isoformat()
+        return True
 
     def _trim(self) -> None:
         """Trim oldest messages to stay within max_turns.
@@ -112,44 +149,88 @@ class ChatManager:
         self,
         client: LlmClient,
         context_collector: PrinterContextCollector,
-        adapter: PrinterAdapter | None = None,
+        adapters: dict[str, Any] | None = None,
+        adapter: Any | None = None,
         camera=None,
         rtsp_url: str | None = None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
+        context_window_tokens: int = 32000,
         history_path: Path | None = None,
+        audit_log_path: Path | None = None,
+        allowed_gcode_commands: set[str] | None = None,
     ):
         self._client = client
         self._context_collector = context_collector
-        self._adapter = adapter
+        self._adapters = adapters or ({"default": adapter} if adapter is not None else {})
         self._camera = camera
         self._max_turns = max_turns
         self._max_tool_iterations = max_tool_iterations
+        self._context_window_tokens = context_window_tokens
         self._history_path = history_path or Path("data/chat_history.json")
-        self._sessions: dict[int, ChatSession] = {}
+        self._audit_logger = ToolAuditLogger(audit_log_path or Path("data/tool_audit.jsonl"))
+        self._background_tasks = BackgroundTaskManager()
+        self._approval_store = PendingApprovalStore()
+        self._sessions: dict[str, ChatSession] = {}
 
         # Create tool executor if adapter is available
         self._tool_executor = None
         self._tools = None
-        if adapter:
+        if self._adapters:
             from sensing_voxel.llm.tools import CAMERA_TOOLS, PRINTER_TOOLS, ToolExecutor
 
-            self._tool_executor = ToolExecutor(adapter, camera=camera, rtsp_url=rtsp_url)
+            self._tool_executor = ToolExecutor(
+                self._adapters,
+                camera=camera,
+                rtsp_url=rtsp_url,
+                audit_logger=self._audit_logger,
+                background_tasks=self._background_tasks,
+                approval_store=self._approval_store,
+                allowed_gcode_commands=allowed_gcode_commands,
+            )
             self._tools = list(PRINTER_TOOLS)
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
 
-    async def chat(self, user_id: int, message: str) -> str:
+    def set_photo_sender(self, sender) -> None:
+        """Attach a channel-specific photo sender after construction."""
+        if self._tool_executor is not None:
+            self._tool_executor._photo_sender = sender
+
+    def set_text_notifier(self, sender) -> None:
+        """Attach a channel-aware text notifier for background task callbacks."""
+        if self._tool_executor is not None:
+            self._tool_executor._text_notifier = sender
+
+    async def chat(
+        self,
+        logical_user_id: str | int | None = None,
+        message: str = "",
+        request_context: ChatRequestContext | None = None,
+        user_id: str | int | None = None,
+    ) -> str:
         """Process user message and return AI response.
 
         If tools are available, runs an agentic loop: the LLM can call
         tools, observe results, and continue until it produces a final
         text response or hits the iteration limit.
         """
-        session = self._get_or_create_session(user_id)
+        identity = logical_user_id if logical_user_id is not None else user_id
+        if identity is None:
+            raise ValueError("logical_user_id or user_id is required")
+        user_key = str(identity)
+        request_context = request_context or ChatRequestContext(
+            logical_user_id=user_key,
+            channel="unknown",
+        )
+        session = self._get_or_create_session(identity)
         session.add_user_message(message)
+        session.compact_if_needed(self._context_window_tokens)
 
-        system_prompt = self._context_collector.format_system_prompt()
+        system_prompt = self._context_collector.format_system_prompt(
+            request_context=request_context,
+            chat_summary=session.summary,
+        )
 
         # No tools — simple path
         if not self._tool_executor or not self._tools:
@@ -197,7 +278,15 @@ class ChatManager:
                     block_input = block.input if hasattr(block, "input") else block.get("input")
                     block_id = block.id if hasattr(block, "id") else block.get("id")
                     logger.info(f"Tool call: {block_name}({block_input})")
-                    result = await self._tool_executor.execute(block_name, block_input)
+                    execute_sig = inspect.signature(self._tool_executor.execute)
+                    if len(execute_sig.parameters) >= 3:
+                        result = await self._tool_executor.execute(
+                            block_name,
+                            block_input,
+                            request_context,
+                        )
+                    else:
+                        result = await self._tool_executor.execute(block_name, block_input)
                     if isinstance(result, dict) and "content" in result:
                         logger.info(f"Tool result: [image + text content blocks]")
                         session.add_tool_result(block_id, result["content"])
@@ -211,16 +300,65 @@ class ChatManager:
             "Please try again or simplify your request."
         )
 
-    def clear_session(self, user_id: int) -> None:
+    def clear_session(self, user_id: str | int) -> None:
         """Clear user's conversation history."""
+        user_key = str(user_id)
         if user_id in self._sessions:
             self._sessions[user_id].clear()
             self.save_history()
+            return
+        if user_key in self._sessions:
+            self._sessions[user_key].clear()
+            self.save_history()
 
-    def get_history(self, user_id: int) -> list[dict]:
+    def get_history(self, user_id: str | int) -> list[dict]:
         """Get message history for a user."""
         session = self._get_or_create_session(user_id)
         return session.get_messages()
+
+    def get_context_status(
+        self,
+        user_id: str | int,
+        request_context: ChatRequestContext | None = None,
+    ) -> dict[str, Any]:
+        """Expose session/context diagnostics for the UI and bot."""
+        user_key = str(user_id)
+        session = self._get_or_create_session(user_key)
+        return {
+            "logical_user_id": user_key,
+            "channel": request_context.channel if request_context else None,
+            "active_printer": (
+                request_context.active_printer
+                if request_context and request_context.active_printer
+                else getattr(self._context_collector, "_active_printer", None)
+            ),
+            "model": getattr(getattr(self._client, "_config", None), "model", None),
+            "context_window_tokens": self._context_window_tokens,
+            "estimated_tokens": estimate_token_count(session.messages, session.summary),
+            "message_count": len(session.messages),
+            "last_compacted_at": session.last_compacted_at,
+            "summary": session.summary,
+        }
+
+    def get_audit_records(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Read recent tool audit records."""
+        return self._audit_logger.tail(limit=limit)
+
+    def get_background_tasks(
+        self,
+        logical_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Expose recent background tasks for a logical user."""
+        return self._background_tasks.tail(str(logical_user_id), limit=limit)
+
+    def get_pending_approvals(
+        self,
+        logical_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Expose pending approvals for a logical user."""
+        return self._approval_store.tail(str(logical_user_id), limit=limit, status="pending")
 
     def save_history(self, path: Path | str | None = None) -> None:
         """Save all sessions to disk."""
@@ -228,8 +366,10 @@ class ChatManager:
         try:
             data = {str(uid): s.to_dict() for uid, s in self._sessions.items()}
             history_path.parent.mkdir(parents=True, exist_ok=True)
-            with history_path.open("w", encoding="utf-8") as f:
+            tmp_path = history_path.with_suffix(f"{history_path.suffix}.tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            tmp_path.replace(history_path)
         except Exception as e:
             logger.error(f"Failed to save chat history: {e}")
 
@@ -242,20 +382,34 @@ class ChatManager:
             with history_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             for uid_str, s_data in data.items():
-                self._sessions[int(uid_str)] = ChatSession.from_dict(s_data)
+                self._sessions[str(uid_str)] = ChatSession.from_dict(s_data)
             logger.info(f"Loaded {len(self._sessions)} chat sessions from {history_path}")
         except Exception as e:
             logger.error(f"Failed to load chat history: {e}")
+            try:
+                corrupt_path = history_path.with_suffix(
+                    f"{history_path.suffix}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                )
+                shutil.move(str(history_path), str(corrupt_path))
+                logger.warning(f"Moved corrupt chat history to {corrupt_path}")
+            except Exception as move_error:
+                logger.error(f"Failed to quarantine corrupt chat history: {move_error}")
 
     def get_session_count(self) -> int:
         """Get number of active sessions."""
         return len(self._sessions)
 
-    def _get_or_create_session(self, user_id: int) -> ChatSession:
+    def _get_or_create_session(self, user_id: str | int) -> ChatSession:
         """Get existing session or create new one."""
-        if user_id not in self._sessions:
+        user_key = str(user_id)
+        if user_id in self._sessions:
+            return self._sessions[user_id]
+        if isinstance(user_id, int) and user_key not in self._sessions:
             self._sessions[user_id] = ChatSession(user_id, self._max_turns)
-        return self._sessions[user_id]
+            return self._sessions[user_id]
+        if user_key not in self._sessions:
+            self._sessions[user_key] = ChatSession(user_key, self._max_turns)
+        return self._sessions[user_key]
 
     @staticmethod
     def _serialize_content(content) -> list[dict]:

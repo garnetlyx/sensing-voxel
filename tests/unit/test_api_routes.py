@@ -50,6 +50,10 @@ class MockChatManager:
         self.chat = AsyncMock(return_value="Test response")
         self.clear_session = MagicMock()
         self.get_history = MagicMock(return_value=[{"role": "user", "content": "Hello"}])
+        self.get_context_status = MagicMock(return_value={"model": "test"})
+        self.get_audit_records = MagicMock(return_value=[])
+        self.get_background_tasks = MagicMock(return_value=[])
+        self.get_pending_approvals = MagicMock(return_value=[])
 
 
 class MockCamera:
@@ -464,7 +468,10 @@ async def test_post_chat_success(aiohttp_client):
     assert resp.status == 200
     data = await resp.json()
     assert data["response"] == "Test response"
-    chat_manager.chat.assert_called_once_with(user_id=0, message="Hello AI")
+    args = chat_manager.chat.await_args.args
+    assert args[0] == "dashboard-user"
+    assert args[1] == "Hello AI"
+    assert args[2].channel == "dashboard"
 
 
 @pytest.mark.asyncio
@@ -519,7 +526,7 @@ async def test_get_chat_history_with_manager(aiohttp_client):
     assert resp.status == 200
     data = await resp.json()
     assert len(data["history"]) == 1
-    chat_manager.get_history.assert_called_once_with(0)
+    chat_manager.get_history.assert_called_once_with("dashboard-user")
 
 
 @pytest.mark.asyncio
@@ -533,7 +540,7 @@ async def test_post_chat_clear(aiohttp_client):
     assert resp.status == 200
     data = await resp.json()
     assert data["status"] == "cleared"
-    chat_manager.clear_session.assert_called_once_with(0)
+    chat_manager.clear_session.assert_called_once_with("dashboard-user")
 
 
 @pytest.mark.asyncio
@@ -709,7 +716,7 @@ async def test_api_with_auth_token(aiohttp_client):
         "/api/v1/printers",
         headers={"Authorization": "Bearer wrong_token"},
     )
-    assert resp.status == 401
+    assert resp.status == 403
 
     resp = await client.get(
         "/api/v1/printers",

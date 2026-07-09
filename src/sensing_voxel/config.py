@@ -158,9 +158,11 @@ class LlmConfig:
     base_url: str = "https://api.anthropic.com"
     model: str = "claude-sonnet-4-20250514"
     max_tokens: int = 2048
+    context_window_tokens: int = 32000
     temperature: float = 0.7
     timeout_seconds: int = 30
     max_conversation_turns: int = 20
+    allowed_gcode_commands: list[str] = field(default_factory=list)
     enabled: bool = False
 
 

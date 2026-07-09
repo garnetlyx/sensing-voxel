@@ -577,8 +577,60 @@ class KlipperAdapter(PrinterAdapter):
             return CommandResult(CommandResultStatus.FAILURE, message=validation_error)
 
         safe_command = _strip_gcode_comment(command)
+        upper_command = safe_command.upper()
+        if upper_command.startswith("M114") or upper_command.startswith("GET_POSITION"):
+            position = await self.get_current_position()
+            if position is None:
+                return CommandResult(
+                    CommandResultStatus.FAILURE,
+                    message="Current position is unavailable",
+                )
+            return CommandResult(
+                CommandResultStatus.SUCCESS,
+                message=(
+                    f"X:{position['x']:.3f} Y:{position['y']:.3f} Z:{position['z']:.3f}"
+                ),
+                data={"response_type": "position", "position": position},
+            )
+        if upper_command.startswith("GCODE_LIST") or upper_command.startswith("HELP"):
+            return await self._get_gcode_help()
+        if upper_command.startswith("QUERY_ENDSTOPS"):
+            return await self._query_endstops()
+
         return await self._rest_request(
             "POST", "/printer/gcode/script", json={"script": safe_command}
+        )
+
+    async def _get_gcode_help(self) -> CommandResult:
+        result = await self._rest_request("GET", "/printer/gcode/help")
+        if result.status != CommandResultStatus.SUCCESS or not result.data:
+            return result
+        commands = result.data.get("commands") if isinstance(result.data, dict) else None
+        if commands is None:
+            commands = result.data
+        if isinstance(commands, dict):
+            command_names = sorted(commands.keys())
+        elif isinstance(commands, list):
+            command_names = sorted(str(item) for item in commands)
+        else:
+            command_names = []
+        return CommandResult(
+            CommandResultStatus.SUCCESS,
+            message=f"Found {len(command_names)} available G-code commands",
+            data={"response_type": "gcode_list", "commands": command_names},
+        )
+
+    async def _query_endstops(self) -> CommandResult:
+        result = await self._rest_request("GET", "/printer/objects/query?query_endstops")
+        if result.status != CommandResultStatus.SUCCESS or not result.data:
+            return result
+        status = result.data.get("status", result.data)
+        query = status.get("query_endstops", {})
+        last_query = query.get("last_query")
+        return CommandResult(
+            CommandResultStatus.SUCCESS,
+            message="Queried endstop status",
+            data={"response_type": "endstops", "endstops": last_query or query},
         )
 
     async def list_files(self) -> CommandResult:
@@ -749,7 +801,7 @@ class KlipperAdapter(PrinterAdapter):
         """Get current print progress and state"""
         # Query comprehensive printer status
         result = await self._rest_request(
-            "GET", "/printer/objects/query?print_stats&heater_bed&extruder&toolhead"
+            "GET", "/printer/objects/query?print_stats&heater_bed&extruder&toolhead&display_status"
         )
 
         if result.status != CommandResultStatus.SUCCESS or not result.data:
@@ -771,7 +823,7 @@ class KlipperAdapter(PrinterAdapter):
         heater_bed = status.get("heater_bed", {})
         extruder = status.get("extruder", {})
 
-        # Parse layer info from filename parsing (if available)
+        # Parse layer info from Klipper stats or metadata fallback
         filename = print_stats.get("filename", "")
         current_layer = None
         total_layers = None
@@ -782,13 +834,30 @@ class KlipperAdapter(PrinterAdapter):
             current_layer = info.get("current_layer")
             total_layers = info.get("total_layer")
 
-        # If Klipper doesn't have layer info, estimate from file metadata + progress
+        toolhead = status.get("toolhead", {})
+        position = toolhead.get("position", [0.0, 0.0, 0.0]) if toolhead else [0.0, 0.0, 0.0]
+        current_z = position[2] if len(position) > 2 else 0.0
+
+        # If Klipper doesn't have layer info, estimate from file metadata and current Z/progress
         if total_layers is None and filename and progress is not None:
             file_meta = await self.get_file_metadata(filename)
             if file_meta.status == CommandResultStatus.SUCCESS and file_meta.data:
                 total_layers = file_meta.data.get("total_layers")
+                layer_height = file_meta.data.get("layer_height")
+                first_layer_height = file_meta.data.get("first_layer_height")
                 if total_layers and current_layer is None:
-                    current_layer = max(1, int(progress * total_layers))
+                    if layer_height and current_z > 0:
+                        base_height = first_layer_height or layer_height
+                        if current_z <= base_height:
+                            current_layer = 1
+                        else:
+                            current_layer = 1 + max(
+                                0,
+                                int(round((current_z - base_height) / layer_height)),
+                            )
+                            current_layer = min(current_layer, total_layers)
+                    else:
+                        current_layer = max(1, int(progress * total_layers))
 
         return PrintProgress(
             state=state,
@@ -802,6 +871,22 @@ class KlipperAdapter(PrinterAdapter):
             bed_temp=heater_bed.get("temperature"),
             bed_target=heater_bed.get("target"),
         )
+
+    async def get_current_position(self) -> dict[str, float] | None:
+        """Get current position from Klipper toolhead state."""
+        result = await self._rest_request("GET", "/printer/objects/query?toolhead")
+        if result.status != CommandResultStatus.SUCCESS or not result.data:
+            return None
+        status = result.data.get("status", result.data)
+        toolhead = status.get("toolhead", {})
+        position = toolhead.get("position")
+        if not position or len(position) < 3:
+            return None
+        return {
+            "x": float(position[0]),
+            "y": float(position[1]),
+            "z": float(position[2]),
+        }
 
     async def is_connected(self) -> bool:
         return self._connected and self._session is not None

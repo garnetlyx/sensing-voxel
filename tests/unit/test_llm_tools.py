@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
 
+import asyncio
 import base64
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -47,6 +48,7 @@ def mock_adapter():
             total_layers=200,
         )
     )
+    adapter.get_current_position = AsyncMock(return_value={"x": 1.0, "y": 2.0, "z": 3.0})
 
     for name in [
         "start_print",
@@ -98,6 +100,7 @@ def mock_camera():
     camera.move_to = AsyncMock(return_value={"status": "ok"})
     camera.get_presets = AsyncMock(return_value={"presets": [{"id": 1, "name": "bed"}]})
     camera.set_preset = AsyncMock(return_value={"status": "ok"})
+    camera.get_position = AsyncMock(return_value={"pan": 0.1, "tilt": 0.2})
     return camera
 
 
@@ -217,14 +220,11 @@ class TestPrinterControlTools:
     @pytest.mark.parametrize(
         ("tool_name", "tool_input", "adapter_method", "expected_call"),
         [
-            ("start_print", {"filename": "part.gcode"}, "start_print", ("part.gcode",)),
             ("pause_print", {}, "pause_print", ()),
             ("resume_print", {}, "resume_print", ()),
-            ("cancel_print", {}, "cancel_print", ()),
             ("home_axes", {"axes": "X Y"}, "home_axes", ("X Y",)),
             ("set_fan_speed", {"speed": 200}, "set_fan_speed", (200,)),
             ("set_z_offset", {"offset_mm": -0.03}, "set_z_offset", (-0.03,)),
-            ("delete_file", {"filename": "old.gcode"}, "delete_file", ("old.gcode",)),
             (
                 "move_axis",
                 {"axis": "x", "distance": 5.5, "speed": 1234},
@@ -235,9 +235,6 @@ class TestPrinterControlTools:
             ("motors_off", {}, "motors_off", ()),
             ("set_speed_override", {"percent": 150}, "set_speed_override", (150,)),
             ("set_flow_override", {"percent": 120}, "set_flow_override", (120,)),
-            ("execute_macro", {"name": "PRINT_START"}, "execute_macro", ("PRINT_START",)),
-            ("restart_firmware", {}, "restart_firmware", ()),
-            ("restart_service", {}, "restart_service", ()),
         ],
     )
     async def test_control_tool_happy_paths(
@@ -270,12 +267,152 @@ class TestPrinterControlTools:
 
     @pytest.mark.asyncio
     async def test_run_gcode_executes_sanitized_command(self, executor, mock_adapter):
-        payload = _load_json(
+        first = _load_json(
             await executor.execute("run_gcode", {"command": "G1 X100 Y100 Z10 E5 F1200 ; move"})
+        )
+        token = first["approval_token"]
+        payload = _load_json(
+            await executor.execute(
+                "run_gcode",
+                {"approval_token": token, "command": "G1 X100 Y100 Z10 E5 F1200 ; move"},
+            )
         )
         assert payload["status"] == "SUCCESS"
         assert "warning" in payload
         mock_adapter.run_gcode.assert_called_once_with("G1 X100 Y100 Z10 E5 F1200")
+
+    @pytest.mark.asyncio
+    async def test_start_print_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("start_print", {"filename": "part.gcode"}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "start_print",
+                {"approval_token": first["approval_token"], "filename": "part.gcode"},
+            )
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.start_print.assert_called_once_with("part.gcode")
+
+    @pytest.mark.asyncio
+    async def test_cancel_print_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("cancel_print", {}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute("cancel_print", {"approval_token": first["approval_token"]})
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.cancel_print.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_file_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("delete_file", {"filename": "old.gcode"}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "delete_file",
+                {"approval_token": first["approval_token"], "filename": "old.gcode"},
+            )
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.delete_file.assert_called_once_with("old.gcode")
+
+    @pytest.mark.asyncio
+    async def test_execute_macro_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("execute_macro", {"name": "PRINT_START"}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "execute_macro",
+                {"approval_token": first["approval_token"], "name": "PRINT_START"},
+            )
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.execute_macro.assert_called_once_with("PRINT_START")
+
+    @pytest.mark.asyncio
+    async def test_restart_firmware_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("restart_firmware", {}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "restart_firmware",
+                {"approval_token": first["approval_token"]},
+            )
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.restart_firmware.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restart_service_requires_approval_then_executes(self, executor, mock_adapter):
+        first = _load_json(await executor.execute("restart_service", {}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "restart_service",
+                {"approval_token": first["approval_token"]},
+            )
+        )
+        assert payload["status"] == "SUCCESS"
+        mock_adapter.restart_service.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_query_command_executes_without_approval(self, executor, mock_adapter):
+        mock_adapter.run_gcode.return_value = _success(
+            message="X:1.000 Y:2.000 Z:3.000",
+            data={"response_type": "position", "position": {"x": 1.0, "y": 2.0, "z": 3.0}},
+        )
+        payload = _load_json(await executor.execute("run_gcode", {"command": "M114"}))
+        assert payload["status"] == "SUCCESS"
+        assert payload["data"]["response_type"] == "position"
+        mock_adapter.run_gcode.assert_called_once_with("M114")
+
+    @pytest.mark.asyncio
+    async def test_run_shell_requires_approval_then_executes(self, executor):
+        first = _load_json(await executor.execute("run_shell", {"command": "rm -rf /tmp/nope"}))
+        assert first["status"] == "approval_required"
+        payload = _load_json(
+            await executor.execute(
+                "run_shell",
+                {"approval_token": first["approval_token"], "command": "rm -rf /tmp/nope"},
+            )
+        )
+        assert payload["status"] in {"success", "failure"}
+
+    @pytest.mark.asyncio
+    async def test_run_shell_background_task_lifecycle(self, executor):
+        async def fake_background(task_id, _request_context):
+            record = executor._background_tasks.get(task_id)
+            record.status = "running"
+            record.status = "completed"
+
+        executor._run_shell_background = fake_background
+        payload = _load_json(
+            await executor.execute(
+                "run_shell",
+                {
+                    "command": "sleep 0.1",
+                    "background": True,
+                    "task_name": "short sleep",
+                    "completion_message": "done",
+                },
+            )
+        )
+        assert payload["status"] == "scheduled"
+        task_id = payload["task_id"]
+
+        await asyncio.sleep(0)
+
+        tasks_payload = _load_json(await executor.execute("get_background_tasks", {}))
+        matching = [task for task in tasks_payload["tasks"] if task["task_id"] == task_id]
+        assert matching
+        assert matching[0]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_get_pending_approvals_lists_created_tokens(self, executor):
+        await executor.execute("cancel_print", {})
+        payload = _load_json(await executor.execute("get_pending_approvals", {}))
+        assert payload["approvals"]
 
     @pytest.mark.asyncio
     async def test_upload_to_printer_uses_sanitized_basename(
@@ -418,8 +555,22 @@ class TestCameraTools:
     async def test_camera_move_step_passthrough_and_validation(self, executor, mock_camera):
         mock_camera.move_step.return_value = {"error": "invalid direction"}
         payload = _load_json(await executor.execute("camera_move_step", {"direction": "diagonal"}))
-        assert payload == {"error": "invalid direction"}
+        assert payload["error"] == "invalid direction"
+        assert payload["position_before"]["pan"] == 0.1
         mock_camera.move_step.assert_called_once_with("diagonal")
+
+    @pytest.mark.asyncio
+    async def test_camera_move_step_reports_limit_status_from_position_delta(
+        self, executor, mock_camera
+    ):
+        mock_camera.get_position.side_effect = [
+            {"pan": 0.1, "tilt": 0.2},
+            {"pan": 0.1, "tilt": 0.2},
+        ]
+        payload = _load_json(await executor.execute("camera_move_step", {"direction": "left"}))
+        assert payload["limit_status"] == "reached"
+        assert payload["position_before"]["pan"] == 0.1
+        assert payload["position_after"]["pan"] == 0.1
 
     @pytest.mark.asyncio
     async def test_camera_move_to_coerces_int(self, executor, mock_camera):
@@ -442,6 +593,12 @@ class TestCameraTools:
         payload = _load_json(await executor.execute("camera_go_to_preset", {"preset_id": "3"}))
         assert payload == {"status": "ok"}
         mock_camera.set_preset.assert_called_once_with(3)
+
+    @pytest.mark.asyncio
+    async def test_camera_get_position(self, executor):
+        payload = _load_json(await executor.execute("camera_get_position", {}))
+        assert payload["status"] == "ok"
+        assert payload["position"]["pan"] == 0.1
 
     @pytest.mark.asyncio
     async def test_camera_snapshot_base64_content(self, executor, monkeypatch):

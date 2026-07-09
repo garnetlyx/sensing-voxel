@@ -22,6 +22,7 @@ from sensing_voxel.core.models import (
     DecisionAction,
 )
 from sensing_voxel.storage.job_repository import JobRepository, JobStatus
+from sensing_voxel.llm.runtime import ChatRequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,9 @@ async def get_printers(request: web.Request) -> web.Response:
 
     printers = []
     for pid, adapter in adapters.items():
-        # Determine printer type from adapter class name
-        printer_type = type(adapter).__name__.replace("Adapter", "").lower()
+        printer_type = getattr(adapter, "printer_type", None) or type(adapter).__name__.replace(
+            "Adapter", ""
+        ).lower()
         printers.append(
             {
                 "id": pid,
@@ -210,8 +212,18 @@ async def post_chat(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Empty message")
 
     try:
-        # Use user_id=0 for dashboard session
-        response = await chat_manager.chat(user_id=0, message=message)
+        logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
+        request_context = ChatRequestContext(
+            logical_user_id=str(logical_user_id),
+            channel="dashboard",
+            channel_user_id=str(logical_user_id),
+            active_printer=app_state.get("active_printer"),
+        )
+        response = await chat_manager.chat(
+            str(logical_user_id),
+            message,
+            request_context,
+        )
         return web.json_response({"response": response})
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
@@ -225,9 +237,10 @@ async def post_chat_clear(request: web.Request) -> web.Response:
     """Clear the dashboard chat session"""
     app_state = request.app["app_state"]
     chat_manager = app_state.get("chat_manager")
+    logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
 
     if chat_manager:
-        chat_manager.clear_session(0)
+        chat_manager.clear_session(str(logical_user_id))
 
     return web.json_response({"status": "cleared"})
 
@@ -236,12 +249,66 @@ async def get_chat_history(request: web.Request) -> web.Response:
     """Get the dashboard chat history"""
     app_state = request.app["app_state"]
     chat_manager = app_state.get("chat_manager")
+    logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
 
     if not chat_manager:
         return web.json_response({"history": []})
 
-    history = chat_manager.get_history(0)
+    history = chat_manager.get_history(str(logical_user_id))
     return web.json_response({"history": history})
+
+
+async def get_chat_context(request: web.Request) -> web.Response:
+    """Get chat context/session diagnostics."""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+    if not chat_manager:
+        return web.json_response({"error": "AI chat not configured"}, status=503)
+
+    logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
+    request_context = ChatRequestContext(
+        logical_user_id=str(logical_user_id),
+        channel="dashboard",
+        channel_user_id=str(logical_user_id),
+        active_printer=app_state.get("active_printer"),
+    )
+    return web.json_response(chat_manager.get_context_status(str(logical_user_id), request_context))
+
+
+async def get_tool_audit(request: web.Request) -> web.Response:
+    """Return recent tool audit records."""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+    if not chat_manager:
+        return web.json_response({"records": []})
+    limit = int(request.query.get("limit", 50))
+    return web.json_response({"records": chat_manager.get_audit_records(limit=limit)})
+
+
+async def get_background_tasks(request: web.Request) -> web.Response:
+    """Return recent background tasks for the dashboard logical user."""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+    if not chat_manager:
+        return web.json_response({"tasks": []})
+    logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
+    limit = int(request.query.get("limit", 20))
+    return web.json_response(
+        {"tasks": chat_manager.get_background_tasks(str(logical_user_id), limit=limit)}
+    )
+
+
+async def get_pending_approvals(request: web.Request) -> web.Response:
+    """Return pending approvals for the dashboard logical user."""
+    app_state = request.app["app_state"]
+    chat_manager = app_state.get("chat_manager")
+    if not chat_manager:
+        return web.json_response({"approvals": []})
+    logical_user_id = app_state.get("default_logical_user_id", "dashboard-user")
+    limit = int(request.query.get("limit", 20))
+    return web.json_response(
+        {"approvals": chat_manager.get_pending_approvals(str(logical_user_id), limit=limit)}
+    )
 
 
 async def set_active_printer(request: web.Request) -> web.Response:
@@ -538,6 +605,10 @@ def setup_routes(app: web.Application, ws_manager):
     app.router.add_post("/api/v1/chat", post_chat)
     app.router.add_get("/api/v1/chat/history", get_chat_history)
     app.router.add_post("/api/v1/chat/clear", post_chat_clear)
+    app.router.add_get("/api/v1/chat/context", get_chat_context)
+    app.router.add_get("/api/v1/tool-audit", get_tool_audit)
+    app.router.add_get("/api/v1/background-tasks", get_background_tasks)
+    app.router.add_get("/api/v1/pending-approvals", get_pending_approvals)
     app.router.add_post("/api/v1/upload", post_upload)
     app.router.add_post("/api/v1/camera/move", post_camera_move)
     app.router.add_post("/api/v1/camera/preset", post_camera_preset)

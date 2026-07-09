@@ -31,6 +31,7 @@ from telegram.ext import (
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.config import Config
 from sensing_voxel.llm.chat import ChatManager
+from sensing_voxel.llm.runtime import ChatRequestContext
 from sensing_voxel.core.decision import DecisionEngine
 from sensing_voxel.core.models import (
     AgentState,
@@ -117,6 +118,10 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("calibrate_camera", self._handle_calibrate_camera))
         self._app.add_handler(CommandHandler("ask", self._handle_ask))
         self._app.add_handler(CommandHandler("clear_chat", self._handle_clear_chat))
+        self._app.add_handler(CommandHandler("ctx", self._handle_context_status))
+        self._app.add_handler(CommandHandler("audit", self._handle_audit))
+        self._app.add_handler(CommandHandler("tasks", self._handle_tasks))
+        self._app.add_handler(CommandHandler("approvals", self._handle_approvals))
 
         # Message handlers
         self._app.add_handler(MessageHandler(filters.Document.ALL, self._handle_file_upload))
@@ -869,11 +874,17 @@ class TelegramBot:
             return
 
         user_id = update.effective_user.id
+        request_context = ChatRequestContext(
+            logical_user_id=str(user_id),
+            channel="telegram",
+            channel_user_id=str(user_id),
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+        )
 
         await update.effective_chat.send_action("typing")
 
         try:
-            response = await self.chat_manager.chat(user_id, message)
+            response = await self.chat_manager.chat(str(user_id), message, request_context)
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"LLM chat error: {e}", exc_info=True)
@@ -902,6 +913,94 @@ class TelegramBot:
             self.chat_manager.clear_session(update.effective_user.id)
 
         await update.message.reply_text("Chat history cleared.")
+
+    async def _handle_context_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show context/session diagnostics."""
+        if not await self._check_auth(update):
+            return
+        if not self.chat_manager:
+            await update.message.reply_text("AI chat is not configured.")
+            return
+
+        user_id = update.effective_user.id
+        request_context = ChatRequestContext(
+            logical_user_id=str(user_id),
+            channel="telegram",
+            channel_user_id=str(user_id),
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+        )
+        status = self.chat_manager.get_context_status(str(user_id), request_context)
+        summary = status.get("summary") or "(none)"
+        message = (
+            f"Model: <code>{html.escape(str(status.get('model')))}</code>\n"
+            f"Estimated tokens: <code>{status.get('estimated_tokens')}</code>\n"
+            f"Context window: <code>{status.get('context_window_tokens')}</code>\n"
+            f"Messages: <code>{status.get('message_count')}</code>\n"
+            f"Last compacted: <code>{html.escape(str(status.get('last_compacted_at')))}</code>\n"
+            f"Active printer: <code>{html.escape(str(status.get('active_printer')))}</code>\n\n"
+            f"Summary:\n<code>{html.escape(summary[:1500])}</code>"
+        )
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    async def _handle_audit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show recent tool audit records."""
+        if not await self._check_auth(update):
+            return
+        if not self.chat_manager:
+            await update.message.reply_text("AI chat is not configured.")
+            return
+
+        records = self.chat_manager.get_audit_records(limit=5)
+        if not records:
+            await update.message.reply_text("No tool audit records yet.")
+            return
+
+        lines = []
+        for record in records:
+            lines.append(
+                f"{record['started_at']} | {record['tool_name']} | {record['status']} | {record['channel']}"
+            )
+        await update.message.reply_text("\n".join(lines))
+
+    async def _handle_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show recent background tasks."""
+        if not await self._check_auth(update):
+            return
+        if not self.chat_manager:
+            await update.message.reply_text("AI chat is not configured.")
+            return
+
+        user_id = update.effective_user.id
+        tasks = self.chat_manager.get_background_tasks(str(user_id), limit=5)
+        if not tasks:
+            await update.message.reply_text("No background tasks yet.")
+            return
+
+        lines = [
+            f"{task['task_id']} | {task['task_name']} | {task['status']}"
+            for task in tasks
+        ]
+        await update.message.reply_text("\n".join(lines))
+
+    async def _handle_approvals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show pending approvals."""
+        if not await self._check_auth(update):
+            return
+        if not self.chat_manager:
+            await update.message.reply_text("AI chat is not configured.")
+            return
+
+        user_id = update.effective_user.id
+        approvals = self.chat_manager.get_pending_approvals(str(user_id), limit=5)
+        if not approvals:
+            await update.message.reply_text("No pending approvals.")
+            return
+
+        lines = [
+            f"{record['approval_token']} | {record['tool_name']} | {record['reason']}"
+            for record in approvals
+        ]
+        await update.message.reply_text("\n".join(lines))
 
     def create_decision_keyboard(self, job_id: str, state: AgentState) -> InlineKeyboardMarkup:
         """Create inline keyboard for decisions (OpenClaw pattern)"""

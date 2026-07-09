@@ -1,9 +1,9 @@
 # Sensing Voxel - Architecture Document
 
-**Version**: 1.2
-**Date**: 2026-03-03
-**Source**: `.design/plan.md` v10 + `.design/review.md` (all 11 issues addressed)
-**Last Review**: 2026-03-03 — Phase 2/3 vision added; detail restoration from `.design/idea.txt`
+**Version**: 1.3
+**Date**: 2026-03-27
+**Source**: `.design/plan.md` v10 + iterative runtime hardening
+**Last Review**: 2026-03-27 — LLM runtime hardening, tool audit, shared session context, shell access
 
 ---
 
@@ -111,6 +111,7 @@ sensing-voxel/
 │       │   ├── client.py            # Async Anthropic SDK wrapper
 │       │   ├── chat.py              # ChatSession + agentic tool-use loop
 │       │   ├── context.py           # PrinterContextCollector (system prompt)
+│       │   ├── runtime.py           # Request context, audit log, compaction helpers
 │       │   └── tools.py             # 31 tool definitions + ToolExecutor
 │       ├── camera/
 │       │   ├── __init__.py
@@ -443,32 +444,42 @@ class PrinterAdapter(ABC):
 ### 4.14 LLM Chat with Tool Use
 
 - Anthropic SDK-based async client (`llm/client.py`) with retry on transient errors.
-- Per-user `ChatSession` (`llm/chat.py`) with conversation history and safe trim (never orphans tool_result messages).
+- Per-logical-user `ChatSession` (`llm/chat.py`) with shared Telegram/dashboard history, conversation summary, and safe compaction that preserves recent turns.
 - `ChatManager` runs an agentic tool-use loop: LLM calls tools, observes results, continues until text response or max 5 iterations.
-- `PrinterContextCollector` (`llm/context.py`) builds system prompt with live printer state, telemetry, and job context. System prompt explicitly warns LLM that background context may be stale — always use tools for authoritative data.
-- 31 tool definitions in `llm/tools.py`:
-  - **Printer query**: get_printer_state, get_print_progress, get_z_offset, list_files, get_file_metadata, get_system_info, list_macros
-  - **Printer control**: start_print, pause_print, resume_print, cancel_print, set_nozzle_temp, set_bed_temp, home_axes, set_fan_speed, set_z_offset, move_axis, extrude, motors_off, set_speed_override, set_flow_override, run_gcode, execute_macro, restart_firmware, restart_service
-  - **Camera**: camera_snapshot (RTSP frame + base64 image block), camera_move_step, camera_move_to, camera_get_presets, camera_go_to_preset
+- Server-provided `ChatRequestContext` (`llm/runtime.py`) carries request identity, channel, channel-local user/chat IDs, active printer, and request ID into the prompt/tool layer.
+- `PrinterContextCollector` (`llm/context.py`) builds the system prompt with live printer state, telemetry, job context, request context, and compacted session summary. System prompt explicitly warns that background context may be stale and tools remain authoritative.
+- Tool execution is audit-logged to `data/tool_audit.jsonl` with request ID, logical user, channel, tool name, input, timing, outcome, and whether image content was returned.
+- High-risk actions use approval tokens. Raw G-code is default-deny except for safe query-style commands and any explicitly configured allowlist entries (`llm.allowed_gcode_commands`). Shell commands, destructive printer actions, macro execution, restarts, and high-temperature settings can return `approval_required` and must be replayed with the issued approval token.
+- Background shell tasks are supported for non-blocking execution. The runtime stores in-memory task state, emits progress/completion callbacks through Telegram or dashboard alerts, and exposes task state for later inspection/cancellation.
+- The recommended Anthropic-compatible deployment model is `volcengine-anthropic-doubao-seed-20-pro`, which supports direct image input and image-bearing `tool_result` responses through the current proxy.
+- Tool set in `llm/tools.py` includes:
+  - **Printer query**: `get_printer_state`, `get_current_position`, `get_print_progress`, `get_z_offset`, `list_files`, `get_file_metadata`, `get_system_info`, `list_macros`
+  - **Printer control**: `start_print`, `pause_print`, `resume_print`, `cancel_print`, `set_nozzle_temp`, `set_bed_temp`, `home_axes`, `set_fan_speed`, `set_z_offset`, `move_axis`, `extrude`, `motors_off`, `set_speed_override`, `set_flow_override`, `run_gcode`, `execute_macro`, `restart_firmware`, `restart_service`
+  - **Camera**: `camera_snapshot`, `camera_move_step`, `camera_move_to`, `camera_get_presets`, `camera_go_to_preset`, `camera_get_position`
+  - **Runtime ops**: `run_shell`, `get_background_tasks`, `cancel_background_task`, `get_pending_approvals`
+- Most printer-oriented tools accept an optional `printer` parameter. When omitted, routing defaults to the request context’s `active_printer`.
 - Safety: nozzle temp capped at 300C, bed at 120C, M112 blocked via run_gcode (must use emergency_cancel path).
-- `camera_snapshot` returns multimodal content blocks (base64 image + text) for vision analysis by the LLM.
+- `camera_snapshot` returns multimodal content blocks (JPEG image + text), persists the snapshot under `data/camera_snapshots/`, and can deliver the photo back to Telegram when the request originated from Telegram.
+- `run_shell` is intended to reduce long-term pressure to add one-off custom tools. Low-risk inspection commands may run directly; high-risk commands return an approval-required result instead of executing.
 
 ### 4.15 Camera PTZ Control
 
 - `TapoCamera` (`camera/tapo.py`) uses `python-onvif-zeep` for ONVIF protocol.
 - ONVIF connection via `asyncio.to_thread` (blocking ONVIF SDK calls offloaded).
-- Supports: move_step (left/right/up/down), move_to (absolute pan/tilt), get_presets, go_to_preset.
+- Supports: move_step (left/right/up/down), move_to (absolute pan/tilt), get_presets, go_to_preset, and best-effort `get_position()` via ONVIF status when the camera reports PTZ coordinates.
 - Step movements use velocity-based continuous move with 0.3s duration + stop.
 - Configuration via `TapoCameraConfig` (host, user, password, onvif_port).
+- PTZ hard-limit detection is not inferred blindly. If the camera API cannot report limit state, tool responses surface `limit_status: unknown`.
 
 ### 4.16 Web Dashboard API
 
 - `aiohttp`-based web server (`api/server.py`) with REST + WebSocket endpoints.
-- REST: `/api/health`, `/api/printers`, `/api/status`, `/api/telemetry/{printer_id}`, `/api/actions/{printer_id}/{action}`, `/api/llm/chat`.
+- REST: `/api/health`, `/api/printers`, `/api/status`, `/api/telemetry/{printer_id}`, `/api/actions/{printer_id}/{action}`, `/api/llm/chat`, `/api/v1/chat/context`, `/api/v1/tool-audit`, `/api/v1/background-tasks`, `/api/v1/pending-approvals`.
 - WebSocket: `/ws` for real-time telemetry push to dashboard clients.
 - MJPEG camera proxy: `/api/camera/stream` converts RTSP to browser-compatible MJPEG.
 - Optional API token authentication (`DashboardConfig.api_token`).
 - Static file serving for dashboard UI at `/`.
+- Dashboard chat uses the same logical-user session model as Telegram instead of a hardcoded `user_id=0`.
 
 ---
 
@@ -658,12 +669,12 @@ The find-stl skill stages downloaded files with:
 | LLM-centric skill system (prompt injection) | Our logic is rule-based, not LLM-driven |
 | Grammy framework internals | Using `python-telegram-bot` instead |
 | Community skill sharing (ClawhHub) | Single-purpose agent |
-| Multi-session management | One session per printer instance |
+| Multi-session management | Shared per-logical-user chat session across Telegram and dashboard |
 | Disk budget / transcript archival | Overkill for MVP |
 
 ---
 
-## 9. Implementation Status (as of 2026-03-05)
+## 9. Implementation Status (as of 2026-03-27)
 
 This section tracks actual implementation state vs. the architecture spec.
 
@@ -682,14 +693,15 @@ This section tracks actual implementation state vs. the architecture spec.
 | Bambu adapter | `adapters/bambu.py` | ~80% | MQTT+FTP, start/pause/cancel/status, emergency cancel |
 | Telegram bot | `bot/telegram.py` | ~70% | Auth, upload, decisions, DI, notifications; missing AI chat wiring |
 | Configuration | `config.py` | Complete | All config sections including LLM, TapoCamera, Dashboard |
-| Entry point | `main.py` | ~90% | Async main, multi-printer, dashboard, LLM wiring |
-| Web dashboard API | `api/` | Complete | REST endpoints, WebSocket, MJPEG proxy, token auth |
+| Entry point | `main.py` | Complete | Async main, multi-printer, dashboard, LLM wiring, chat photo sender, default logical user |
+| Web dashboard API | `api/` | Complete | REST endpoints, WebSocket, MJPEG proxy, token auth, chat context and audit endpoints |
 | Dashboard UI | `dashboard/static/` | ~40% | Real-time telemetry, multi-printer selector |
 | LLM client | `llm/client.py` | Complete | Async Anthropic SDK wrapper with retry |
-| LLM chat | `llm/chat.py` | Complete | Per-user sessions, agentic tool-use loop (max 5 iterations) |
-| LLM context | `llm/context.py` | Complete | Printer context collector + system prompt builder |
-| LLM tools | `llm/tools.py` | Complete | 31 tools: printer control, camera, system (Fluidd-equivalent) |
-| Camera PTZ | `camera/tapo.py` | Complete | ONVIF-based Tapo C220 pan/tilt control |
+| LLM runtime | `llm/runtime.py` | Complete | Request context, token estimation, compaction helpers, tool audit logger, approvals, background tasks |
+| LLM chat | `llm/chat.py` | Complete | Shared logical-user sessions, auto-compaction, context diagnostics, audit access, task/approval visibility |
+| LLM context | `llm/context.py` | Complete | Printer context collector + request context + summary-aware system prompt builder |
+| LLM tools | `llm/tools.py` | Complete | Printer control/query, camera, shell, printer targeting, audit-aware executor |
+| Camera PTZ | `camera/tapo.py` | Complete | ONVIF-based Tapo C220 pan/tilt control + best-effort position reporting |
 | Monitoring orchestrator | `monitoring/monitor.py` | ~60% | External print detection done, NOTHING routing done |
 
 ### Not Yet Implemented
@@ -710,3 +722,4 @@ This section tracks actual implementation state vs. the architecture spec.
 | §8.2 | Jitter should be random | Uses `event_loop.time() % 1` (deterministic) | Yes — BUG-REV-4 |
 | §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation |
 | §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; no env var fallback | Low risk for MVP |
+| Runtime plan | First-class reminder/scheduler helpers | Background execution exists and can support sleep-based reminders, but there is no dedicated milestone/reminder planner yet | Planned follow-up |

@@ -10,6 +10,7 @@ from datetime import datetime
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import TelemetryData
 from sensing_voxel.core.state_machine import AgentStateMachine
+from sensing_voxel.llm.runtime import ChatRequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -159,11 +160,29 @@ class PrinterContextCollector:
 
         return "\n".join(lines)
 
-    def format_system_prompt(self) -> str:
+    def format_system_prompt(
+        self,
+        request_context: ChatRequestContext | None = None,
+        chat_summary: str | None = None,
+    ) -> str:
         """Build complete system prompt with live printer context."""
         context = self.collect_context()
-        return (
-            f"{BASE_SYSTEM_PROMPT}\n\n---\n"
-            "Background Context (may be stale — use tools for authoritative data):\n"
-            f"{context}\n---"
-        )
+        sections = [
+            BASE_SYSTEM_PROMPT,
+            "\n\n---\nBackground Context (may be stale — use tools for authoritative data):\n",
+            context,
+            "\n---",
+        ]
+        if request_context:
+            sections.extend(
+                [
+                    "\nRequest Context:\n",
+                    f"- Channel: {request_context.channel}\n",
+                    f"- Logical User: {request_context.logical_user_id}\n",
+                    f"- Active Printer Preference: {request_context.active_printer or self._active_printer or 'none'}\n",
+                    f"- Request ID: {request_context.request_id}\n",
+                ]
+            )
+        if chat_summary:
+            sections.extend(["\nCompacted Conversation Summary:\n", chat_summary, "\n"])
+        return "".join(sections)

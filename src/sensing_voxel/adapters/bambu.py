@@ -143,6 +143,7 @@ class BambuAdapter(PrinterAdapter):
 
         # Cached telemetry data
         self._cached_telemetry: dict[str, Any] = {}
+        self._last_position: dict[str, float] | None = None
 
         # Z-offset cache (Bambu reports this in telemetry)
         self._z_offset: float = 0.0
@@ -522,6 +523,13 @@ class BambuAdapter(PrinterAdapter):
 
             if not temps and not position:
                 return None
+
+            if position:
+                self._last_position = {
+                    "x": float(position["x"]),
+                    "y": float(position["y"]),
+                    "z": float(position["z"]),
+                }
 
             return TelemetryData(
                 timestamp=datetime.now(),
@@ -1064,6 +1072,10 @@ class BambuAdapter(PrinterAdapter):
             bed_temp=bed_temp,
             bed_target=bed_target,
         )
+
+    async def get_current_position(self) -> dict[str, float] | None:
+        """Get last known position from cached telemetry."""
+        return dict(self._last_position) if self._last_position else None
 
     async def is_connected(self) -> bool:
         """Check if adapter is connected"""

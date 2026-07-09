@@ -170,6 +170,11 @@ class PrinterAdapter(ABC):
         pass
 
     @abstractmethod
+    async def get_current_position(self) -> dict[str, float] | None:
+        """Get current toolhead/nozzle position if available."""
+        pass
+
+    @abstractmethod
     async def is_connected(self) -> bool:
         """Check if adapter is connected"""
         pass
