@@ -60,10 +60,18 @@ def sample_image_path():
 
 
 def pytest_collection_modifyitems(items):
-    """Add asyncio marker to all async tests"""
+    """Add asyncio marker to all async tests; tag live-system tests."""
     for item in items:
         if asyncio.iscoroutinefunction(item.function):
             item.add_marker(pytest.mark.asyncio)
+    # Tests under tests/e2e/ and tests/real_world/ require live hardware,
+    # a running dashboard, or network access to printers. Tag them as
+    # "live" so they can be deselected in CI and default local runs.
+    live_paths = ("tests/e2e/", "tests/real_world/")
+    for item in items:
+        rel = str(item.fspath)
+        if rel.startswith(live_paths):
+            item.add_marker(pytest.mark.live)
 
 
 def pytest_configure(config):
@@ -79,4 +87,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "slow: mark test as slow",
+    )
+    config.addinivalue_line(
+        "markers",
+        "live: requires live hardware, running dashboard, or network access",
     )

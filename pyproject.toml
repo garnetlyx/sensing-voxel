@@ -18,6 +18,7 @@ dependencies = [
     "opencv-python>=4.9",
     "NOTHING>=8.2",
     "numpy>=1.24",
+    "scipy>=1.11",
     "pydantic>=2.0",
     "filelock>=3.12",
     "paho-mqtt>=2.0",
@@ -52,12 +53,15 @@ sensing_voxel = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unit", "tests/integration"]
+norecursedirs = ["tests/e2e", "tests/real_world"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test"]
 python_functions = ["test_"]
+addopts = ["-m", "not live"]
 markers = [
     "qa_critical: marks tests as critical QA tests",
+    "live: requires live hardware, running dashboard, or network access (deselected by default; run with: pytest -m live --no-header -o testpaths=tests)",
 ]
 
 [tool.black]
