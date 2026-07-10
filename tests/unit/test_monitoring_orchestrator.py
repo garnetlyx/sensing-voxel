@@ -357,46 +357,6 @@ class TestMonitoringOrchestrator:
         assert orchestrator.state_machine.current_state == AgentState.PAUSED_PENDING_USER
 
     @pytest.mark.asyncio
-    async def test_handle_NOTHING_pause(self, orchestrator, mock_persistence):
-        """Test handling NOTHING detection pause"""
-        await orchestrator.start()
-
-        # Trigger external print detection
-        await orchestrator._handle_state_change(
-            NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
-            NormalizedPrinterState.PRINTING,
-        )
-        await orchestrator._handle_state_change(
-            NormalizedPrinterState.PRINTING,
-            NormalizedPrinterState.PRINTING,
-        )
-
-        # Handle NOTHING pause
-        await orchestrator.NOTHING(confidence=0.7)
-
-        assert orchestrator.state_machine.current_state == AgentState.PAUSED_PENDING_USER
-
-    @pytest.mark.asyncio
-    async def test_handle_NOTHING_emergency_cancel(self, orchestrator, mock_persistence):
-        """Test handling NOTHING detection emergency cancel"""
-        await orchestrator.start()
-
-        # Trigger external print detection
-        await orchestrator._handle_state_change(
-            NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT,
-            NormalizedPrinterState.PRINTING,
-        )
-        await orchestrator._handle_state_change(
-            NormalizedPrinterState.PRINTING,
-            NormalizedPrinterState.PRINTING,
-        )
-
-        # Handle emergency cancel
-        await orchestrator.NOTHING(confidence=0.9)
-
-        assert orchestrator.state_machine.current_state == AgentState.EMERGENCY_FAILED
-
-    @pytest.mark.asyncio
     async def test_debounce_counter_reset_after_detection(
         self, orchestrator, mock_persistence
     ):

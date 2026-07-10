@@ -5,7 +5,6 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 ## Features
 
 - 🤖 **Telegram Bot Interface**: Upload STL files, receive notifications, and control prints
-- 🍝 **NOTHING Detection**: NOTHING
 - 🔧 **First-Layer Auto-Correction**: Z-offset adjustment for perfect first layers
 - 📸 **Camera Calibration**: Checkerboard-based bed-level calibration
 - 🖨️ **Multi-Printer Support**: Klipper/Moonraker and Bambu printers
@@ -21,9 +20,7 @@ Telegram Bot <-> Agent Core (state machine + policy + decision engine)
       |               |                   |
  Slicer Pipeline   Vision Monitor     Printer Adapter (abstract)
  (PrusaSlicer CLI) (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
-                   ├── NOTHING       └── BambuAdapter (Local MQTT + FTP)
-                   │   (NOTHING
-                   ├── FirstLayer
+                   ├── FirstLayer       └── BambuAdapter (Local MQTT + FTP)
                    │   (OpenCV)
                    └── Calibration
                        (Checkerboard)
@@ -106,7 +103,7 @@ All configuration is done through the `.env` file. Key variables:
 Docker volumes are automatically created for:
 - `sensing-voxel-data`: Agent state, calibration data
 - `sensing-voxel-uploads`: Uploaded STL files
-- `sensing-voxel-models`: ML models (NOTHING weights)
+- `sensing-voxel-models`: ML models
 
 **Updating:**
 
@@ -195,7 +192,7 @@ modules or tests.
   - [ ] STL/STEP/3MF slicing workflow: `SlicerPipeline` exists, but Telegram model
         uploads currently stop after staging the file and entering `RECEIVING`; the
         runtime does not yet call the slicer and advance to approval automatically
-  - [ ] Print monitoring orchestrator: external print detection, NOTHING detection,
+  - [ ] Print monitoring orchestrator: external print detection,
         first-layer correction, audio anomaly handling, and filament monitoring are
         implemented in modules/tests but are not instantiated or started by `main.py`
   - [ ] Dashboard decision side effects: `/api/v1/decision` records a decision but

@@ -31,7 +31,6 @@ class DecisionUI:
     - "res_{job_id[:8]}" - Resume
     - "can_{job_id[:8]}" - Cancel
     - "to_a_{job_id[:8]}" - Timeout approval
-    - "to_s_{job_id[:8]}" - Timeout NOTHING pause
     """
 
     # Callback data prefixes (must be <= 64 bytes total with job ID)
@@ -40,7 +39,6 @@ class DecisionUI:
     PREFIX_RESUME = "res_"
     PREFIX_CANCEL = "can_"
     PREFIX_TIMEOUT_APPROVAL = "to_a_"
-    NOTHING = "to_s_"
 
     MAX_JOB_ID_LENGTH = 56  # 64 - len(longest_prefix)
 
@@ -128,9 +126,6 @@ class DecisionUI:
         elif callback_data.startswith(self.PREFIX_TIMEOUT_APPROVAL):
             action = DecisionAction.TIMEOUT_APPROVAL
             job_id_prefix = callback_data[len(self.PREFIX_TIMEOUT_APPROVAL) :]
-        elif callback_data.startswith(self.NOTHING):
-            action = DecisionAction.NOTHING
-            job_id_prefix = callback_data[len(self.NOTHING) :]
         else:
             logger.warning(f"Unknown callback data prefix: {callback_data[:20]}")
             return None, None
@@ -151,7 +146,6 @@ class DecisionUI:
             DecisionAction.RESUME: self.PREFIX_RESUME,
             DecisionAction.CANCEL: self.PREFIX_CANCEL,
             DecisionAction.TIMEOUT_APPROVAL: self.PREFIX_TIMEOUT_APPROVAL,
-            DecisionAction.NOTHING: self.NOTHING,
         }
 
         prefix = prefix_map.get(action)
@@ -226,7 +220,6 @@ class DecisionUI:
             DecisionAction.RESUME: "Resume paused print",
             DecisionAction.CANCEL: "Cancel paused print",
             DecisionAction.TIMEOUT_APPROVAL: "Approval timeout",
-            DecisionAction.NOTHING: "NOTHING pause timeout",
         }
         return descriptions.get(action, action.name)
 
@@ -288,7 +281,7 @@ class DecisionUI:
 
         Args:
             job_context: Job context
-            reason: Reason for pause (e.g., "NOTHING detected")
+            reason: Reason for pause (e.g., "Print anomaly detected")
             current_state: Optional current printer state info
 
         Returns:
@@ -325,12 +318,6 @@ class DecisionUI:
                 "⏰ <b>Approval Timeout</b>\n\n"
                 f"Print job <code>{job_context.job_id[:8]}</code> was automatically "
                 "rejected due to no response."
-            )
-        elif action == DecisionAction.NOTHING:
-            return (
-                "⏰ <b>Pause Timeout</b>\n\n"
-                f"Paused print <code>{job_context.job_id[:8]}</code> was automatically "
-                "cancelled due to no response."
             )
         return f"Timeout: {action.name}"
 

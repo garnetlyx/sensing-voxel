@@ -172,13 +172,13 @@ class TestJobRepository:
         result = job_repo.fail(
             job_id="job_005",
             duration_seconds=1800.0,
-            notes="Failed due to NOTHING",
+            notes="Failed - error detected",
         )
         assert result is True
 
         job = job_repo.get_by_id("job_005")
         assert job.status == JobStatus.FAILED
-        assert job.notes == "Failed due to NOTHING"
+        assert job.notes == "Failed - error detected"
 
     def test_cancel_job(self, job_repo):
         job_repo.create(

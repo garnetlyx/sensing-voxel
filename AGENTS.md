@@ -7,7 +7,7 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 - **Runtime**: Python 3.12 + asyncio
 - **Adapters**: Klipper (Moonraker REST+WS), Bambu (MQTT+FTP)
 - **Interfaces**: Telegram bot, Web dashboard, LLM chat (Anthropic tool use)
-- **Vision**: NOTHING
+- **Vision**: First-layer auto-correction, camera calibration, filament/tangle monitoring, USB camera
 - **Camera**: Tapo C220 with ONVIF PTZ control
 
 ## Architecture
@@ -21,7 +21,7 @@ src/sensing_voxel/
   llm/          - LLM chat with tool use (31+ tools incl. web_search)
   camera/       - PTZ camera control (Tapo ONVIF)
   slicer/       - STL/STEP/3MF slicing pipeline + geometry analysis (module-complete, unwired)
-  vision/       - NOTHING, first-layer, calibration, filament, usb_camera (module-complete, unwired)
+  vision/       - First-layer, calibration, filament, usb_camera (module-complete, unwired)
   monitoring/   - Print monitoring orchestrator, Z-offset, predictive maintenance (module-complete, unwired)
   audio/        - YAMNet anomaly detection (Phase 2, module-complete, unwired, no AudioConfig yet)
   calibration/  - Tower generation, visual scoring, config injection (Phase 2, module-complete, unwired)

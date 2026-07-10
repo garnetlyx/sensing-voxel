@@ -170,14 +170,10 @@ class TestDecisionEngine:
     def test_set_timeouts(self, engine):
         """Test timeout configuration"""
         engine.set_timeouts(
-            approval_timeout_seconds=300,
-            NOTHING=150,
+            approval_timeout_seconds=150,
         )
-
-        # Verify timeouts were set correctly
-        approval_timeout, NOTHING_timeout = engine.get_timeouts()
-        assert approval_timeout == 300
-        assert NOTHING_timeout == 150
+        (approval_timeout,) = engine.get_timeouts()
+        assert approval_timeout == 150
 
     @pytest.mark.asyncio
     async def test_timeout_preemption_by_user(self, engine, job_context):

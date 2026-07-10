@@ -50,7 +50,6 @@ class DecisionAction(Enum):
     RESUME = auto()
     CANCEL = auto()
     TIMEOUT_APPROVAL = auto()
-    NOTHING = auto()
 
 
 class ConsumeResult(Enum):
@@ -130,14 +129,6 @@ class FirstLayerQuality(Enum):
     POOR = auto()
 
 
-class NOTHING(Enum):
-    """NOTHING detection decision"""
-
-    CONTINUE = auto()  # No action
-    PAUSE_FOR_REVIEW = auto()  # Moderate confidence
-    EMERGENCY_CANCEL = auto()  # High confidence
-
-
 class CalibrationStatus(Enum):
     """Camera calibration status"""
 
@@ -207,7 +198,7 @@ class JobContext:
     slicing_status: SlicingStatus = SlicingStatus.PENDING
     file_validation_status: FileValidationStatus = FileValidationStatus.VALID
     is_external: bool = False  # True for externally-started prints
-    external_monitoring: bool = False  # Policy flag (True for external prints)
+    external_monitoring: bool = False  # True = agent visual monitoring for external prints
 
     # Immutable fields that should not be modified after creation
     _immutable_fields = {"job_id", "job_file", "uploaded_at", "decision_token"}
@@ -345,26 +336,6 @@ class CameraCalibration:
 
 
 @dataclass
-class NOTHING:
-    """Result of NOTHING detection inference"""
-
-    confidence: float  # 0.0 to 1.0
-    bounding_box: tuple[float, float, float, float] | None = None  # x, y, w, h
-    timestamp: datetime = field(default_factory=datetime.now)
-    frame_id: int | None = None
-
-    @property
-    def confidence_level(self) -> VisionConfidenceLevel:
-        """Get confidence level from raw confidence"""
-        if self.confidence > 0.85:
-            return VisionConfidenceLevel.HIGH
-        elif self.confidence > 0.6:
-            return VisionConfidenceLevel.MODERATE
-        else:
-            return VisionConfidenceLevel.LOW
-
-
-@dataclass
 class FirstLayerAnalysisResult:
     """Result of first-layer quality analysis"""
 
@@ -416,13 +387,10 @@ class ZOffsetState:
 class MonitoringConfig:
     """Monitoring configuration for active print"""
 
-    NOTHING: bool = True
     enable_first_layer: bool = True  # Only for agent-started jobs
     evaluation_interval_seconds: int = 5
     cooldown_seconds: int = 10
     min_consecutive_evaluations: int = 2  # Hysteresis threshold
-    NOTHING: float = 0.85
-    NOTHING: float = 0.6
     z_offset_step_mm: float = 0.01
     z_offset_max_correction_mm: float = 0.05
     z_offset_saturation_count: int = 3  # Consecutive poor before pause
@@ -433,10 +401,8 @@ class MonitoringStats:
     """Monitoring statistics during active print"""
 
     frames_processed: int = 0
-    NOTHING: int = 0
     first_layer_evaluations: int = 0
     z_offset_corrections: int = 0
-    NOTHING: datetime | None = None
     last_first_layer_timestamp: datetime | None = None
     first_layer_active_until_layer: int | None = None  # Stop after this layer
 

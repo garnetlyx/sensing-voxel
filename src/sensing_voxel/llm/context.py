@@ -117,7 +117,7 @@ class PrinterContextCollector:
             if job.decision_consumed:
                 lines.append(f"Decision: {job.decision_action.name}")
             if job.is_external:
-                lines.append("Job Type: External (NOTHING-only monitoring)")
+                lines.append("Job Type: External (agent visual monitoring)")
 
         # Z-offset status
         if self._state_machine.z_offset_dirty:

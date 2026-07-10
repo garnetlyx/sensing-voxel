@@ -19,7 +19,6 @@ from sensing_voxel.core.models import (
     AgentState,
     JobContext,
     NormalizedPrinterState,
-    NOTHING,
     generate_job_id,
 )
 from sensing_voxel.core.persistence import StatePersistence
@@ -32,7 +31,6 @@ try:
     from sensing_voxel.vision.camera import CameraStream
     from sensing_voxel.vision.calibration import CameraCalibrator
     from sensing_voxel.vision.first_layer import FirstLayerClassifier
-    from sensing_voxel.vision.NOTHING import NOTHING, NOTHING
     from sensing_voxel.vision.filament import FilamentMonitor
 
     VISION_AVAILABLE = True
@@ -70,7 +68,6 @@ class MonitoringOrchestrator:
         adapter: PrinterAdapter,
         persistence: StatePersistence,
         camera: CameraStream | None = None,
-        NOTHING_detector: NOTHING | None = None,
         first_layer_classifier: FirstLayerClassifier | None = None,
         z_offset_controller: ZOffsetController | None = None,
         calibrator: CameraCalibrator | None = None,
@@ -92,7 +89,6 @@ class MonitoringOrchestrator:
 
         # Vision components (optional — gracefully degrade if missing)
         self.camera = camera
-        self.NOTHING_detector = NOTHING_detector
         self.first_layer_classifier = first_layer_classifier
         self.z_offset_controller = z_offset_controller
         self.calibrator = calibrator
@@ -115,7 +111,6 @@ class MonitoringOrchestrator:
         # Monitoring state
         self._is_monitoring = False
         self._monitoring_job_id: str | None = None
-        self._NOTHING_task: asyncio.Task | None = None
         self._first_layer_task: asyncio.Task | None = None
         self._audio_task: asyncio.Task | None = None
         self._filament_task: asyncio.Task | None = None
@@ -300,14 +295,13 @@ class MonitoringOrchestrator:
         job_id = generate_job_id()
 
         # Create job context for external print
-        # Note: external prints are NOTHING-only monitoring
-        # First-layer correction is disabled for safety
+        # External prints use agent-based visual monitoring (LLM-driven image assessment)
         job_context = JobContext(
             job_id=job_id,
             job_file="external_print",  # Placeholder - no actual file
             uploaded_at=datetime.now(),
             is_external=True,
-            external_monitoring=True,  # Critical: external prints are NOTHING-only
+            external_monitoring=True,  # Agent visual monitoring for external prints
         )
 
         # Set job context in state machine
@@ -332,7 +326,9 @@ class MonitoringOrchestrator:
             self._is_monitoring = True
             self._monitoring_job_id = job_id
 
-            await self.NOTHING(job_context)
+            # TODO: Wire agent-based visual monitoring via LLM image assessment
+            # The agent will receive camera frames and make autonomous decisions
+            # replacing the removed vision detection pipeline.
         else:
             logger.error("Failed to transition to MONITORING for external print")
             self.state_machine.job_context = None
@@ -422,68 +418,6 @@ class MonitoringOrchestrator:
             AgentState.PAUSED_PENDING_USER,
             self.persistence,
         )
-
-    async def NOTHING(self, confidence: float):
-        """
-        Handle NOTHING detection pause request
-
-        Called when moderate confidence NOTHING is detected.
-
-        Args:
-            confidence: Detection confidence (0.0-1.0)
-        """
-        if not self._is_monitoring:
-            return
-
-        logger.info(f"NOTHING detected (confidence={confidence:.2f}), pausing for user review")
-
-        await self.handle_print_pause()
-
-    async def NOTHING(self, confidence: float):
-        """
-        Handle NOTHING detection emergency cancel
-
-        Called when high confidence NOTHING is detected.
-
-        Args:
-            confidence: Detection confidence (0.0-1.0)
-        """
-        if not self._is_monitoring:
-            return
-
-        logger.warning(
-            f"CRITICAL: High confidence NOTHING detected (confidence={confidence:.2f}), "
-            "triggering emergency cancel"
-        )
-
-        # Transition to EMERGENCY_FAILED
-        await self.state_machine.transition_to(
-            AgentState.EMERGENCY_FAILED,
-            self.persistence,
-        )
-
-    async def NOTHING(self, job_context: JobContext):
-        """Start NOTHING-only monitoring."""
-        if not self.camera or not self.NOTHING_detector:
-            logger.info(
-                f"Vision not configured, NOTHING monitoring unavailable "
-                f"for job {job_context.job_id}"
-            )
-            return
-
-        async def on_NOTHING_decision(decision: NOTHING, confidence: float):
-            if decision == NOTHING.EMERGENCY_CANCEL:
-                await self.NOTHING(confidence)
-            elif decision == NOTHING.PAUSE_FOR_REVIEW:
-                await self.NOTHING(confidence)
-
-        self._NOTHING_task = asyncio.create_task(
-            self.NOTHING_detector.run_detection_loop(
-                get_frame=self.camera.get_frame,
-                on_decision=on_NOTHING_decision,
-            )
-        )
-        logger.info(f"NOTHING monitoring started for job {job_context.job_id}")
 
     async def _start_audio_monitoring(self, job_context: JobContext):
         """Start audio anomaly monitoring."""
@@ -584,13 +518,10 @@ class MonitoringOrchestrator:
         self._audio_task = None
 
     async def _start_full_monitoring(self, job_context: JobContext):
-        """Start full monitoring (NOTHING + first-layer for agent-started prints)."""
+        """Start full monitoring (first-layer for agent-started prints)."""
         if not VISION_AVAILABLE:
             logger.warning("Vision modules not available, full monitoring disabled")
             return
-
-        # Always start NOTHING detection
-        await self.NOTHING(job_context)
 
         # Start audio monitoring if enabled
         if self.enable_audio_monitoring and AUDIO_AVAILABLE:
@@ -712,14 +643,12 @@ class MonitoringOrchestrator:
 
     async def _cancel_vision_tasks(self):
         """Cancel running vision tasks."""
-        for task in (self._NOTHING_task, self._first_layer_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        self._NOTHING_task = None
+        if self._first_layer_task and not self._first_layer_task.done():
+            self._first_layer_task.cancel()
+            try:
+                await self._first_layer_task
+            except asyncio.CancelledError:
+                pass
         self._first_layer_task = None
 
     async def _cancel_filament_monitoring(self):

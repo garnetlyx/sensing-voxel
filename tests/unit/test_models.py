@@ -14,7 +14,6 @@ from sensing_voxel.core.models import (
     SlicingStatus,
     VisionConfidenceLevel,
     FirstLayerQuality,
-    NOTHING,
     CalibrationStatus,
     ZOffsetStatus,
     CommandResultStatus,
@@ -27,7 +26,6 @@ from sensing_voxel.core.models import (
     CommandResult,
     HomographyMatrix,
     CameraCalibration,
-    NOTHING,
     FirstLayerAnalysisResult,
     VisionFrame,
     ZOffsetState,
@@ -87,7 +85,6 @@ class TestEnums:
             "RESUME",
             "CANCEL",
             "TIMEOUT_APPROVAL",
-            "NOTHING",
         ]
         actual_actions = [a.name for a in DecisionAction]
         assert set(required_actions) == set(actual_actions)
@@ -166,25 +163,6 @@ class TestFirstLayerBounds:
         assert bounds.area == 2000.0
 
 
-class TestNOTHING:
-    """Test NOTHING confidence levels"""
-
-    def test_high_confidence(self):
-        """Test high confidence level"""
-        result = NOTHING(confidence=0.9)
-        assert result.confidence_level == VisionConfidenceLevel.HIGH
-
-    def test_moderate_confidence(self):
-        """Test moderate confidence level"""
-        result = NOTHING(confidence=0.7)
-        assert result.confidence_level == VisionConfidenceLevel.MODERATE
-
-    def test_low_confidence(self):
-        """Test low confidence level"""
-        result = NOTHING(confidence=0.5)
-        assert result.confidence_level == VisionConfidenceLevel.LOW
-
-
 class TestHomographyMatrix:
     """Test HomographyMatrix validity"""
 
@@ -241,13 +219,10 @@ class TestMonitoringConfig:
     def test_default_values(self):
         """Test default configuration values"""
         config = MonitoringConfig()
-        assert config.NOTHING is True
         assert config.enable_first_layer is True
         assert config.evaluation_interval_seconds == 5
         assert config.cooldown_seconds == 10
         assert config.min_consecutive_evaluations == 2
-        assert config.NOTHING == 0.85
-        assert config.NOTHING == 0.6
         assert config.z_offset_step_mm == 0.01
         assert config.z_offset_max_correction_mm == 0.05
         assert config.z_offset_saturation_count == 3
@@ -296,5 +271,4 @@ class TestDataClassDefaults:
         """Test MonitoringStats default values"""
         stats = MonitoringStats()
         assert stats.frames_processed == 0
-        assert stats.NOTHING == 0
         assert stats.z_offset_corrections == 0

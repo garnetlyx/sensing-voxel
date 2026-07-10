@@ -836,28 +836,6 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Failed to send warning notification: {e}")
 
-    async def NOTHING(self, confidence: float, job_id: str):
-        """Notify user that NOTHING has been detected"""
-        if not self._chat_id:
-            return
-
-        message = (
-            "🍝 <b>NOTHING Detected!</b>\n\n"
-            f"Confidence: {confidence:.1%}\n"
-            f"Job ID: <code>{job_id}</code>\n\n"
-            "Bot has paused the print. Please check the printer."
-        )
-
-        try:
-            await self.send(
-                chat_id=self._chat_id,
-                content=message,
-                content_type="text",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.error(f"Failed to send NOTHING notification: {e}")
-
     async def _handle_chat_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle free-text messages as AI chat"""
         if not await self._check_auth(update):

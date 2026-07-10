@@ -295,47 +295,6 @@ class TestAgentStartedPrintWorkflow:
         assert await sm.transition_to(AgentState.IDLE, persistence)
         assert sm.current_state == AgentState.IDLE
 
-    @pytest.mark.asyncio
-    async def NOTHING_pause_then_cancel(self, setup):
-        """MONITORING → PAUSED_PENDING_USER → FAILED (user cancels after NOTHING)."""
-        sm, adapter, persistence, _, orchestrator = setup
-
-        # Set up monitoring state
-        job = JobContext(
-            job_id=generate_job_id(),
-            job_file="test.gcode",
-            uploaded_at=datetime.now(),
-        )
-        sm.job_context = job
-        sm.current_state = AgentState.MONITORING
-        orchestrator._is_monitoring = True
-
-        # NOTHING detected → pause
-        await orchestrator.NOTHING(0.72)
-        assert sm.current_state == AgentState.PAUSED_PENDING_USER
-
-        # User cancels
-        await adapter.cancel_print()
-        assert await sm.transition_to(AgentState.FAILED, persistence)
-        assert sm.current_state == AgentState.FAILED
-
-    @pytest.mark.asyncio
-    async def NOTHING_emergency_cancel(self, setup):
-        """MONITORING → EMERGENCY_FAILED on high-confidence NOTHING."""
-        sm, _, persistence, _, orchestrator = setup
-
-        job = JobContext(
-            job_id=generate_job_id(),
-            job_file="test.gcode",
-            uploaded_at=datetime.now(),
-        )
-        sm.job_context = job
-        sm.current_state = AgentState.MONITORING
-        orchestrator._is_monitoring = True
-
-        await orchestrator.NOTHING(0.92)
-        assert sm.current_state == AgentState.EMERGENCY_FAILED
-
 
 class TestStlToPrintE2E:
     """

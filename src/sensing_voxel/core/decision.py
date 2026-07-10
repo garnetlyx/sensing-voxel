@@ -24,7 +24,6 @@ class DecisionEngine:
         self._decision_locks: dict[str, asyncio.Lock] = {}
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._approval_timeout: int = 600  # 10 minutes
-        self.NOTHING: int = 300  # 5 minutes
 
     def _get_lock(self, job_id: str) -> asyncio.Lock:
         """Get or create lock for job_id"""
@@ -69,18 +68,6 @@ class DecisionEngine:
 
     def _get_timeout_for_action(self, action: DecisionAction) -> int:
         """Get timeout duration for action type"""
-        if action in [
-            DecisionAction.TIMEOUT_APPROVAL,
-            DecisionAction.APPROVE,
-            DecisionAction.REJECT,
-        ]:
-            return self._approval_timeout
-        elif action in [
-            DecisionAction.NOTHING,
-            DecisionAction.RESUME,
-            DecisionAction.CANCEL,
-        ]:
-            return self.NOTHING
         return self._approval_timeout
 
     async def _timeout_handler(self, job_id: str, job_context: JobContext, action: DecisionAction):
@@ -179,7 +166,6 @@ class DecisionEngine:
                 # Re-check guards (skip for timeout actions)
                 if action not in [
                     DecisionAction.TIMEOUT_APPROVAL,
-                    DecisionAction.NOTHING,
                 ]:
                     if current_state is None or expected_state is None:
                         logger.error(
@@ -254,16 +240,13 @@ class DecisionEngine:
     def set_timeouts(
         self,
         approval_timeout_seconds: int,
-        NOTHING: int,
     ):
         """Configure timeout durations"""
         self._approval_timeout = approval_timeout_seconds
-        self.NOTHING = NOTHING
         logger.info(
-            f"Timeouts configured: approval={approval_timeout_seconds}s, "
-            f"NOTHING_pause={NOTHING}s"
+            f"Timeout configured: approval={approval_timeout_seconds}s"
         )
 
-    def get_timeouts(self) -> tuple[int, int]:
+    def get_timeouts(self) -> tuple[int]:
         """Get current timeout durations (for testing)"""
-        return self._approval_timeout, self.NOTHING
+        return (self._approval_timeout,)

@@ -73,7 +73,7 @@ class TelegramConfig:
     bot_token: str
     allowed_users: list[int] = field(default_factory=list)
     approval_timeout_seconds: int = 600  # 10 minutes
-    NOTHING: int = 300  # 5 minutes
+
 
 
 @dataclass

@@ -61,7 +61,7 @@ class MockPrinterAdapter(PrinterAdapter):
 
 
 class TestExternalPrintDetection:
-    """Test external print detection and NOTHING-only monitoring."""
+    """Test external print detection and visual monitoring."""
 
     @pytest.fixture
     def setup(self, tmp_path):
@@ -103,8 +103,8 @@ class TestExternalPrintDetection:
         await orchestrator.stop()
 
     @pytest.mark.asyncio
-    async def test_external_print_external_monitoring_policy(self, setup):
-        """External prints use NOTHING-only monitoring (no first-layer correction)."""
+    async def test_external_print_policy(self, setup):
+        """External prints use visual monitoring (no first-layer correction)."""
         sm, adapter, persistence, orchestrator = setup
         await orchestrator.start()
 

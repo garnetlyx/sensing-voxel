@@ -14,13 +14,13 @@
 Sensing Voxel is an end-to-end AI platform that turns photos into physical 3D prints with minimal human intervention. The long-term goal is a single-message workflow: a user sends a photo, and the system generates a 3D model, prepares it for printing, prints it, and monitors the entire process autonomously.
 
 This vision is delivered in phases:
-- **Phase 1 (MVP)**: Intelligent print automation — Telegram-driven job intake, automated slicing, camera monitoring (NOTHING detection + first-layer auto-correction), and printer control across a mixed Klipper/Bambu fleet.
+- **Phase 1 (MVP)**: Intelligent print automation — Telegram-driven job intake, automated slicing, camera monitoring (first-layer auto-correction), and printer control across a mixed Klipper/Bambu fleet.
 - **Phase 2**: Platform maturity — multi-printer orchestration, job history/analytics, full Bambu parity, predictive maintenance.
 - **Phase 3**: Photo-to-print pipeline — Image-to-3D generation via AI models, automated mesh repair for printability, and one-tap physical output from any photo or sketch.
 
 ### 1.2 Problem Statement
 
-**Near-term**: Current home and prosumer 3D-print workflows are fragmented and manual: users manually slice, tune first layer, watch for NOTHING failures, and inspect calibration towers by eye. This leads to failed overnight prints, wasted filament, and inconsistent quality. The problem is worse in mixed-printer environments where control APIs differ (Moonraker vs Bambu protocols), forcing duplicated manual processes.
+**Near-term**: Current home and prosumer 3D-print workflows are fragmented and manual: users manually slice, tune first layer, monitor print quality, and inspect calibration towers by eye. This leads to failed overnight prints, wasted filament, and inconsistent quality. The problem is worse in mixed-printer environments where control APIs differ (Moonraker vs Bambu protocols), forcing duplicated manual processes.
 
 **Long-term**: 3D printing remains inaccessible to non-technical users. Even with perfect printer automation, the pipeline breaks at the start: users need CAD skills or must find pre-made models. Image-to-3D generation is advancing rapidly (TripoSR, Meshy, Tripo3D, etc.), but no platform connects AI-generated models to a reliable print pipeline. The generated meshes are not print-ready — they require manifold repair, wall thickening, support analysis, and orientation optimization before slicing. Sensing Voxel aims to close this gap by owning the full chain from image capture to finished print.
 
@@ -103,7 +103,7 @@ This vision is delivered in phases:
 **Actor**: Agent
 **Trigger**: Active print monitoring detects sustained failure pattern via vision and/or audio.
 **Flow**:
-1. **Vision**: NOTHING
+1. **Vision**: Multimodal failure detector emits confidence stream from camera frames.
 2. **Audio** (Phase 2): YAMNet-based audio classifier monitors microphone feed for anomalous sounds — stepper motor skipping, glass bed cracking, filament grinding/clicking at extruder. Audio detection triggers `M112` emergency stop immediately for mechanical safety events.
 3. If vision shows high confidence (3/5 frames >0.85), emergency cancel path executes.
 4. If vision shows moderate confidence (2/3 frames 0.6-0.85), pause and request **Resume/Cancel**.
@@ -118,10 +118,10 @@ This vision is delivered in phases:
 **Flow**:
 1. Agent debounces state transition (2 updates / up to 3s).
 2. Agent transitions to monitoring mode.
-3. Monitoring policy is **NOTHING-only** for the entire external job.
+3. Monitoring policy is **agent visual monitoring** for the entire external job.
 4. Agent may parse layer markers for notification context only.
 
-**Policy**: External prints receive NOTHING-only monitoring. First-layer auto-correction is **never** enabled for external prints, even if metadata can be parsed.
+**Policy**: External prints receive agent visual monitoring. First-layer auto-correction is **never** enabled for external prints, even if metadata can be parsed.
 
 **Success**: External jobs are monitored for catastrophic failures without unsafe first-layer actuation.
 
@@ -210,11 +210,10 @@ Legend: `[x]` wired into runtime · `[~]` module-complete with unit tests but no
 - [~] STL/STEP/3MF slicing pipeline with parameter extraction (`FirstLayerParams`, `FirstLayerBounds`) for agent-started jobs. **Module-complete** (`slicer/`); not yet invoked from the Telegram upload flow.
 - [~] Camera calibration lifecycle: checkerboard calibration, artifact storage, validity checking, `/calibrate_camera` command. **Module-complete** (`vision/calibration.py`); not yet wired into `MonitoringOrchestrator`.
 - [~] First-layer auto-correction for agent-started jobs only, with saturation exit behavior. **Module-complete** (`vision/first_layer.py`, `monitoring/z_offset.py`); not yet wired.
-- [~] NOTHING detection with pause/cancel policy and emergency bypass path. **Module-complete** (`vision/NOTHING.py`); `MonitoringOrchestrator` not started by `main.py`.
 - [x] Decision idempotency with lock-guarded CAS helper across callbacks/timeouts/recovery.
 - [x] Persistent state snapshots (JSON) with safe IDLE reset policy preserving safety flags.
 - [x] Z-offset baseline capture/restore contract with verification, dirty-state print blocking, and `/reset_z_offset [target_mm]`.
-- [x] External print detection with NOTHING-only monitoring policy.
+- [x] External print detection with visual monitoring policy.
 - [x] Moonraker WebSocket reconnection with backoff and state reconciliation.
 - [x] **LLM chat with 31+ tool-use functions** for natural language printer control, including SearXNG-backed `web_search` (added post-PRD).
 - [x] **PTZ camera control** via ONVIF for Tapo C220 (added post-PRD).
@@ -262,7 +261,7 @@ Legend: `[~]` module-complete with unit tests but not yet started by `main.py` �
 - **Command serialization**: All non-emergency printer commands flow through a prioritized queue. Emergency cancel bypasses queue via dedicated client/session.
 - **Deployment model**: MVP deploys **one Agent Core instance per printer**. Each instance has its own state machine, Telegram command namespace, and state file. Multi-printer coordination is deferred.
 - **State storage**: JSON atomic snapshots for MVP. SQLite deferred to Phase 2 for job history/analytics.
-- **Vision inference**: NOTHING
+- **Vision inference**: ONNX INT8 models for edge deployment on SBC hardware.
 
 ---
 
@@ -287,7 +286,7 @@ Legend: `[~]` module-complete with unit tests but not yet started by `main.py` �
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
 | Duplicate decision handling from async races | High | Medium | Lock-guarded `consume_decision(...)` used by all entry points; race tests required |
-| External-print policy drift reintroduces unsafe actuation | High | Medium | Single canonical rule: external jobs are NOTHING-only; policy asserted in integration tests |
+| External-print policy drift reintroduces unsafe actuation | High | Medium | Single canonical rule: external jobs use agent visual monitoring only; policy asserted in integration tests |
 | `z_offset_dirty` lost during idle reset | High | Low | Full IDLE snapshot preserving persistent fields |
 | Moonraker variant payload mismatch (Neptune mods) | Medium | Medium | Compatibility shim + normalized internal enums |
 | Unsafe manual Z reset to wrong baseline | Medium | Medium | `/reset_z_offset [target_mm]` baseline-default + explicit zero requirement + verification |
@@ -307,7 +306,7 @@ Legend: `[~]` module-complete with unit tests but not yet started by `main.py` �
 
 ### Phase 1 (MVP)
 - [ ] Should OrcaSlicer become co-equal with PrusaSlicer in MVP, or remain optional profile-compatible backend?
-- [ ] Should external prints support user-approved first-layer correction in a future mode, or remain permanently NOTHING-only?
+- [ ] Should external prints support user-approved first-layer correction in a future mode, or remain permanently agent-visual-monitoring only?
 - [ ] What is the minimum integration-test matrix for legacy Moonraker variants (stock, Elegoo-modified, and one pinned older release)?
 - [ ] For Bambu, should cloud API be supported as fallback when local MQTT is unavailable, or explicitly local-only for safety/privacy?
 

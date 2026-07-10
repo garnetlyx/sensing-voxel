@@ -24,14 +24,12 @@ Telegram Bot <-> Agent Core (state machine + policy + decision engine)
       +---------------+-------------------+
       |               |                   |
  Slicer Pipeline   Vision Monitor     Printer Adapter (abstract)
- (PrusaSlicer/     (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
-  OrcaSlicer CLI)  ├── NOTHING       └── BambuAdapter (Local MQTT + FTP)
-                   │   (NOTHING
-                   ├── FirstLayer
-                   │   "God Hand"
-                   │   (OpenCV + SET_GCODE_OFFSET Z_ADJUST)
-                   └── Calibration
-                       (Checkerboard)
+  (PrusaSlicer/     (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
+   OrcaSlicer CLI)  ├── FirstLayer       └── BambuAdapter (Local MQTT + FTP)
+                    │   "God Hand"
+                    │   (OpenCV + SET_GCODE_OFFSET Z_ADJUST)
+                    └── Calibration
+                        (Checkerboard)
 
 Phase 2 additions:
 
@@ -56,7 +54,7 @@ Phase 3 additions:
 | Runtime | Python 3.12 + `asyncio` | Mature async + CV/ML ecosystem |
 | Bot | `python-telegram-bot` | Robust async Telegram integration |
 | Slicing | PrusaSlicer CLI (headless) | Headless automation and profile support |
-| Vision | OpenCV + NOTHING
+| Vision | OpenCV | Practical edge inference on SBC |
 | Camera | RTSP via OpenCV `VideoCapture` | Network IP camera support |
 | Camera PTZ | ONVIF via `python-onvif-zeep` | Tapo C220 pan/tilt/zoom control |
 | Klipper Control | Moonraker REST + WebSocket | Standard Klipper control plane |
@@ -125,7 +123,6 @@ sensing-voxel/
 │       │   ├── __init__.py
 │       │   ├── camera.py            # RTSP stream capture
 │       │   ├── calibration.py       # Checkerboard calibration lifecycle
-│       │   ├── NOTHING.py         # NOTHING
 │       │   ├── first_layer.py       # First-layer classifier + Z-offset decisions
 │       │   ├── filament.py          # Spool volume estimation + tangle detection (Phase 2)
 │       │   └── usb_camera.py        # Secondary USB camera for filament monitoring (Phase 2)
@@ -179,7 +176,7 @@ sensing-voxel/
 ├── data/                            # Runtime data (gitignored)
 │   └── agent_state.json
 ├── models/                          # ML model files (gitignored)
-│   └── NOTHING
+│   └── (model weights stored in separate repo)
 ├── docs/
 │   ├── PRD.md
 │   └── ARCHITECTURE.md
@@ -226,9 +223,7 @@ PRINTING -> MONITORING         : Print confirmed active, monitoring begins
 PRINTING -> FAILED             : Printer error event before monitoring starts
 PRINTING -> ERROR              : Command failure during print start
 
-MONITORING -> PAUSED_PENDING_USER : Moderate NOTHING confidence (pause + ask)
 MONITORING -> PAUSED_PENDING_USER : First-layer saturation exit (correction maxed)
-MONITORING -> EMERGENCY_FAILED    : High NOTHING confidence (emergency cancel)
 MONITORING -> COMPLETE            : Print completed successfully
 MONITORING -> FAILED              : Printer error event during monitoring
 
@@ -250,7 +245,7 @@ Error handling policy:
 
 #### External Print Policy
 
-Canonical rule: **External prints are NOTHING-only monitoring.** First-layer auto-correction is never enabled for external prints even if metadata can be parsed. This rule is asserted in integration tests.
+Canonical rule: **External prints use agent visual monitoring only.** First-layer auto-correction is never enabled for external prints even if metadata can be parsed. This rule is asserted in integration tests.
 
 ### 4.2 Decision Idempotency
 
@@ -280,7 +275,6 @@ async def consume_decision(
 
 **Timeout configuration** (stored in config, per-decision-type):
 - `approval_timeout_seconds`: 600 (10 minutes)
-- `NOTHING`: 300 (5 minutes)
 
 ### 4.3 State Persistence
 
@@ -391,7 +385,7 @@ class PrinterAdapter(ABC):
   - Status + control events via local MQTT broker.
 - Implements the same `PrinterAdapter` interface.
 - **MVP command set**: `start_print`, `pause_print`, `resume_print`, `cancel_print`, `emergency_cancel`, `get_printer_state`.
-- Z-offset commands (`get_z_offset`, `set_z_offset`) return `NotSupported` in MVP; Bambu prints are NOTHING-only monitoring until full adapter parity in Phase 2.
+- Z-offset commands (`get_z_offset`, `set_z_offset`) return `NotSupported` in MVP; Bambu prints use visual monitoring until full adapter parity in Phase 2.
 - Safety policy mirrors Klipper side: emergency stop uses adapter-specific high-priority MQTT channel.
 - Reconnection: MQTT client auto-reconnect with backoff. State poll on reconnect.
 
@@ -402,7 +396,7 @@ class PrinterAdapter(ABC):
   - `FirstLayerParams`: layer height, nozzle temp, bed temp, speed.
   - `FirstLayerBounds`: XY bounding box of first-layer moves from G-code parsing.
 - **Proactive geometry analysis**: detect overhangs >60°, bridges, thin walls. Agent recommends optimizations to user (e.g., "Detected overhangs >60° — enable tree supports? Estimated +15g filament, +20min print time") rather than silently slicing with defaults.
-- If extraction fails, print may proceed with NOTHING-only monitoring.
+- If extraction fails, print may proceed with agent visual monitoring.
 - For external prints, metadata parsing is best-effort and used for observability only; it does not enable first-layer actuation.
 
 ### 4.9 Vision Monitor
@@ -423,18 +417,10 @@ class PrinterAdapter(ABC):
 
 **Degraded behavior** when calibration is stale or missing:
 - First-layer correction disabled.
-- NOTHING detection remains active (does not require calibration).
+- Vision monitoring continues with uncalibrated coordinates (rough ROI only).
 - User notified: "Camera calibration expired/missing. First-layer correction disabled. Run /calibrate_camera."
 
-#### 4.9.2 NOTHING Detection
-
-- NOTHING
-- Temporal confirmation windows:
-  - **High confidence**: 3/5 frames > 0.85 → emergency cancel.
-  - **Moderate confidence**: 2/3 frames 0.6-0.85 → pause + ask user.
-- Active for both agent-started and external prints.
-
-#### 4.9.3 First-Layer "God Hand" Classifier
+#### 4.9.2 First-Layer "God Hand" Classifier
 
 - OpenCV-based analysis of calibrated ROI.
 - Visual classification logic: gaps between extrusion lines → Z too high; filament scraping/ridging → Z too low.
@@ -454,7 +440,7 @@ class PrinterAdapter(ABC):
   - **Glass bed cracking**: sharp crack sound indicating thermal stress failure.
   - **Filament grinding**: continuous grinding/clicking at extruder indicating filament jam or stripped gear.
 - On detection of mechanical safety events, agent triggers `M112` (firmware emergency stop) immediately — does not wait for vision confirmation.
-- Audio detection is independent of and additive to vision-based NOTHING detection.
+- Audio detection is independent of and additive to vision-based monitoring.
 
 ### 4.11 Filament Spool Monitor (Phase 2)
 
@@ -538,7 +524,7 @@ User -> Telegram: .stl file
   -> Decision Engine: await user response (10min timeout)
   -> Adapter: upload_file() + start_print()
   -> State Machine: PRINTING -> MONITORING
-  -> Vision Monitor: NOTHING detection (continuous)
+  -> Vision Monitor: continuous quality monitoring
   -> Vision Monitor: first-layer "God Hand" classifier (first N layers)
   -> Z-Offset Controller: SET_GCODE_OFFSET Z_ADJUST bounded corrections
   -> (print completes)
@@ -552,7 +538,7 @@ User -> Telegram: .stl file
 ```
 Adapter WebSocket: print_stats.state -> "printing" (debounced)
   -> State Machine: IDLE -> MONITORING
-  -> Vision Monitor: NOTHING-only (no first-layer correction)
+  -> Vision Monitor: visual monitoring only (no first-layer correction)
   -> (print completes or fails)
   -> State Machine: COMPLETE/FAILED -> IDLE
 ```
@@ -593,7 +579,7 @@ User -> Telegram: photo or sketch
 |----------|--------|-----------|
 | One Agent Core per printer | Single-instance MVP | Simplifies state machine, avoids concurrency across printers. Multi-printer coordination deferred to Phase 3. |
 | JSON over SQLite for MVP state | Atomic JSON snapshots | Simpler, no DB dependency. SQLite added in Phase 2 for history/analytics. |
-| External prints are NOTHING-only | No first-layer correction | Agent cannot verify calibration state or G-code origin for external prints. Safety first. |
+| External prints use visual monitoring only | No first-layer correction | Agent cannot verify calibration state or G-code origin for external prints. Safety first. |
 | Dedicated emergency cancel path | Bypasses command queue | Emergency stop must not wait behind queued commands. Uses separate connection. |
 | Rule-based safety, not LLM | Local deterministic logic | Real-time safety decisions cannot tolerate LLM latency or hallucination risk. |
 | Per-job decision lock | asyncio.Lock keyed by job_id | Eliminates timeout-vs-user race conditions across all decision entry points. |
@@ -763,7 +749,6 @@ consumed at runtime. Wiring these is the primary contents of `.project/TODO.md`.
 | Subsystem | File(s) | LOC | Phase | Wiring blocker |
 |-----------|---------|-----|-------|----------------|
 | Slicer pipeline | `slicer/{pipeline,metadata,converter}.py` | 1,125 | 1 | Telegram upload flow must call `SlicerPipeline.process_model()` instead of stopping at `RECEIVING` |
-| NOTHING detection | `vision/NOTHING.py` | 189 | 1 | `MonitoringOrchestrator` not started |
 | RTSP camera stream | `vision/camera.py` | 150 | 1 | `MonitoringOrchestrator` not started |
 | Camera calibration | `vision/calibration.py` | 197 | 1 | `MonitoringOrchestrator` not started |
 | First-layer "God Hand" | `vision/first_layer.py` | 162 | 1 | `MonitoringOrchestrator` not started |
@@ -796,7 +781,7 @@ review cycle (which reported 574/610 passing). Root causes are identified in
 |---|---|---|---|
 | §4.6 | Compatibility shim for Elegoo/Neptune | `compatibility_mode` bool stored but shim not applied | Partial — needs implementation |
 | §6 | Secrets in env vars or `.env` (gitignored) | Config reads from YAML; `docker-compose.yml` wires `SV_*` env vars; manual install path is YAML-only | Low risk for MVP |
-| §4.9 / §4.10 | First-layer, NOTHING, audio, filament monitoring are runtime features | All are module-complete but `main.py` does not start `MonitoringOrchestrator` | Yes — see `.project/TODO.md` T1.1–T1.3 |
+| §4.9 / §4.10 | First-layer, audio, filament monitoring are runtime features | All are module-complete but `main.py` does not start `MonitoringOrchestrator` | Yes — see `.project/TODO.md` T1.1–T1.3 |
 | §4.14 | LLM tool set | Now includes `web_search` (SearXNG) — not yet documented in §4.14 tool list | Yes — §4.14 needs `web_search` entry |
 | Runtime plan | First-class reminder/scheduler helpers | Background execution exists but no dedicated reminder planner | Planned follow-up |
 | `monitor.py` imports | Optional deps lazy-imported | Vision imports are still module-level (`monitor.py:26-28`) | Yes — T1.1, prerequisite for wiring |
