@@ -80,9 +80,14 @@ async def shutdown(
     state_machine: AgentStateMachine,
     persistence: StatePersistence,
     dashboard_runner=None,
+    print_monitors: dict | None = None,
 ) -> None:
     """Graceful shutdown handler."""
     print(f"Received exit signal {signal.name}...")
+
+    if print_monitors:
+        for monitor in print_monitors.values():
+            await monitor.stop_monitoring(reason="shutdown")
 
     # Stop dashboard server
     if dashboard_runner:
@@ -302,13 +307,45 @@ async def main() -> None:
             adapter.on_connection_lost(on_connection_lost_llm)
             adapter.on_connection_restored(on_connection_restored_llm)
 
+    # Initialize print monitors (optional)
+    print_monitors: dict[str, Any] = {}
+    if config.print_monitor.enabled and chat_manager and tapo_camera:
+        from sensing_voxel.monitoring.print_monitor import PrintMonitor
+
+        rtsp_url = config.dashboard.camera_rtsp_url
+
+        async def _llm_send(**kwargs):
+            return await llm_client._client.send_message(**kwargs)
+
+        async def _notify(pid: str, level: str, message: str):
+            if ws_manager:
+                await ws_manager.broadcast_alert(level, message, printer_id=pid)
+            if bot:
+                for uid in config.telegram.allowed_users:
+                    await bot.send_message(uid, message)
+
+        for printer_id, adapter in adapters.items():
+            monitor = PrintMonitor(
+                printer_id=printer_id,
+                adapter=adapter,
+                rtsp_url=rtsp_url,
+                llm_send_fn=_llm_send,
+                notifier_fn=_notify,
+                config=config.print_monitor,
+            )
+            print_monitors[printer_id] = monitor
+            logger.info(f"Print monitor initialized for {printer_id}")
+
+        if chat_manager and chat_manager._tool_executor:
+            chat_manager._tool_executor._print_monitors = print_monitors
+
     # Set up signal handlers
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
             sig,
             lambda sig=sig: asyncio.create_task(
-                shutdown(sig, loop, state_machine, persistence, dashboard_runner)
+                shutdown(sig, loop, state_machine, persistence, dashboard_runner, print_monitors)
             ),
         )
 

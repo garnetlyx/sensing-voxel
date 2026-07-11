@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 from sensing_voxel.adapters.base import PrinterAdapter
+from sensing_voxel.adapters.klipper import _normalize_filename
 from sensing_voxel.core.models import CommandResultStatus
 from sensing_voxel.infra.gcode import _strip_gcode_comment, validate_gcode_command
 from sensing_voxel.llm.runtime import (
@@ -569,6 +570,64 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    {
+        "name": "start_print_with_monitor",
+        "description": (
+            "Upload a G-code file to the printer, start printing, and activate "
+            "background monitoring. SVA will periodically check the camera and "
+            "printer state, detect anomalies (spaghetti, fire, air printing), "
+            "and auto-pause if no user response within the configured timeout. "
+            "This is the ONLY way SVA should start prints — it ensures monitoring."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID (e.g. 'neptune4max').",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Local filename in data/uploads/ to upload and print",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
+    {
+        "name": "acknowledge_anomaly",
+        "description": (
+            "Acknowledge a print anomaly alert — prevents auto-pause. "
+            "Use when the user confirms the print is fine despite an alert."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID to acknowledge.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_monitor_status",
+        "description": (
+            "Check if background print monitoring is active for a printer, "
+            "including check count, last analysis result, and anomaly status."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID. Defaults to active printer.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -820,6 +879,7 @@ class ToolExecutor:
         self._tool_cooldown_seconds = tool_cooldown_seconds
         self._last_tool_call: dict[str, float] = {}
         self._memo_repository = memo_repository
+        self._print_monitors: dict[str, Any] = {}
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
@@ -878,6 +938,9 @@ class ToolExecutor:
             self._dispatch["set_printer_memo"] = self._set_printer_memo
         self._dispatch["update_printer_config"] = self._update_printer_config
         self._dispatch["get_printer_hardware"] = self._get_printer_hardware
+        self._dispatch["start_print_with_monitor"] = self._start_print_with_monitor
+        self._dispatch["acknowledge_anomaly"] = self._acknowledge_anomaly
+        self._dispatch["get_monitor_status"] = self._get_monitor_status
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2333,3 +2396,102 @@ class ToolExecutor:
                 self._memo_repository.upsert(printer_id, "hostname", hw["hostname"])
 
         return {"printer_id": printer_id, **hw}
+
+    async def _start_print_with_monitor(
+        self,
+        tool_input: dict,
+        request_context: ChatRequestContext | None = None,
+    ) -> dict:
+        request_context = request_context or ChatRequestContext(
+            logical_user_id="unknown", channel="unknown", active_printer=None,
+        )
+        approved_input, approval_error = self._consume_approval(
+            "start_print_with_monitor", tool_input, request_context
+        )
+        if approval_error:
+            return approval_error
+
+        filename = tool_input.get("filename", "").strip()
+        if not filename:
+            return {"error": "filename is required"}
+
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+
+        if approved_input is None:
+            return self._create_approval(
+                request_context,
+                "start_print_with_monitor",
+                {"filename": filename, "printer_id": printer_id},
+                f"Starting print '{filename}' on {printer_id} with background monitoring. "
+                "This will upload the file and begin printing.",
+            )
+
+        local_path = Path("data/uploads") / filename
+        if not local_path.exists():
+            return {"error": f"File not found locally: {local_path}"}
+
+        remote_name = _normalize_filename(filename)
+        upload_result = await adapter.upload_file(str(local_path), remote_name)
+        if upload_result.status != CommandResultStatus.SUCCESS:
+            return {"error": f"Upload failed: {upload_result.message}"}
+
+        start_result = await adapter.start_print(remote_name)
+        if start_result.status != CommandResultStatus.SUCCESS:
+            return {"error": f"Start print failed: {start_result.message}"}
+
+        monitor = self._print_monitors.get(printer_id)
+        if monitor:
+            await monitor.start_monitoring(filename=remote_name)
+            monitor_status = "active"
+        else:
+            monitor_status = "not_configured"
+
+        return {
+            "printer_id": printer_id,
+            "filename": remote_name,
+            "status": "printing",
+            "monitor": monitor_status,
+        }
+
+    async def _acknowledge_anomaly(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, _adapter = selected
+
+        monitor = self._print_monitors.get(printer_id)
+        if not monitor:
+            return {"error": f"No print monitor for {printer_id}"}
+        if not monitor.is_monitoring:
+            return {"error": f"No active monitoring for {printer_id}"}
+
+        await monitor.acknowledge()
+        return {"printer_id": printer_id, "status": "acknowledged"}
+
+    async def _get_monitor_status(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, _adapter = selected
+
+        monitor = self._print_monitors.get(printer_id)
+        if not monitor:
+            return {"printer_id": printer_id, "monitoring": "not_configured"}
+        if not monitor.is_monitoring:
+            return {"printer_id": printer_id, "monitoring": "inactive"}
+
+        state = monitor._state
+        last = state.last_analysis if state else None
+        return {
+            "printer_id": printer_id,
+            "monitoring": "active",
+            "filename": state.filename if state else None,
+            "check_count": state.check_count if state else 0,
+            "anomaly_pending": state.anomaly_pending if state else False,
+            "last_severity": last.severity.value if last else None,
+            "last_summary": last.summary if last else None,
+            "started_at": str(state.started_at) if state else None,
+        }

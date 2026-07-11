@@ -192,6 +192,21 @@ class LlmConfig:
 
 
 @dataclass
+class PrintMonitorConfig:
+    """Background print monitoring configuration"""
+    enabled: bool = False
+    check_interval_seconds: float = 1800.0
+    anomaly_response_timeout_seconds: float = 300.0
+    llm_max_tokens: int = 800
+    camera_search_enabled: bool = True
+    camera_search_max_moves: int = 6
+    camera_search_settle_seconds: float = 2.0
+    auto_pause_enabled: bool = True
+    notify_on_completion: bool = True
+    notify_on_camera_failure: bool = True
+
+
+@dataclass
 class ImageTo3DConfig:
     """Image-to-3D generation configuration"""
 
@@ -269,6 +284,7 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
+    print_monitor: PrintMonitorConfig = field(default_factory=PrintMonitorConfig)
     modeling: ModelingConfig = field(default_factory=ModelingConfig)
     queue: QueueConfig = field(default_factory=QueueConfig)
     debug: bool = False
@@ -285,6 +301,7 @@ class Config:
             "storage": StorageConfig,
             "dashboard": DashboardConfig,
             "llm": LlmConfig,
+            "print_monitor": PrintMonitorConfig,
         }
         parsed: dict = {}
         for key, value in data.items():
