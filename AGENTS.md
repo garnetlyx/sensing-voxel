@@ -108,6 +108,32 @@ Or in tmux: `tmux new-session -d -s sv-server -c <repo-root>` then send the abov
 - Telegram STL/STEP upload → enters RECEIVING state, slicer never called
 - LLM config has no `provider` field in local.yaml → defaults to `LlmProvider.MINIMAX` (Anthropic SDK path — this is the working path)
 
+### LLM model multimodal verification
+
+The model may be swapped (MiniMax-M3 today, Doubao/GPT/Ollama tomorrow). **Before relying on any vision feature (camera_snapshot tool, first-layer analysis), independently verify the connected model's multimodal capability** — do not assume it from model name alone.
+
+Quick test (run from repo root with proxy reachable):
+
+```bash
+# Download a known test image
+curl -sL -o /tmp/test-img.jpg "https://picsum.photos/id/237/400/300"
+
+# Send image + question via the same Anthropic protocol SV uses
+IMG_B64=$(base64 -i /tmp/test-img.jpg)
+curl -s -m 60 "$LLM_BASE_URL/v1/messages" \
+  -H "x-api-key: $LLM_API_KEY" \
+  -H "content-type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d "{\"model\":\"$LLM_MODEL\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"$IMG_B64\"}},{\"type\":\"text\",\"text\":\"What animal is this? Describe in detail.\"}]}]}"
+```
+
+**Pass criteria**: model correctly identifies the subject (a black Labrador puppy on wooden floor) without hallucinating objects that aren't there.
+
+**If the model fails or returns text-only / errors**: vision features (camera_snapshot, first-layer visual analysis) are non-functional. Either switch to a multimodal-capable model or disable vision-dependent tools.
+
+**Verified models**:
+- `minimax-m3` via `http://host.example:4000` — ✅ verified 2026-07-10 (Labrador test + Tapo camera snapshot analysis)
+
 ### Verification plan
 
 See `.project/module-verification/` for the full per-component verification checklist and go/no-go decisions on orphaned modules.
