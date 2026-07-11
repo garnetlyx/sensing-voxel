@@ -4,12 +4,12 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 
 ## Features
 
-- 🤖 **Telegram Bot Interface**: Upload STL files, receive notifications, and control prints
-- 🔧 **First-Layer Auto-Correction**: Z-offset adjustment for perfect first layers
-- 📸 **Camera Calibration**: Checkerboard-based bed-level calibration
-- 🖨️ **Multi-Printer Support**: Klipper/Moonraker and Bambu printers
-- 🛡️ **External Print Detection**: Monitor prints started outside the agent
+- 🤖 **Telegram Bot Interface**: Upload G-code files, receive notifications, and control prints
+- 🖨️ **Multi-Printer Support**: Klipper/Moonraker (Bambu adapter exists but is not production-wired)
 - 📊 **Web Dashboard**: Real-time monitoring UI with WebSocket updates
+- 🔧 **First-Layer Auto-Correction**: Z-offset adjustment *(module-complete, not yet wired — see Roadmap)*
+- 📸 **Camera Calibration**: Checkerboard-based bed-level calibration *(module-complete, not yet wired — see Roadmap)*
+- 🛡️ **External Print Detection**: Monitor prints started outside the agent *(module-complete, not yet wired — see Roadmap)*
 
 ## Architecture
 
@@ -146,14 +146,22 @@ sensing-voxel/
 │   └── sensing_voxel/
 │       ├── main.py                  # Entry point
 │       ├── config.py                # Configuration
-│       ├── core/                    # Core state machine
-│       ├── adapters/                # Printer adapters
-│       ├── bot/                     # Telegram bot
+│       ├── core/                    # Core state machine, decision engine, persistence
+│       ├── adapters/                # Printer adapters (Klipper, Bambu, base, command queue)
+│       ├── bot/                     # Telegram bot (telegram, auth, decisions)
 │       ├── api/                     # Dashboard REST/WS API
+│       ├── llm/                     # LLM chat with tool use (31+ tools)
+│       ├── camera/                  # PTZ camera control (Tapo ONVIF)
+│       ├── infra/                   # Shared utilities (retry, gcode validation)
 │       ├── dashboard/               # Dashboard static files
-│       ├── slicer/                  # Slicing pipeline
-│       ├── vision/                  # Vision processing
-│       └── monitoring/              # Print monitoring
+│       ├── slicer/                  # Slicing pipeline (module-complete, unwired)
+│       ├── vision/                  # Vision processing (module-complete, unwired)
+│       ├── monitoring/              # Print monitoring, Z-offset, maintenance (unwired)
+│       ├── audio/                   # YAMNet anomaly detection (unwired, no config yet)
+│       ├── calibration/             # Tower generation, visual scoring (unwired)
+│       ├── storage/                 # SQLite job/calibration repositories (unwired)
+│       ├── queue/                   # Multi-printer queue + schedulers (unwired)
+│       └── modeling/                # Photo-to-print, image-to-3D, mesh repair (unwired)
 ├── tests/
 │   ├── unit/                        # Unit tests
 │   └── integration/                 # Integration tests
@@ -162,8 +170,7 @@ sensing-voxel/
 ├── data/                            # Runtime data
 └── docs/
     ├── PRD.md                       # Product requirements
-    ├── ARCHITECTURE.md              # Architecture doc
-    └── TASKS.md                     # Development tasks
+    └── ARCHITECTURE.md              # Architecture doc
 ```
 
 ## Roadmap / Current Runtime Status
@@ -179,8 +186,9 @@ modules or tests.
 - **Currently wired and usable**
   - [x] Klipper/Moonraker adapter: REST/WebSocket connection, telemetry, file upload,
         print lifecycle commands, temperatures, movement, macros, and basic system info
-  - [x] Telegram allowlisted bot with `/status`, `/reset_z_offset`, `/ask`,
-        `/clear_chat`, and file upload handling
+  - [x] Telegram allowlisted bot with `/start`, `/status`, `/reset_z_offset`,
+        `/calibrate_camera`, `/ask`, `/clear_chat`, `/ctx`, `/audit`, `/tasks`,
+        `/approvals`, and file upload handling
   - [x] Direct G-code upload workflow through Telegram:
         upload `.gcode`/`.g`/`.gco` → approval buttons → upload to printer → start print
   - [x] Web dashboard server with status, printer list, telemetry, alerts,
