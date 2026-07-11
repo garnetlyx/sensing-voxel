@@ -66,6 +66,52 @@ pytest --cov=sensing_voxel --cov-report=html
 - Second printer: `printer.example:80`
 - Moonraker REST wraps results under `result.status.{object}` — unwrap with `data.get("status", data)`
 
+## Live Runtime Environment (verified 2026-07-10)
+
+The system runs live against real hardware. All config is in `config/local.yaml` (gitignored).
+
+### Services
+
+| Service | Address | Status |
+|---------|---------|--------|
+| neptune4max (Klipper) | `printer.example:80` | ✅ Connected, WS subscribed |
+| rpi-printer (Klipper) | `printer.example:80` | ✅ Connected, WS subscribed |
+| Tapo C220 camera (ONVIF) | `192.168.68.67:2020` | ✅ Connected, PTZ working |
+| Tapo C220 RTSP stream | `rtsp://threedp:garage10@192.168.68.67:554/stream1` | ✅ 1080p capture verified |
+| LLM proxy (Anthropic protocol) | `http://host.example:4000` | ✅ MiniMax-M3 model |
+| Telegram bot | `@example_bot` | ✅ Polling (ensure only one instance runs — duplicate `getUpdates` causes 409 Conflict) |
+| Dashboard API | `http://localhost:8080` | ✅ 24 endpoints live |
+
+### Start the server
+
+```bash
+source .venv/bin/activate
+python -m sensing_voxel.main 2>&1 | tee /tmp/sv-server.log
+```
+
+Or in tmux: `tmux new-session -d -s sv-server -c <repo-root>` then send the above command.
+
+### Verified working (as of 2026-07-10)
+
+- LLM tool-use loop: `get_print_progress` returns real temps, `list_files` returns real G-code list from Moonraker
+- Dual-printer Klipper adapter (REST + WS telemetry)
+- Tapo camera RTSP capture (1920×1080 JPEG) + ONVIF PTZ step-move
+- Dashboard REST API: health, printers, status, telemetry, chat, camera/move
+- Tool audit log: `data/tool_audit.jsonl` records tool name + user ID + result excerpt
+- State machine starts at IDLE, persistence loads from `data/agent_state.json`
+
+### Known runtime gaps (confirmed by live test)
+
+- `GET /api/v1/jobs/history` → returns empty (JobRepository not wired into app_state)
+- `GET /api/v1/queue` → returns empty (QueueManager not wired)
+- `POST /api/v1/decision` → records only, no upload/start/resume/cancel side effects
+- Telegram STL/STEP upload → enters RECEIVING state, slicer never called
+- LLM config has no `provider` field in local.yaml → defaults to `LlmProvider.MINIMAX` (Anthropic SDK path — this is the working path)
+
+### Verification plan
+
+See `.project/module-verification/` for the full per-component verification checklist and go/no-go decisions on orphaned modules.
+
 ## LLM Integration
 
 - 31+ tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals
