@@ -174,6 +174,7 @@ class ChatManager:
         web_search=None,
         max_turns: int = 20,
         max_tool_iterations: int = 5,
+        tool_cooldown_seconds: float = 1.0,
         context_window_tokens: int = 32000,
         history_path: Path | None = None,
         audit_log_path: Path | None = None,
@@ -218,6 +219,7 @@ class ChatManager:
                 background_tasks=self._background_tasks,
                 approval_store=self._approval_store,
                 allowed_gcode_commands=allowed_gcode_commands,
+                tool_cooldown_seconds=tool_cooldown_seconds,
             )
             self._tools = list(PRINTER_TOOLS) if self._adapters else []
             if getattr(self._tool_executor._shell_config, "enabled", False):

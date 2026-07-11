@@ -184,6 +184,7 @@ class LlmConfig:
     max_conversation_turns: int = 20
     allowed_gcode_commands: list[str] = field(default_factory=list)
     max_tool_iterations: int = 50
+    tool_cooldown_seconds: float = 1.0
     verbose_tool_use: bool = True
     enabled: bool = False
     shell: ShellToolConfig = field(default_factory=ShellToolConfig)

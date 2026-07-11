@@ -643,6 +643,35 @@ CAMERA_TOOLS: list[dict[str, Any]] = [
 class ToolExecutor:
     """Dispatches tool calls to one or more printer adapters and optional camera."""
 
+    # Tools that move physical hardware — rate-limited to prevent congestion.
+    _PHYSICAL_TOOLS: set[str] = frozenset({
+        "camera_move_step",
+        "camera_move_to",
+        "camera_go_to_preset",
+        "camera_snapshot",
+        "run_gcode",
+        "move_axis",
+        "extrude",
+        "home_axes",
+        "set_nozzle_temp",
+        "set_bed_temp",
+        "set_fan_speed",
+        "set_z_offset",
+        "motors_off",
+        "set_speed_override",
+        "set_flow_override",
+        "execute_macro",
+        "start_print",
+        "pause_print",
+        "resume_print",
+        "cancel_print",
+        "restart_firmware",
+        "restart_service",
+        "upload_to_printer",
+        "delete_file",
+        "run_shell",
+    })
+
     def __init__(
         self,
         adapter: PrinterAdapter | None = None,
@@ -658,6 +687,7 @@ class ToolExecutor:
         background_tasks: BackgroundTaskManager | None = None,
         approval_store: PendingApprovalStore | None = None,
         allowed_gcode_commands: set[str] | None = None,
+        tool_cooldown_seconds: float = 0.0,
     ):
         if adapters is None:
             adapters = {}
@@ -679,6 +709,8 @@ class ToolExecutor:
         self._background_tasks = background_tasks or BackgroundTaskManager()
         self._approval_store = approval_store or PendingApprovalStore()
         self._allowed_gcode_commands = {cmd.upper() for cmd in (allowed_gcode_commands or set())}
+        self._tool_cooldown_seconds = tool_cooldown_seconds
+        self._last_tool_call: dict[str, float] = {}
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
@@ -769,9 +801,29 @@ class ToolExecutor:
             channel="unknown",
             active_printer=None,
         )
+
+        if (
+            self._tool_cooldown_seconds > 0
+            and tool_name in self._PHYSICAL_TOOLS
+        ):
+            last = self._last_tool_call.get(tool_name)
+            now = asyncio.get_event_loop().time()
+            if last is not None:
+                elapsed = now - last
+                if elapsed < self._tool_cooldown_seconds:
+                    wait = self._tool_cooldown_seconds - elapsed
+                    logger.info(
+                        f"Tool cooldown: {tool_name} waiting {wait:.1f}s "
+                        f"(last called {elapsed:.1f}s ago)"
+                    )
+                    await asyncio.sleep(wait)
+
         handler = self._dispatch.get(tool_name)
         if not handler:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        if self._tool_cooldown_seconds > 0 and tool_name in self._PHYSICAL_TOOLS:
+            self._last_tool_call[tool_name] = asyncio.get_event_loop().time()
 
         needs_context = "request_context" in inspect.signature(handler).parameters
         started_at = datetime.now().isoformat()

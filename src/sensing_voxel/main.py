@@ -163,6 +163,7 @@ async def main() -> None:
             max_turns=config.llm.max_conversation_turns,
             context_window_tokens=config.llm.context_window_tokens,
             max_tool_iterations=config.llm.max_tool_iterations,
+            tool_cooldown_seconds=config.llm.tool_cooldown_seconds,
             history_path=Path(config.storage.data_dir) / "chat_history.json",
             audit_log_path=Path(config.storage.data_dir) / "tool_audit.jsonl",
             allowed_gcode_commands=set(config.llm.allowed_gcode_commands),
