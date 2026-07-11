@@ -640,6 +640,60 @@ CAMERA_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+MEMO_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "get_printer_memo",
+        "description": (
+            "Read SVA's stored notes about a printer's physical attributes that "
+            "cannot be queried from Klipper (e.g. nozzle diameter, bed surface type, "
+            "filament brand). Pass a specific key to read one attribute, or omit key "
+            "to read all stored notes for the printer."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID (e.g. 'neptune4max'). Defaults to active printer.",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Specific attribute key (e.g. 'nozzle_diameter'). Omit to read all.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "set_printer_memo",
+        "description": (
+            "Store or update a note about a printer's physical attribute that SVA "
+            "should remember across sessions (e.g. nozzle_diameter=0.6, "
+            "bed_surface=PEI_textured, filament_brand=Polymaker). "
+            "Only store information that cannot be read from Klipper."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID (e.g. 'neptune4max'). Defaults to active printer.",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Attribute key (e.g. 'nozzle_diameter')",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Attribute value (e.g. '0.6')",
+                },
+            },
+            "required": ["key", "value"],
+        },
+    },
+]
+
+
 class ToolExecutor:
     """Dispatches tool calls to one or more printer adapters and optional camera."""
 
@@ -688,6 +742,7 @@ class ToolExecutor:
         approval_store: PendingApprovalStore | None = None,
         allowed_gcode_commands: set[str] | None = None,
         tool_cooldown_seconds: float = 0.0,
+        memo_repository=None,
     ):
         if adapters is None:
             adapters = {}
@@ -711,6 +766,7 @@ class ToolExecutor:
         self._allowed_gcode_commands = {cmd.upper() for cmd in (allowed_gcode_commands or set())}
         self._tool_cooldown_seconds = tool_cooldown_seconds
         self._last_tool_call: dict[str, float] = {}
+        self._memo_repository = memo_repository
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
@@ -764,6 +820,9 @@ class ToolExecutor:
             self._dispatch["run_bash"] = self._run_bash
         if self._web_search_config.enabled:
             self._dispatch["web_search"] = self._web_search
+        if self._memo_repository:
+            self._dispatch["get_printer_memo"] = self._get_printer_memo
+            self._dispatch["set_printer_memo"] = self._set_printer_memo
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2057,3 +2116,47 @@ class ToolExecutor:
         merged = dict(record.payload)
         merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
         return merged, None
+
+    # --- Printer memo tools ---
+
+    async def _get_printer_memo(self, tool_input: dict) -> dict:
+        if self._memo_repository is None:
+            return {"error": "Memo storage is not configured"}
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, _adapter = selected
+        key = tool_input.get("key")
+        if key:
+            record = self._memo_repository.get(printer_id, key)
+            if record is None:
+                return {"printer_id": printer_id, "key": key, "found": False}
+            return {
+                "printer_id": record.printer_id,
+                "key": record.key,
+                "value": record.value,
+                "updated_at": str(record.updated_at) if record.updated_at else None,
+                "found": True,
+            }
+        else:
+            all_memos = self._memo_repository.get_as_dict(printer_id)
+            return {"printer_id": printer_id, "memos": all_memos, "count": len(all_memos)}
+
+    async def _set_printer_memo(self, tool_input: dict) -> dict:
+        if self._memo_repository is None:
+            return {"error": "Memo storage is not configured"}
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, _adapter = selected
+        key = tool_input.get("key", "").strip()
+        value = str(tool_input.get("value", "")).strip()
+        if not key or not value:
+            return {"error": "Both 'key' and 'value' are required"}
+        self._memo_repository.upsert(printer_id, key, value)
+        return {
+            "printer_id": printer_id,
+            "key": key,
+            "value": value,
+            "status": "saved",
+        }

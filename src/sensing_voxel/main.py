@@ -141,9 +141,13 @@ async def main() -> None:
         from sensing_voxel.llm.chat import ChatManager
         from sensing_voxel.llm.client import LlmClient
         from sensing_voxel.llm.context import PrinterContextCollector
+        from sensing_voxel.storage import PrinterMemoRepository, create_database
 
         llm_client = LlmClient(config.llm)
         await llm_client.initialize()
+
+        db = create_database(config.storage.data_dir)
+        memo_repo = PrinterMemoRepository(db)
 
         context_collector = PrinterContextCollector(
             state_machine=state_machine,
@@ -168,6 +172,7 @@ async def main() -> None:
             audit_log_path=Path(config.storage.data_dir) / "tool_audit.jsonl",
             allowed_gcode_commands=set(config.llm.allowed_gcode_commands),
             verbose_tool_use=config.llm.verbose_tool_use,
+            memo_repository=memo_repo,
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")

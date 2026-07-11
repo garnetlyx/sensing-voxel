@@ -177,6 +177,23 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_calibrations_performed ON calibrations(performed_at)"
         )
 
+        # Printer memos table (SVA notes about physical printer attributes)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS printer_memos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                printer_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(printer_id, key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_printer_memos_printer ON printer_memos(printer_id)"
+        )
+
         # Schema version table
         conn.execute(
             """

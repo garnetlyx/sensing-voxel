@@ -180,6 +180,7 @@ class ChatManager:
         audit_log_path: Path | None = None,
         allowed_gcode_commands: set[str] | None = None,
         verbose_tool_use: bool = True,
+        memo_repository=None,
     ):
         self._client = client
         self._context_collector = context_collector
@@ -203,6 +204,7 @@ class ChatManager:
         if self._adapters or camera or rtsp_url or shell or web_search:
             from sensing_voxel.llm.tools import (
                 CAMERA_TOOLS,
+                MEMO_TOOLS,
                 PRINTER_TOOLS,
                 SYSTEM_TOOLS,
                 ToolExecutor,
@@ -220,6 +222,7 @@ class ChatManager:
                 approval_store=self._approval_store,
                 allowed_gcode_commands=allowed_gcode_commands,
                 tool_cooldown_seconds=tool_cooldown_seconds,
+                memo_repository=memo_repository,
             )
             self._tools = list(PRINTER_TOOLS) if self._adapters else []
             if getattr(self._tool_executor._shell_config, "enabled", False):
@@ -228,6 +231,8 @@ class ChatManager:
                 self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "web_search"])
             if camera or rtsp_url:
                 self._tools.extend(CAMERA_TOOLS)
+            if getattr(self._tool_executor, "_memo_repository", None):
+                self._tools.extend(MEMO_TOOLS)
 
     def set_photo_sender(self, sender) -> None:
         """Attach a channel-specific photo sender after construction."""

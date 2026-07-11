@@ -23,6 +23,10 @@ from sensing_voxel.storage.job_repository import (
     JobRepository,
     JobStatus,
 )
+from sensing_voxel.storage.printer_memo_repository import (
+    MemoRecord,
+    PrinterMemoRepository,
+)
 
 __all__ = [
     # Database
@@ -41,4 +45,7 @@ __all__ = [
     "CalibrationRepository",
     "CalibrationRecord",
     "CalibrationType",
+    # Printer Memo Repository
+    "PrinterMemoRepository",
+    "MemoRecord",
 ]
