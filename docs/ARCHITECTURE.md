@@ -501,9 +501,36 @@ class PrinterAdapter(ABC):
 ### 4.16 Web Dashboard API
 
 - `aiohttp`-based web server (`api/server.py`) with REST + WebSocket endpoints.
-- REST: `/api/health`, `/api/printers`, `/api/status`, `/api/telemetry/{printer_id}`, `/api/actions/{printer_id}/{action}`, `/api/llm/chat`, `/api/v1/chat/context`, `/api/v1/tool-audit`, `/api/v1/background-tasks`, `/api/v1/pending-approvals`.
-- WebSocket: `/ws` for real-time telemetry push to dashboard clients.
-- MJPEG camera proxy: `/api/camera/stream` converts RTSP to browser-compatible MJPEG.
+- REST endpoints (registered in `api/routes.py` and `api/server.py`):
+
+| Method | Path | Handler |
+|--------|------|---------|
+| GET | `/health` | Health check |
+| GET | `/api/v1/printers` | List configured printers |
+| GET | `/api/v1/status` | Aggregate agent + printer status |
+| GET | `/api/v1/job` | Current job for active printer |
+| GET | `/api/v1/telemetry` | Latest telemetry (`?printer=` query param) |
+| GET | `/api/v1/alerts` | Recent alerts |
+| POST | `/api/v1/decision` | Consume a pending decision (records only; no upload/start/resume/cancel side effects yet) |
+| POST | `/api/v1/active-printer` | Set active printer |
+| POST | `/api/v1/chat` | LLM chat message |
+| GET | `/api/v1/chat/history` | Chat history |
+| POST | `/api/v1/chat/clear` | Clear chat history |
+| GET | `/api/v1/chat/context` | Current chat context summary |
+| GET | `/api/v1/tool-audit` | Tool-call audit log |
+| GET | `/api/v1/background-tasks` | Background task status |
+| GET | `/api/v1/pending-approvals` | Pending approval queue |
+| POST | `/api/v1/upload` | Upload G-code/model file |
+| POST | `/api/v1/camera/move` | PTZ camera move (relative) |
+| POST | `/api/v1/camera/preset` | PTZ camera go-to-preset |
+| GET | `/api/v1/jobs/history` | Job history (requires `JobRepository` wired into app state — not yet wired) |
+| GET | `/api/v1/jobs/stats` | Job statistics (same wiring gap) |
+| GET | `/api/v1/queue` | Multi-printer queue status (requires `QueueManager` wired — not yet wired) |
+| POST | `/api/v1/queue/clear` | Clear queue (same wiring gap) |
+| GET | `/api/v1/camera/stream` | MJPEG camera proxy (RTSP → MJPEG, registered in `server.py`) |
+| GET | `/api/v1/ws` | WebSocket (telemetry, alerts, state changes, chat) |
+
+- MJPEG camera proxy: `/api/v1/camera/stream` converts RTSP to browser-compatible MJPEG.
 - Optional API token authentication (`DashboardConfig.api_token`).
 - Static file serving for dashboard UI at `/`.
 - Dashboard chat uses the same logical-user session model as Telegram instead of a hardcoded `user_id=0`.
@@ -726,7 +753,7 @@ next tasks live in `.project/TODO.md`.
 | Printer adapter ABC | `adapters/base.py` | 267 | Includes `get_current_position`, `NotSupportedError` |
 | Command queue | `adapters/command_queue.py` | 148 | Priority queue, emergency bypass |
 | Klipper/Moonraker adapter | `adapters/klipper.py` | 998 | REST+WS, base_url, telemetry, state normalization, current position |
-| Bambu adapter | `adapters/bambu.py` | 1,082 | MQTT+FTP, full command set, cached position. Code-wired; no Bambu config enabled in `default.yaml`. |
+| Bambu adapter | `adapters/bambu.py` | 1,082 | MQTT+FTP, full command set, cached position. Code-complete; instantiated by `main.py` only when a `BambuConfig` is present, but `default.yaml` does not enable one — not production-wired. |
 | Telegram bot | `bot/telegram.py` | 1,048 | Auth, upload, decisions, notifications, `/ask` `/clear_chat` `/ctx` `/audit` `/tasks` `/approvals` |
 | Telegram auth + decisions | `bot/auth.py`, `bot/decisions.py` | 119 + 358 | Allowlist, inline keyboard |
 | Web dashboard API | `api/{server,routes,websocket,auth,serializers,camera_proxy}.py` | 1,131 | REST, WebSocket, MJPEG proxy, token auth, chat context, audit, background tasks, pending approvals |
@@ -765,15 +792,12 @@ consumed at runtime. Wiring these is the primary contents of `.project/TODO.md`.
 ### 9.3 Test suite status
 
 **1,234 tests collected** across 53 test files (42 unit, 4 integration, 1
-real_world, 2 e2e, 1 conftest). Current run: **588 passing, 537 failing, 75
-errors, 21 skipped, 13 xfailed**. The suite has regressed since the third
-review cycle (which reported 574/610 passing). Root causes are identified in
-`.project/EVAL.md` and fixes are queued in `.project/TODO.md` (P0):
-
-- `MockPrinterAdapter` test mocks missing newly-added abstract methods (`get_current_position`).
-- `pytest-aiohttp` `TestClient` `Runner.run()` event-loop conflict in api/monitoring tests.
-- Playwright browser build pin drift (1208 vs cached 1217/1223). Playwright IS installed.
-- Stale `.venv` pip shebang (project moved directories).
+real_world, 2 e2e, 1 conftest). Default `pytest` run (resolved 2026-07-09,
+P0): **1,181 passed, 0 failed, 18 skipped, 13 xfailed** in ~31s. Live-hardware
+tests under `tests/e2e/` and `tests/real_world/` are auto-deselected (opt in
+with `pytest -m live`). Historical note: before P0 the suite reported
+588 passing / 537 failing / 75 errors — root causes and fixes are recorded in
+`.project/SESSION_LOG.md` ([2026-07-09 P0-fixes]).
 
 ### 9.4 Known Deviations from Architecture Spec
 
@@ -784,4 +808,4 @@ review cycle (which reported 574/610 passing). Root causes are identified in
 | §4.9 / §4.10 | First-layer, audio, filament monitoring are runtime features | All are module-complete but `main.py` does not start `MonitoringOrchestrator` | Yes — see `.project/TODO.md` T1.1–T1.3 |
 | §4.14 | LLM tool set | Now includes `web_search` (SearXNG) — not yet documented in §4.14 tool list | Yes — §4.14 needs `web_search` entry |
 | Runtime plan | First-class reminder/scheduler helpers | Background execution exists but no dedicated reminder planner | Planned follow-up |
-| `monitor.py` imports | Optional deps lazy-imported | Vision imports are still module-level (`monitor.py:26-28`) | Yes — T1.1, prerequisite for wiring |
+| `monitor.py` imports | Optional deps lazy-imported | Vision/audio imports are guarded by `try/except ImportError` with `VISION_AVAILABLE`/`AUDIO_AVAILABLE` flags (`monitor.py:30-51`). T1.1 resolved. | Done — orchestrator still needs wiring (T1.3) |
