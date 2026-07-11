@@ -138,6 +138,48 @@ curl -s -m 60 "$LLM_BASE_URL/v1/messages" \
 
 See `.project/module-verification/` for the full per-component verification checklist and go/no-go decisions on orphaned modules.
 
+### Live debugging workflow
+
+When a bug is found or behavior needs verification, follow this loop:
+
+```
+┌─► 1. DISCOVER: identify the problem (log error, wrong behavior, user report)
+│
+│   2. INVESTIGATE: gather evidence in parallel
+│      • Server log:   tail -50 /tmp/sv-server.log
+│      • Camera frame: capture via RTSP → /tmp/sv-camera-snapshot.jpg → look_at
+│      • Hardware:     curl Moonraker REST endpoints, ping devices
+│      • Code:         grep / read the relevant module
+│      • LLM state:    GET /api/v1/chat/context, tool_audit.jsonl
+│
+│   3. FIX: make the minimal code change (never refactor while fixing)
+│      • Run unit tests: pytest tests/unit/test_<module>.py -x -q
+│
+│   4. RESTART: reload the server with the fix
+│      • Ctrl-C in tmux, re-run python -m sensing_voxel.main | tee /tmp/sv-server.log
+│      • Verify startup log: adapters connected, camera ONVIF, LLM initialized
+│
+│   5. REPRODUCE AS USER: act as a human user via Playwright dashboard
+│      • Navigate to http://localhost:8080
+│      • Type the triggering message in the chat input
+│      • Observe: LLM response, tool calls in log, camera movement, state changes
+│      • For vision: capture RTSP frame → look_at → cross-check LLM's description
+│
+│   6. VERIFY OUTCOME
+│      ├─ FIXED → 7. DOCUMENT + COMMIT
+│      │         • Update AGENTS.md / .project/module-verification/ if behavior changed
+│      │         • git add + commit with conventional-commit message
+│      │         • Confirm: pytest still green, server still running
+│      │
+│      └─ STILL BROKEN or NEW BUG → back to step 1 (↑)
+└──────────────────────────────────────────────────────────────────────────
+```
+
+Key tools for each step:
+- **Investigate**: `tail /tmp/sv-server.log`, `curl localhost:8080/api/v1/*`, RTSP capture + `look_at`
+- **Reproduce**: Playwright browser at `http://localhost:8080` — type in `#chat-input`, click `#chat-send`
+- **Verify**: `grep "Tool call:\|cooldown\|error" /tmp/sv-server.log`, `pytest tests/unit/ -x -q`
+
 ## LLM Integration
 
 - 31+ tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals
