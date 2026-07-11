@@ -334,6 +334,7 @@ async def main() -> None:
                 config=config.print_monitor,
             )
             print_monitors[printer_id] = monitor
+            monitor.enable_auto_monitoring()
             logger.info(f"Print monitor initialized for {printer_id}")
 
         if chat_manager and chat_manager._tool_executor:

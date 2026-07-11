@@ -91,6 +91,35 @@ class PrintMonitor:
         self._state: MonitorState | None = None
         self._stop_event = asyncio.Event()
         self._ack_event = asyncio.Event()
+        self._auto_enabled = False
+
+    def enable_auto_monitoring(self) -> None:
+        """Register adapter event listeners for automatic monitor activation."""
+        self._auto_enabled = True
+        if hasattr(self._adapter, "on_state_changed"):
+            self._adapter.on_state_changed(self._on_adapter_state_changed)
+
+    async def _on_adapter_state_changed(self, old_state: Any, new_state: Any) -> None:
+        """Auto-activate monitoring when printer enters PRINTING state."""
+        if not self._auto_enabled:
+            return
+
+        new_name = new_state.name if hasattr(new_state, "name") else str(new_state)
+        old_name = old_state.name if hasattr(old_state, "name") else str(old_state)
+
+        if new_name == "PRINTING" and old_name != "PRINTING":
+            if not self.is_monitoring:
+                logger.info(f"Auto-activating monitor: {self.printer_id} entered PRINTING")
+                await self.start_monitoring()
+
+        if old_name == "PRINTING" and new_name in ("STANDBY", "COMPLETE", "IDLE_NO_ACTIVE_PRINT", "CANCELLED", "ERROR"):
+            if self.is_monitoring:
+                if self._config.notify_on_completion:
+                    await self._notify(
+                        self.printer_id, "info",
+                        f"Print ended on {self.printer_id} (state: {new_name})",
+                    )
+                await self.stop_monitoring(reason=f"state_changed_to_{new_name}")
 
     async def start_monitoring(self, filename: str | None = None) -> None:
         if self._task and not self._task.done():
