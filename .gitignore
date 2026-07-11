@@ -85,3 +85,4 @@ docs/REAL_WORLD_TESTING.md
 docs/PHASE_4_1_WORK_PLAN.md
 .omo/
 *.bak
+.playwright-mcp/
