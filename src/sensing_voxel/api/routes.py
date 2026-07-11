@@ -2,11 +2,19 @@
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+
+
+def normalize_filename(filename: str) -> str:
+    """Replace spaces and special characters with dashes to avoid Moonraker path issues."""
+    name, ext = os.path.splitext(filename)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")
+    return f"{name}{ext}"
 
 from sensing_voxel.api.serializers import (
     serialize_alert,
@@ -397,6 +405,7 @@ async def post_upload(request: web.Request) -> web.Response:
 
     # Sanitize filename
     filename = os.path.basename(filename)
+    filename = normalize_filename(filename)
 
     # Ensure data/uploads directory exists
     # Use data directory relative to the project root

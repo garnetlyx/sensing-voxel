@@ -14,6 +14,15 @@ from urllib.parse import quote
 
 import aiohttp
 
+
+def _normalize_filename(filename: str) -> str:
+    """Replace spaces and special characters with dashes to avoid Moonraker path issues."""
+    import os
+    import re
+    name, ext = os.path.splitext(filename)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")
+    return f"{name}{ext}"
+
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.core.models import (
     AdapterCommandError,
@@ -487,6 +496,8 @@ class KlipperAdapter(PrinterAdapter):
                     message=f"File not found: {local_path}",
                 )
 
+            remote_name = _normalize_filename(remote_name)
+
             # Read file content
             with open(path, "rb") as f:
                 file_content = f.read()
@@ -698,6 +709,46 @@ class KlipperAdapter(PrinterAdapter):
                 CommandResultStatus.FAILURE,
                 message=f"Request failed: {str(e)}",
             )
+
+    async def write_config_file(self, filename: str, content: str) -> CommandResult:
+        """Write a config file to Moonraker's config root. Auto-creates a backup first."""
+        safe_filename = filename.strip().lstrip("/") or "printer.cfg"
+        if ".." in Path(safe_filename).parts:
+            return CommandResult(
+                CommandResultStatus.FAILURE,
+                message="filename must stay under Moonraker config root",
+            )
+
+        backup_name = f"sv-backup-{datetime.now().strftime('%Y%m%d_%H%M%S')}-{safe_filename}"
+        backup_result = await self.get_config_file(safe_filename, max_bytes=200000)
+        if backup_result.status == CommandResultStatus.SUCCESS:
+            backup_content = backup_result.data.get("content", "")
+            try:
+                backup_data = aiohttp.FormData()
+                backup_data.add_field(
+                    "file",
+                    backup_content.encode(),
+                    filename=backup_name,
+                    content_type="text/plain",
+                )
+                backup_data.add_field("root", "config")
+                await self._rest_request("POST", "/server/files/upload", data=backup_data)
+                logger.info(f"Created config backup: {backup_name}")
+            except Exception as e:
+                logger.warning(f"Backup upload failed (proceeding): {e}")
+
+        data = aiohttp.FormData()
+        data.add_field(
+            "file",
+            content.encode(),
+            filename=safe_filename,
+            content_type="text/plain",
+        )
+        data.add_field("root", "config")
+        result = await self._rest_request("POST", "/server/files/upload", data=data)
+        if result.status == CommandResultStatus.SUCCESS:
+            logger.info(f"Wrote config file: {safe_filename}")
+        return result
 
     async def delete_file(self, filename: str) -> CommandResult:
         return await self._rest_request("DELETE", f"/server/files/gcodes/{filename}")

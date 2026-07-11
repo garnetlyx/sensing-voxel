@@ -62,6 +62,7 @@ pytest --cov=sensing_voxel --cov-report=html
 - **Decision safety**: Lock-guarded CAS via `consume_decision()` in `core/decision.py`
 - **Emergency path**: Dedicated session for emergency cancel, bypasses the command queue
 - **G-code validation**: Shared `validate_gcode_command()` in `infra/gcode.py` (blocks M112/M410/M80/M81/M23, validates axis + temperature bounds)
+- **Printer config safety**: **ALWAYS backup printer.cfg before any modification.** Moonraker auto-creates timestamped backups (e.g. `printer-20260516_075252.cfg`) but never overwrite printer.cfg without confirming a backup exists. SVA's `update_printer_config` tool MUST create a backup copy before writing. A single-line overwrite can brick the printer's startup.
 - **Local lifecycle state**: `.project/` holds `TODO.md`, `SESSION_LOG.md`, `EVAL.md` (gitignored)
 
 ## Printer Connectivity

@@ -520,6 +520,36 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    {
+        "name": "update_printer_config",
+        "description": (
+            "Update a single key in a Klipper config section (e.g. nozzle_diameter in [extruder]). "
+            "Automatically creates a timestamped backup before writing. "
+            "Requires approval — destructive operation that modifies printer.cfg."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID (e.g. 'neptune4max'). Defaults to active printer.",
+                },
+                "section": {
+                    "type": "string",
+                    "description": "Config section name without brackets (e.g. 'extruder', 'heater_bed')",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Config key to update (e.g. 'nozzle_diameter')",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "New value (e.g. '0.600')",
+                },
+            },
+            "required": ["section", "key", "value"],
+        },
+    },
 ]
 
 
@@ -823,6 +853,7 @@ class ToolExecutor:
         if self._memo_repository:
             self._dispatch["get_printer_memo"] = self._get_printer_memo
             self._dispatch["set_printer_memo"] = self._set_printer_memo
+        self._dispatch["update_printer_config"] = self._update_printer_config
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2159,4 +2190,72 @@ class ToolExecutor:
             "key": key,
             "value": value,
             "status": "saved",
+        }
+
+    async def _update_printer_config(
+        self,
+        tool_input: dict,
+        request_context: ChatRequestContext | None = None,
+    ) -> dict:
+        request_context = request_context or ChatRequestContext(
+            logical_user_id="unknown", channel="unknown", active_printer=None,
+        )
+        approved_input, approval_error = self._consume_approval(
+            "update_printer_config", tool_input, request_context
+        )
+        if approval_error:
+            return approval_error
+
+        section = tool_input.get("section", "").strip()
+        key = tool_input.get("key", "").strip()
+        value = str(tool_input.get("value", "")).strip()
+        if not section or not key:
+            return {"error": "Both 'section' and 'key' are required"}
+
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+
+        if approved_input is None:
+            return self._create_approval(
+                request_context,
+                "update_printer_config",
+                {"section": section, "key": key, "value": value, "printer_id": printer_id},
+                f"Modifying printer.cfg [{section}] {key}={value} — this changes printer configuration and requires explicit approval.",
+            )
+
+        read_fn = getattr(adapter, "get_config_file", None)
+        write_fn = getattr(adapter, "write_config_file", None)
+        if not read_fn or not write_fn:
+            return {"error": "This printer adapter does not support remote config writes"}
+
+        current = await read_fn(filename="printer.cfg", max_bytes=200000)
+        if current.status != CommandResultStatus.SUCCESS:
+            return {"error": f"Failed to read current printer.cfg: {current.message}"}
+
+        content = current.data.get("content", "")
+        import re
+        pattern = re.compile(
+            rf"^(\[{re.escape(section)}\][^\[]*?{re.escape(key)}:\s*)(.*)$",
+            re.MULTILINE,
+        )
+        match = pattern.search(content)
+        if not match:
+            return {"error": f"Could not find [{section}] {key}: in printer.cfg"}
+
+        old_value = match.group(2).strip()
+        new_content = pattern.sub(rf"\g<1>{value}", content, count=1)
+        write_result = await write_fn("printer.cfg", new_content)
+        if write_result.status != CommandResultStatus.SUCCESS:
+            return {"error": f"Failed to write printer.cfg: {write_result.message}"}
+
+        return {
+            "printer_id": printer_id,
+            "section": section,
+            "key": key,
+            "old_value": old_value,
+            "new_value": value,
+            "status": "updated",
+            "note": "Backup created automatically. Run FIRMWARE_RESTART to apply (not done automatically).",
         }
