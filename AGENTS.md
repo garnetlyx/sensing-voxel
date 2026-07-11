@@ -81,6 +81,7 @@ The system runs live against real hardware. All config is in `config/local.yaml`
 | LLM proxy (Anthropic protocol) | `http://host.example:4000` | ✅ MiniMax-M3 model |
 | Telegram bot | `@example_bot` | ✅ Polling (ensure only one instance runs — duplicate `getUpdates` causes 409 Conflict) |
 | Dashboard API | `http://localhost:8080` | ✅ 24 endpoints live |
+| SearXNG (web search) | `http://localhost:8888` (Docker) | ✅ JSON API enabled, web_search tool wired |
 
 ### Start the server
 
@@ -99,6 +100,9 @@ Or in tmux: `tmux new-session -d -s sv-server -c <repo-root>` then send the abov
 - Dashboard REST API: health, printers, status, telemetry, chat, camera/move
 - Tool audit log: `data/tool_audit.jsonl` records tool name + user ID + result excerpt
 - State machine starts at IDLE, persistence loads from `data/agent_state.json`
+- `web_search` tool: SearXNG instance at `localhost:8888` (Docker), LLM performs multi-turn progressive queries autonomously
+- `camera_snapshot` tool: RTSP → base64 → MiniMax-M3 multimodal analysis (cross-verified against independent look_at)
+- Tool cooldown: physical tools rate-limited (default 1.0s between identical tool calls)
 
 ### Known runtime gaps (confirmed by live test)
 
