@@ -694,9 +694,11 @@ MEMO_TOOLS: list[dict[str, Any]] = [
         "name": "get_printer_memo",
         "description": (
             "Read SVA's stored notes about a printer's physical attributes that "
-            "cannot be queried from Klipper (e.g. nozzle diameter, bed surface type, "
-            "filament brand). Pass a specific key to read one attribute, or omit key "
-            "to read all stored notes for the printer."
+            "cannot be queried from Klipper (e.g. bed surface type, filament brand, "
+            "hardware modifications). Memos are for information Klipper does NOT have — "
+            "config values like nozzle_diameter, max_temp, bed_size are the single source "
+            "of truth in printer.cfg, not in memos. "
+            "Pass a specific key to read one attribute, or omit key to read all."
         ),
         "input_schema": {
             "type": "object",
@@ -707,7 +709,7 @@ MEMO_TOOLS: list[dict[str, Any]] = [
                 },
                 "key": {
                     "type": "string",
-                    "description": "Specific attribute key (e.g. 'nozzle_diameter'). Omit to read all.",
+                    "description": "Specific attribute key. Omit to read all.",
                 },
             },
             "required": [],
@@ -716,10 +718,12 @@ MEMO_TOOLS: list[dict[str, Any]] = [
     {
         "name": "set_printer_memo",
         "description": (
-            "Store or update a note about a printer's physical attribute that SVA "
-            "should remember across sessions (e.g. nozzle_diameter=0.6, "
-            "bed_surface=PEI_textured, filament_brand=Polymaker). "
-            "Only store information that cannot be read from Klipper."
+            "Store a note about a printer attribute that SVA needs to remember but "
+            "CANNOT be read from Klipper (e.g. bed_surface=PEI_textured, "
+            "filament_brand=Polymaker, hardware_mods=badge, mac_address). "
+            "Do NOT store values that exist in printer.cfg (nozzle_diameter, max_temp, "
+            "bed_size, etc.) — those are the single source of truth. "
+            "If a memo key conflicts with a config value, warn the user instead."
         ),
         "input_schema": {
             "type": "object",
@@ -2193,17 +2197,43 @@ class ToolExecutor:
             all_memos = self._memo_repository.get_as_dict(printer_id)
             return {"printer_id": printer_id, "memos": all_memos, "count": len(all_memos)}
 
+    _CONFIG_KEYS = frozenset({
+        "nozzle_diameter", "max_temp", "min_temp", "bed_size",
+        "position_max", "position_min", "rotation_distance",
+        "microsteps", "full_steps_per_rotation", "pressure_advance",
+        "smooth_time", "max_extrude_only_distance",
+        "filament_diameter", "extruder_max_temp", "heater_bed_max_temp",
+        "max_accel", "max_velocity", "max_z_accel",
+        "square_corner_velocity", "max_accel_to_decel",
+    })
+
     async def _set_printer_memo(self, tool_input: dict) -> dict:
         if self._memo_repository is None:
             return {"error": "Memo storage is not configured"}
         selected = self._require_adapter(tool_input)
         if isinstance(selected, dict):
             return selected
-        printer_id, _adapter = selected
+        printer_id, adapter = selected
         key = tool_input.get("key", "").strip()
         value = str(tool_input.get("value", "")).strip()
         if not key or not value:
             return {"error": "Both 'key' and 'value' are required"}
+
+        if key in self._CONFIG_KEYS:
+            return {
+                "printer_id": printer_id,
+                "key": key,
+                "value": value,
+                "status": "rejected",
+                "warning": (
+                    f"'{key}' is a printer.cfg config value — single source of truth. "
+                    f"Memos should only store information NOT available in Klipper config. "
+                    f"To change this value, use update_printer_config instead. "
+                    f"To note a discrepancy (e.g. physical hardware differs from config), "
+                    f"use a key like '{key}_physical' or '{key}_observed'."
+                ),
+            }
+
         self._memo_repository.upsert(printer_id, key, value)
         return {
             "printer_id": printer_id,
