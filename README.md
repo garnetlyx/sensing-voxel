@@ -216,7 +216,9 @@ modules or tests.
 
 ## License
 
-MIT License
+GNU General Public License v3.0
+
+This project is licensed under the GPL-3.0 license, which ensures that all derivatives and integrations remain open source. See the [LICENSE](LICENSE) file for details.
 
 ## Credits
 
