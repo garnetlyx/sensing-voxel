@@ -2,6 +2,8 @@
 
 AI-powered 3D printer monitoring and control system with real-time vision-based quality detection.
 
+> **SVA** (Sensing-Voxel Agent) is the AI agent runtime at the core — it drives the LLM tool-use loop, state machine, and all wired subsystems. Interact with SVA via the Telegram bot or web dashboard chat.
+
 ## Features
 
 - 🤖 **Telegram Bot Interface**: Upload G-code files, receive notifications, and control prints

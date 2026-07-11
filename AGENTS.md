@@ -1,5 +1,9 @@
 # Sensing Voxel - Agent Instructions
 
+## Terminology
+
+- **SVA** (Sensing-Voxel Agent): the AI agent runtime that drives this system — the LLM tool-use loop, state machine, and all wired subsystems. When a user says "ask SVA to X", it means interact with the agent via dashboard chat or Telegram.
+
 ## Project Overview
 
 AI-powered 3D printer monitoring and control system with real-time vision-based quality detection.
