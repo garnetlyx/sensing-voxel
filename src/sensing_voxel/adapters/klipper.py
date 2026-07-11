@@ -898,6 +898,46 @@ class KlipperAdapter(PrinterAdapter):
             },
         )
 
+    async def get_hardware_info(self) -> CommandResult:
+        """Fetch hardware fingerprint (MAC address, hostname, CPU info) from Moonraker."""
+        result = await self._rest_request("GET", "/machine/system_info")
+        if result.status != CommandResultStatus.SUCCESS or not result.data:
+            return result
+
+        data = result.data.get("result", result.data)
+        system_info = data.get("system_info", {})
+        network = system_info.get("network", {})
+
+        mac_address = None
+        ip_address = None
+        interface = None
+        for iface_name, iface_info in network.items():
+            mac = iface_info.get("mac_address")
+            if mac and mac != "00:00:00:00:00:00":
+                mac_address = mac
+                interface = iface_name
+                ips = iface_info.get("ip_addresses", [])
+                for ip_entry in ips:
+                    if ip_entry.get("family") == "ipv4" and not ip_entry.get("is_link_local"):
+                        ip_address = ip_entry.get("address")
+                        break
+                if ip_address:
+                    break
+
+        cpu_info = system_info.get("cpu_info", {})
+        return CommandResult(
+            CommandResultStatus.SUCCESS,
+            data={
+                "mac_address": mac_address,
+                "ip_address": ip_address,
+                "network_interface": interface,
+                "hostname": system_info.get("hostname"),
+                "cpu_count": cpu_info.get("cpu_count"),
+                "processor": cpu_info.get("processor"),
+                "total_memory_kb": cpu_info.get("total_memory"),
+            },
+        )
+
     async def motors_off(self) -> CommandResult:
         return await self._rest_request("POST", "/printer/gcode/script", json={"script": "M84"})
 

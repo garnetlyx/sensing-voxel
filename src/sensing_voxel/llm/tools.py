@@ -550,6 +550,25 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "required": ["section", "key", "value"],
         },
     },
+    {
+        "name": "get_printer_hardware",
+        "description": (
+            "Fetch the hardware fingerprint (MAC address, hostname, CPU info) "
+            "from the printer via Moonraker. Use this to identify and distinguish "
+            "between printers, especially when multiple printers of the same model "
+            "are connected."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "printer_id": {
+                    "type": "string",
+                    "description": "Printer ID (e.g. 'neptune4max'). Defaults to active printer.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -854,6 +873,7 @@ class ToolExecutor:
             self._dispatch["get_printer_memo"] = self._get_printer_memo
             self._dispatch["set_printer_memo"] = self._set_printer_memo
         self._dispatch["update_printer_config"] = self._update_printer_config
+        self._dispatch["get_printer_hardware"] = self._get_printer_hardware
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2259,3 +2279,27 @@ class ToolExecutor:
             "status": "updated",
             "note": "Backup created automatically. Run FIRMWARE_RESTART to apply (not done automatically).",
         }
+
+    async def _get_printer_hardware(self, tool_input: dict) -> dict:
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, adapter = selected
+
+        hw_fn = getattr(adapter, "get_hardware_info", None)
+        if hw_fn is None or not inspect.iscoroutinefunction(hw_fn):
+            return {"error": "This printer adapter does not support hardware info queries"}
+
+        result = await hw_fn()
+        if result.status != CommandResultStatus.SUCCESS:
+            return {"printer_id": printer_id, "error": result.message}
+
+        hw = result.data
+        if self._memo_repository and hw.get("mac_address"):
+            existing = self._memo_repository.get(printer_id, "mac_address")
+            if existing is None or existing.value != hw["mac_address"]:
+                self._memo_repository.upsert(printer_id, "mac_address", hw["mac_address"])
+            if hw.get("hostname"):
+                self._memo_repository.upsert(printer_id, "hostname", hw["hostname"])
+
+        return {"printer_id": printer_id, **hw}

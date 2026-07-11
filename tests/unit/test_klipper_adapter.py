@@ -438,3 +438,113 @@ class TestKlipperAdapter:
         }
 
         assert set(adapter.STATE_MAP.keys()) == expected_states
+
+    @pytest.mark.asyncio
+    async def test_get_hardware_info_success(self, adapter):
+        """Test hardware info extraction with realistic Moonraker response"""
+        mock_response_data = {
+            "result": {
+                "system_info": {
+                    "hostname": "mkspi",
+                    "cpu_info": {
+                        "cpu_count": 4,
+                        "processor": "aarch64",
+                        "total_memory": 999784,
+                    },
+                    "network": {
+                        "wlan0": {
+                            "mac_address": "54:78:c9:00:e7:08",
+                            "ip_addresses": [
+                                {"family": "ipv4", "address": "192.168.68.86", "is_link_local": False},
+                                {"family": "ipv6", "address": "fe80::5678:c9ff:fe00:e708", "is_link_local": True},
+                            ],
+                        },
+                        "lo": {
+                            "mac_address": "00:00:00:00:00:00",
+                            "ip_addresses": [
+                                {"family": "ipv4", "address": "127.0.0.1", "is_link_local": False},
+                            ],
+                        },
+                    },
+                }
+            }
+        }
+
+        with patch("aiohttp.ClientSession") as mock_session:
+            mock_response = AsyncMock()
+            mock_response.status = 200
+            mock_response.json = AsyncMock(return_value=mock_response_data)
+            mock_session.return_value.request.return_value.__aenter__.return_value = mock_response
+
+            adapter._session = mock_session.return_value
+            result = await adapter.get_hardware_info()
+
+            assert result.status == CommandResultStatus.SUCCESS
+            data = result.data
+            assert data["mac_address"] == "54:78:c9:00:e7:08"
+            assert data["ip_address"] == "192.168.68.86"
+            assert data["network_interface"] == "wlan0"
+            assert data["hostname"] == "mkspi"
+            assert data["cpu_count"] == 4
+            assert data["processor"] == "aarch64"
+
+    @pytest.mark.asyncio
+    async def test_get_hardware_info_skips_zero_mac(self, adapter):
+        """Test that 00:00:00:00:00:00 MAC is skipped in favor of real one"""
+        mock_response_data = {
+            "result": {
+                "system_info": {
+                    "network": {
+                        "lo": {
+                            "mac_address": "00:00:00:00:00:00",
+                            "ip_addresses": [
+                                {"family": "ipv4", "address": "127.0.0.1", "is_link_local": False},
+                            ],
+                        },
+                        "eth0": {
+                            "mac_address": "2c:cf:67:6a:c7:c0",
+                            "ip_addresses": [
+                                {"family": "ipv4", "address": "192.168.68.127", "is_link_local": False},
+                            ],
+                        },
+                    },
+                }
+            }
+        }
+
+        with patch("aiohttp.ClientSession") as mock_session:
+            mock_response = AsyncMock()
+            mock_response.status = 200
+            mock_response.json = AsyncMock(return_value=mock_response_data)
+            mock_session.return_value.request.return_value.__aenter__.return_value = mock_response
+
+            adapter._session = mock_session.return_value
+            result = await adapter.get_hardware_info()
+
+            assert result.status == CommandResultStatus.SUCCESS
+            assert result.data["mac_address"] == "2c:cf:67:6a:c7:c0"
+            assert result.data["network_interface"] == "eth0"
+
+    @pytest.mark.asyncio
+    async def test_get_hardware_info_no_network(self, adapter):
+        """Test graceful handling when network info is missing"""
+        mock_response_data = {
+            "result": {
+                "system_info": {
+                    "hostname": "unknown",
+                }
+            }
+        }
+
+        with patch("aiohttp.ClientSession") as mock_session:
+            mock_response = AsyncMock()
+            mock_response.status = 200
+            mock_response.json = AsyncMock(return_value=mock_response_data)
+            mock_session.return_value.request.return_value.__aenter__.return_value = mock_response
+
+            adapter._session = mock_session.return_value
+            result = await adapter.get_hardware_info()
+
+            assert result.status == CommandResultStatus.SUCCESS
+            assert result.data["mac_address"] is None
+            assert result.data["hostname"] == "unknown"
