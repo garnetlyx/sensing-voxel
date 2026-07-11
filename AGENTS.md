@@ -69,7 +69,7 @@ pytest --cov=sensing_voxel --cov-report=html
 ## LLM Integration
 
 - 31+ tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals
-- Default backend: `volcengine-anthropic-doubao-seed-20-pro` via Anthropic-compatible proxy (MiniMax and Ollama also supported)
+- Default backend: `volcengine-anthropic-doubao-seed-20-pro` via Anthropic-compatible proxy (MiniMax supported). OpenAI-compatible backends (Ollama) chat but the tool-use loop has two bugs (`llm/client.py` drops `tool_use` block `id` and doesn't set `stop_reason: "tool_use"`), so tool execution is non-functional there.
 - System prompt includes Klipper command reference and live printer context
 - High-risk shell/printer actions require approval-token replay
 - Tool calls audit-logged to `data/tool_audit.jsonl`
@@ -79,13 +79,12 @@ pytest --cov=sensing_voxel --cov-report=html
 
 See `.project/EVAL.md` for the full review and `.project/TODO.md` for the actionable list. Highlights:
 
-- **Test suite is broken**: 537 of 1,234 tests currently fail. Root causes: `MockPrinterAdapter` missing newly-added abstract methods (`get_current_position`), `pytest-aiohttp` `TestClient` event-loop runner conflict, Playwright browser pin drift, stale `.venv` pip shebang. Fixes are mechanical (`.project/TODO.md` P0).
+- **Test suite is green**: 1,181 passed / 0 failed / 18 skipped / 13 xfailed on default `pytest` run (resolved 2026-07-09, P0 in `.project/TODO.md`). Historical note: was 537/1,234 failing before P0 — root causes were `MockPrinterAdapter` missing `get_current_position`, `pytest-aiohttp` `TestClient` event-loop runner conflict, Playwright browser pin drift, stale `.venv` pip shebang.
 - **Phase 2/3 modules are runtime-unwired**: `SlicerPipeline`, `MonitoringOrchestrator`, `AudioAnomalyDetector`, `FilamentMonitor`, `ImageTo3D` pipeline, `QueueManager`, SQLite repositories, and calibration automation all exist as tested code but `main.py` does not start them. Wiring plan in `.project/TODO.md` P1.
-- **`monitoring/monitor.py` imports vision at module level** — must be moved to lazy init before the orchestrator is wired.
 - **`audio/` has no `AudioConfig` dataclass** — blocks wiring.
 - **`llm/tools.py` is 2,007 LOC** — split into a package before adding more tools.
 - **Emergency cancel** now uses a dedicated session (resolved). Historical note: it once shared the primary session.
-- Historical test-failure files (`test_adversarial_*`, `test_concurrency_bugs`, `test_decision_bugs`, `test_qa_critical_bugs`) are no longer the only failing tests — the regression is broader now. Consult `.project/EVAL.md` for the current matrix.
+- Historical test-failure files (`test_adversarial_*`, `test_concurrency_bugs`, `test_decision_bugs`, `test_qa_critical_bugs`) were updated to guard the fixed behavior as regression tests during the P0 fix. See `.project/SESSION_LOG.md` for details.
 
 ## Documentation
 
