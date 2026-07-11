@@ -498,11 +498,9 @@ class KlipperAdapter(PrinterAdapter):
 
             remote_name = _normalize_filename(remote_name)
 
-            # Read file content
             with open(path, "rb") as f:
                 file_content = f.read()
 
-            # Prepare multipart form data
             data = aiohttp.FormData()
             data.add_field(
                 "file",
@@ -510,9 +508,6 @@ class KlipperAdapter(PrinterAdapter):
                 filename=remote_name,
                 content_type="application/octet-stream",
             )
-
-            # Optional: specify path in printer's file system
-            data.add_field("path", "sdcard")  # Default to sdcard directory
 
             result = await self._rest_request("POST", "/server/files/upload", data=data)
 

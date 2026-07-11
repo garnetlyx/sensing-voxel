@@ -628,6 +628,25 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    {
+        "name": "approve_pending",
+        "description": (
+            "Approve a pending approval by token and get the replay payload. "
+            "When the user says 'approve' or 'yes', call this with the token "
+            "from get_pending_approvals. Returns the approved payload — then "
+            "immediately call the original tool with that payload plus approval_token."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "approval_token": {
+                    "type": "string",
+                    "description": "The approval token from get_pending_approvals",
+                },
+            },
+            "required": ["approval_token"],
+        },
+    },
 ]
 
 
@@ -941,6 +960,7 @@ class ToolExecutor:
         self._dispatch["start_print_with_monitor"] = self._start_print_with_monitor
         self._dispatch["acknowledge_anomaly"] = self._acknowledge_anomaly
         self._dispatch["get_monitor_status"] = self._get_monitor_status
+        self._dispatch["approve_pending"] = self._approve_pending
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2495,3 +2515,51 @@ class ToolExecutor:
             "last_summary": last.summary if last else None,
             "started_at": str(state.started_at) if state else None,
         }
+
+    async def _approve_pending(
+        self,
+        tool_input: dict,
+        request_context: ChatRequestContext | None = None,
+    ) -> dict:
+        request_context = request_context or ChatRequestContext(
+            logical_user_id="unknown", channel="unknown", active_printer=None,
+        )
+        token = tool_input.get("approval_token", "").strip()
+        if not token:
+            pending = self._approval_store.tail(
+                logical_user_id=request_context.logical_user_id,
+                limit=5,
+                status="pending",
+            )
+            if not pending:
+                return {"error": "No pending approvals found"}
+            return {
+                "pending_approvals": pending,
+                "hint": "Call approve_pending with the approval_token, then retry the original tool with the payload + approval_token.",
+            }
+
+        for record in self._approval_store.tail(
+            logical_user_id=request_context.logical_user_id,
+            limit=20,
+            status="pending",
+        ):
+            if record.get("approval_token") == token:
+                tool_name = record.get("tool_name", "")
+                payload = record.get("payload", {})
+                approved = self._approval_store.approve(
+                    token, request_context.logical_user_id, tool_name
+                )
+                if approved is None:
+                    return {"error": f"Approval failed for token {token}"}
+                return {
+                    "status": "approved",
+                    "tool_name": tool_name,
+                    "payload": payload,
+                    "approval_token": token,
+                    "instruction": (
+                        f"Now call {tool_name} with these parameters plus approval_token={token}. "
+                        f"Do NOT omit approval_token — it is required for the call to execute."
+                    ),
+                }
+
+        return {"error": f"Token {token} not found among pending approvals"}
