@@ -56,6 +56,8 @@ class MonitorState:
     check_count: int = 0
     last_analysis: AnalysisResult | None = None
     anomaly_pending: bool = False
+    camera_failures: int = 0
+    camera_notified: bool = False
 
 
 SYSTEM_PROMPT = """You are Sensing Voxel's autonomous 3D print monitor.
@@ -195,12 +197,30 @@ class PrintMonitor:
 
         snapshot_b64 = await self._capture_rtsp()
         if snapshot_b64 is None:
-            if self._config.notify_on_camera_failure:
+            self._state.camera_failures += 1
+            if self._config.notify_on_camera_failure and not self._state.camera_notified:
+                self._state.camera_notified = True
                 await self._notify(
                     self.printer_id, "warning",
-                    f"Camera unreachable — cannot monitor {self.printer_id}. Check camera connection.",
+                    f"Camera unreachable — cannot visually monitor {self.printer_id}. "
+                    f"Print continues but SVA is blind. Check camera connection.",
+                )
+            elif self._state.camera_failures == 5:
+                await self._notify(
+                    self.printer_id, "critical",
+                    f"Camera has been unreachable for {self._state.camera_failures} consecutive checks "
+                    f"on {self.printer_id}. Print is still running without visual monitoring. "
+                    f"Consider manually checking the printer.",
                 )
             return
+
+        if self._state.camera_failures > 0 and self._state.camera_notified:
+            self._state.camera_notified = False
+            await self._notify(
+                self.printer_id, "info",
+                f"Camera reconnected for {self.printer_id} — visual monitoring resumed.",
+            )
+        self._state.camera_failures = 0
 
         context = {
             "printer_id": self.printer_id,

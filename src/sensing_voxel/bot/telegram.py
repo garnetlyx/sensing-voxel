@@ -874,9 +874,14 @@ class TelegramBot:
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"LLM chat error: {e}", exc_info=True)
-            await update.message.reply_text(
-                "Sorry, I encountered an error processing your request. Please try again later."
+            error_msg = (
+                "Sorry, I encountered an error processing your request. "
+                f"Please try again later. (Error: {type(e).__name__})"
             )
+            session = self.chat_manager._get_or_create_session(user_id)
+            if session:
+                session.add_assistant_message(error_msg)
+            await update.message.reply_text(error_msg)
 
     async def _handle_ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /ask command for explicit AI chat"""

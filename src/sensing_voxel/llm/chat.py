@@ -329,6 +329,15 @@ class ChatManager:
                         block_input,
                         request_context,
                     )
+                    if isinstance(result, str):
+                        try:
+                            parsed = json.loads(result)
+                            if isinstance(parsed, dict) and "error" in parsed:
+                                logger.warning(
+                                    f"Tool error ({block_name}): {parsed['error']}"
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                     await self._emit_tool_progress(
                         tool_progress_callback,
                         self._format_tool_result(block_name, result),
