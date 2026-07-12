@@ -155,7 +155,7 @@ async def main() -> None:
         memo_repo = PrinterMemoRepository(db)
 
         async def _llm_analyze(**kwargs):
-            return await llm_client._client.send_message(**kwargs)
+            return await llm_client.send_message(**kwargs)
 
         context_collector = PrinterContextCollector(
             state_machine=state_machine,
