@@ -602,6 +602,50 @@ async def post_queue_clear(request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError(text="Failed to clear queue")
 
 
+async def post_approve(request: web.Request) -> web.Response:
+    """Approve or reject a pending SVA tool approval."""
+    app_state = request.app.get("app_state", {})
+    chat_manager = app_state.get("chat_manager")
+    if not chat_manager or not chat_manager._tool_executor:
+        return web.json_response({"error": "SVA not configured"}, status=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Invalid JSON body")
+
+    token = body.get("approval_token", "").strip()
+    action = body.get("action", "approve")
+    if not token:
+        return web.json_response({"error": "approval_token is required"}, status=400)
+
+    store = chat_manager._tool_executor._approval_store
+
+    if action == "reject":
+        for r in store._records.values():
+            if r.approval_token == token and r.status == "pending":
+                r.status = "rejected"
+                return web.json_response({"status": "rejected", "token": token})
+        return web.json_response({"error": "Token not found"}, status=404)
+
+    pending = store.tail(limit=50, status="pending")
+    for record in pending:
+        if record.get("approval_token") == token:
+            tool_name = record.get("tool_name", "")
+            logical_user_id = record.get("logical_user_id", "dashboard")
+            approved = store.approve(token, logical_user_id, tool_name)
+            if approved is None:
+                return web.json_response({"error": "Approval failed"}, status=400)
+            return web.json_response({
+                "status": "approved",
+                "token": token,
+                "tool_name": tool_name,
+                "payload": record.get("payload", {}),
+            })
+
+    return web.json_response({"error": "Token not found among pending approvals"}, status=404)
+
+
 def setup_routes(app: web.Application, ws_manager):
     """Register all API routes"""
     app.router.add_get("/health", health_check)
@@ -628,4 +672,5 @@ def setup_routes(app: web.Application, ws_manager):
     # Queue management endpoints
     app.router.add_get("/api/v1/queue", get_queue_status)
     app.router.add_post("/api/v1/queue/clear", post_queue_clear)
+    app.router.add_post("/api/v1/approve", post_approve)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)

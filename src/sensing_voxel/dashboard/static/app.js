@@ -1038,8 +1038,10 @@
     loadChatHistory();
     initJobHistory();
     initQueue();
+    fetchSvaApprovals();
 
     setInterval(pollStatus, 10000);
+    setInterval(fetchSvaApprovals, 15000);
 
     setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1047,6 +1049,66 @@
       }
     }, 25000);
   }
+
+  async function fetchSvaApprovals() {
+    try {
+      const resp = await fetch("/api/v1/pending-approvals?limit=10");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      renderSvaApprovals(data.approvals || []);
+    } catch (e) { /* silent */ }
+  }
+
+  function renderSvaApprovals(approvals) {
+    const container = $("#sva-approvals-list");
+    if (!container) return;
+    if (!approvals.length) {
+      container.innerHTML = '<p class="no-approvals">No pending approvals</p>';
+      return;
+    }
+    container.innerHTML = approvals.map(a => {
+      const payloadStr = a.payload ? Object.entries(a.payload).map(([k,v]) => `${k}: ${v}`).join(", ") : "";
+      return `<div class="approval-item" data-token="${a.approval_token}">
+        <div class="approval-tool">${a.tool_name}</div>
+        <div class="approval-payload">${payloadStr}</div>
+        <div class="approval-reason">${a.reason || ""}</div>
+        <div class="approval-actions">
+          <button class="btn btn-approve" onclick="approveSvaTool('${a.approval_token}')">Approve</button>
+          <button class="btn btn-reject" onclick="rejectSvaTool('${a.approval_token}')">Reject</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  window.approveSvaTool = async function(token) {
+    try {
+      const resp = await fetch("/api/v1/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({approval_token: token, action: "approve"}),
+      });
+      const data = await resp.json();
+      addAlert(data.status === "approved" ? "success" : "error", `SVA approval: ${data.status || data.error}`);
+      fetchSvaApprovals();
+    } catch (e) {
+      addAlert("error", `Approval failed: ${e.message}`);
+    }
+  };
+
+  window.rejectSvaTool = async function(token) {
+    try {
+      const resp = await fetch("/api/v1/approve", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({approval_token: token, action: "reject"}),
+      });
+      const data = await resp.json();
+      addAlert("info", `SVA approval rejected`);
+      fetchSvaApprovals();
+    } catch (e) {
+      addAlert("error", `Reject failed: ${e.message}`);
+    }
+  };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);

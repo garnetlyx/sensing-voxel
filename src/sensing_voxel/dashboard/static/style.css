@@ -1004,6 +1004,7 @@ body {
   .temps-panel { grid-column: 1 / -1; }
   .chat-panel { grid-column: 1 / -1; }
   .decision-panel { grid-column: 1 / -1; }
+  .sva-approvals-panel { grid-column: 1 / -1; }
   .alerts-panel { grid-column: 1 / -1; }
 }
 
@@ -1026,4 +1027,28 @@ body {
     flex-wrap: wrap;
     gap: 8px;
   }
+}
+
+.approval-item {
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+.approval-tool {
+  font-weight: 600;
+  color: var(--accent, #4fc3f7);
+  margin-bottom: 4px;
+}
+.approval-payload {
+  font-size: 0.85rem;
+  opacity: 0.8;
+  margin-bottom: 4px;
+}
+.approval-reason {
+  font-size: 0.8rem;
+  opacity: 0.6;
+  margin-bottom: 8px;
+}
+.approval-actions {
+  display: flex;
+  gap: 8px;
 }
