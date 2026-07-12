@@ -249,7 +249,7 @@ class PrintMonitor:
 
     async def _capture_rtsp(self) -> str | None:
         def _grab() -> str | None:
-            cap = cv2.VideoCapture(self._rtsp_url)
+            cap = cv2.VideoCapture(self._rtsp_url, cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 return None
             ret, frame = cap.read()

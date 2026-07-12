@@ -2107,8 +2107,10 @@ class ToolExecutor:
         def _capture():
             import cv2
 
-            cap = cv2.VideoCapture(rtsp_url)
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
             try:
+                if not cap.isOpened():
+                    return None
                 ret, frame = cap.read()
                 if not ret:
                     return None
@@ -2118,7 +2120,13 @@ class ToolExecutor:
             finally:
                 cap.release()
 
-        jpeg_bytes = await asyncio.to_thread(_capture)
+        try:
+            jpeg_bytes = await asyncio.wait_for(
+                asyncio.to_thread(_capture), timeout=15
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"RTSP capture failed ({type(e).__name__}): {e}")
+            return {"error": f"Failed to capture frame from camera: {type(e).__name__}"}
         if not jpeg_bytes:
             return {"error": "Failed to capture frame from camera"}
 
