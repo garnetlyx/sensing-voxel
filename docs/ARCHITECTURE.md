@@ -763,7 +763,9 @@ next tasks live in `.project/TODO.md`.
 | LLM context | `llm/context.py` | 193 | Printer context + request context + summary-aware system prompt |
 | LLM tools | `llm/tools.py` | 2,007 | 31+ tools: printer, camera, shell, web_search (SearXNG), approvals, background tasks |
 | Camera PTZ | `camera/tapo.py` | 130 | ONVIF Tapo C220 pan/tilt, best-effort position |
-| Configuration | `config.py` | 371 | 16 dataclasses incl. `WebSearchToolConfig`, `FilamentMonitorConfig`, `ModelingConfig`, `QueueConfig` |
+| Print monitoring | `monitoring/print_monitor.py` | 390 | Background camera check + LLM anomaly detection; auto-activates on PRINTING state |
+| Printer memo | `storage/printer_memo_repository.py` | 91 | SQLite key-value for physical attributes not in Klipper config; rejects config keys |
+| Configuration | `config.py` | 388 | 17 dataclasses incl. `WebSearchToolConfig`, `PrintMonitorConfig`, `FilamentMonitorConfig`, `ModelingConfig`, `QueueConfig` |
 | Entry point | `main.py` | 353 | Async main, multi-printer, dashboard, LLM, camera wiring |
 
 ### 9.2 Module-complete but NOT wired into `main.py`
@@ -785,7 +787,7 @@ consumed at runtime. Wiring these is the primary contents of `.project/TODO.md`.
 | Predictive maintenance | `monitoring/maintenance.py` | 780 | 2 | `SHAPER_CALIBRATE` event wiring + storage layer |
 | Audio anomaly detection | `audio/{detector,baseline}.py` | 810 | 2 | **No `AudioConfig` dataclass exists** (T2.1) |
 | Calibration automation | `calibration/{visual_scoring,tower_generator,config_injector}.py` | 872 | 2 | Wire behind `/calibrate` Telegram command |
-| SQLite storage | `storage/{database,job_repository,calibration_repository}.py` | 933 | 2 | Attach repositories to dashboard app state |
+| SQLite storage | `storage/{database,job_repository,calibration_repository,printer_memo_repository}.py` | 1,024 | 2 | `Database` + `PrinterMemoRepository` **wired** into main.py; `JobRepository`/`CalibrationRepository` still unwired for dashboard endpoints |
 | Multi-printer queue | `queue/{manager,scheduler,models,simple}.py` | 1,952 | 2 | Attach `QueueManager` to dashboard app state |
 | Photo-to-print pipeline | `modeling/{pipeline,image_to_3d,repair,orientation,support_analysis,preview,cost_tracker,cache}.py` | 4,793 | 3 | Feature-flag (`ModelingConfig.enabled`) + Telegram photo flow |
 

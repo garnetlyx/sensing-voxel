@@ -152,13 +152,13 @@ sensing-voxel/
 │       ├── adapters/                # Printer adapters (Klipper, Bambu, base, command queue)
 │       ├── bot/                     # Telegram bot (telegram, auth, decisions)
 │       ├── api/                     # Dashboard REST/WS API
-│       ├── llm/                     # LLM chat with tool use (31+ tools)
+│       ├── llm/                     # LLM chat with tool use (50 tools)
 │       ├── camera/                  # PTZ camera control (Tapo ONVIF)
 │       ├── infra/                   # Shared utilities (retry, gcode validation)
 │       ├── dashboard/               # Dashboard static files
 │       ├── slicer/                  # Slicing pipeline (module-complete, unwired)
 │       ├── vision/                  # Vision processing (module-complete, unwired)
-│       ├── monitoring/              # Print monitoring, Z-offset, maintenance (unwired)
+│       ├── monitoring/              # Print monitoring (PrintMonitor wired), Z-offset, maintenance
 │       ├── audio/                   # YAMNet anomaly detection (unwired, no config yet)
 │       ├── calibration/             # Tower generation, visual scoring (unwired)
 │       ├── storage/                 # SQLite job/calibration repositories (unwired)
@@ -197,14 +197,25 @@ modules or tests.
         WebSocket updates, chat endpoint, and camera stream route
   - [x] Tapo PTZ / RTSP camera support when configured
   - [x] Basic LLM chat when configured
+  - [x] Background print monitoring (`PrintMonitor`): periodic camera snapshot + LLM vision
+        anomaly detection, auto-pause on unacknowledged anomaly, auto-activates on PRINTING state
+  - [x] Printer memo system: SVA stores physical attributes (bed surface, filament brand)
+        in SQLite; rejects values that belong in printer.cfg (single source of truth)
+  - [x] MAC address hardware fingerprinting: auto-discovers printer identity from Moonraker
+  - [x] Web search (`web_search` tool via SearXNG): LLM performs autonomous multi-turn queries
+  - [x] Tool cooldown: physical tools rate-limited to prevent hardware congestion
+  - [x] Independent vision analysis: camera_snapshot performs bias-free LLM analysis
+        in a separate context to prevent confirmation bias from chat history
 
 - **Implemented as modules, but not fully wired into the main runtime**
   - [ ] STL/STEP/3MF slicing workflow: `SlicerPipeline` exists, but Telegram model
         uploads currently stop after staging the file and entering `RECEIVING`; the
         runtime does not yet call the slicer and advance to approval automatically
-  - [ ] Print monitoring orchestrator: external print detection,
+  - [ ] Monitoring orchestrator: external print detection,
         first-layer correction, audio anomaly handling, and filament monitoring are
-        implemented in modules/tests but are not instantiated or started by `main.py`
+        implemented in modules/tests but are not instantiated or started by `main.py`.
+        Note: `PrintMonitor` (background camera check) IS wired; `MonitoringOrchestrator`
+        (first-layer/sfilament/audio) is NOT.
   - [ ] Dashboard decision side effects: `/api/v1/decision` records a decision but
         does not yet perform the Telegram-equivalent upload/start/resume/cancel actions
   - [ ] Job history and queue dashboard APIs: route handlers exist, but repository and

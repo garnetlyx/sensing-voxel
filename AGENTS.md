@@ -22,11 +22,11 @@ src/sensing_voxel/
   adapters/     - Printer adapters (klipper.py, bambu.py, base.py, command_queue.py)
   bot/          - Telegram bot (telegram.py, auth.py, decisions.py)
   api/          - Web dashboard REST/WebSocket API
-  llm/          - LLM chat with tool use (31+ tools incl. web_search)
+  llm/          - LLM chat with tool use (50 tools incl. web_search, print monitor, printer memo)
   camera/       - PTZ camera control (Tapo ONVIF)
   slicer/       - STL/STEP/3MF slicing pipeline + geometry analysis (module-complete, unwired)
   vision/       - First-layer, calibration, filament, usb_camera (module-complete, unwired)
-  monitoring/   - Print monitoring orchestrator, Z-offset, predictive maintenance (module-complete, unwired)
+  monitoring/   - PrintMonitor (wired, auto-activates on PRINTING), MonitoringOrchestrator/Z-offset/predictive maintenance (module-complete, unwired)
   audio/        - YAMNet anomaly detection (Phase 2, module-complete, unwired, no AudioConfig yet)
   calibration/  - Tower generation, visual scoring, config injection (Phase 2, module-complete, unwired)
   storage/      - SQLite job/calibration repositories (Phase 2, module-complete, unwired)
@@ -108,6 +108,12 @@ Or in tmux: `tmux new-session -d -s sv-server -c <repo-root>` then send the abov
 - `web_search` tool: SearXNG instance at `localhost:8888` (Docker), LLM performs multi-turn progressive queries autonomously
 - `camera_snapshot` tool: RTSP → base64 → MiniMax-M3 multimodal analysis (cross-verified against independent look_at)
 - Tool cooldown: physical tools rate-limited (default 1.0s between identical tool calls)
+- Print monitoring (`PrintMonitor`): auto-activates when printer enters PRINTING state, periodic camera snapshot + LLM anomaly detection, auto-pause on unacknowledged anomaly (configurable timeout)
+- Printer memo system: SQLite key-value storage for physical attributes not in Klipper config (bed surface, filament brand); rejects config keys to maintain single source of truth
+- MAC address fingerprinting: auto-discovers printer hardware identity from Moonraker `machine/system_info`, stores in memo DB for persistent identification
+- Independent vision analysis: `camera_snapshot` performs a bias-free LLM analysis in a separate context (no chat history) to prevent confirmation bias
+- `update_printer_config` tool: SVA can modify printer.cfg with mandatory backup + approval flow
+- `approve_pending` tool: helps LLM replay approval tokens reliably
 
 ### Known runtime gaps (confirmed by live test)
 
@@ -191,7 +197,7 @@ Key tools for each step:
 
 ## LLM Integration
 
-- 31+ tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals
+- 50 tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals, printer memo, print monitoring, hardware fingerprinting
 - Default backend: `volcengine-anthropic-doubao-seed-20-pro` via Anthropic-compatible proxy (MiniMax supported). OpenAI-compatible backends (Ollama) chat but the tool-use loop has two bugs (`llm/client.py` drops `tool_use` block `id` and doesn't set `stop_reason: "tool_use"`), so tool execution is non-functional there.
 - System prompt includes Klipper command reference and live printer context
 - High-risk shell/printer actions require approval-token replay
