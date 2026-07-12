@@ -1061,11 +1061,11 @@ class KlipperAdapter(PrinterAdapter):
 
         try:
             async with self._session.request(method, url, timeout=client_timeout, **kwargs) as resp:
-                if resp.status == 200:
+                if resp.status in (200, 201):
                     data = await resp.json()
                     return CommandResult(
                         CommandResultStatus.SUCCESS,
-                        data=data.get("result"),
+                        data=data.get("result", data),
                     )
                 else:
                     error_text = await resp.text()
