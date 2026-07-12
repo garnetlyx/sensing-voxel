@@ -313,7 +313,7 @@ async def main() -> None:
 
     # Initialize print monitors (optional)
     print_monitors: dict[str, Any] = {}
-    if config.print_monitor.enabled and chat_manager and tapo_camera:
+    if config.print_monitor.enabled and chat_manager and config.dashboard.camera_rtsp_url:
         from sensing_voxel.monitoring.print_monitor import PrintMonitor
 
         rtsp_url = config.dashboard.camera_rtsp_url
