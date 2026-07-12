@@ -2288,16 +2288,29 @@ class ToolExecutor:
         request_context: ChatRequestContext,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         token = (tool_input.get("approval_token") or "").strip()
-        if not token:
-            return None, None
-        record = self._approval_store.approve(
-            token, request_context.logical_user_id, tool_name
-        )
-        if record is None:
-            return None, {"error": f"Invalid or expired approval_token for {tool_name}"}
-        merged = dict(record.payload)
-        merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
-        return merged, None
+        if token:
+            record = self._approval_store.approve(
+                token, request_context.logical_user_id, tool_name
+            )
+            if record is None:
+                return None, {"error": f"Invalid or expired approval_token for {tool_name}"}
+            merged = dict(record.payload)
+            merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
+            return merged, None
+
+        for record in self._approval_store._records.values():
+            if (
+                record.tool_name == tool_name
+                and record.logical_user_id == request_context.logical_user_id
+                and record.status == "approved"
+                and record.approved_at is not None
+            ):
+                record.status = "consumed"
+                merged = dict(record.payload)
+                merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
+                return merged, None
+
+        return None, None
 
     # --- Printer memo tools ---
 
