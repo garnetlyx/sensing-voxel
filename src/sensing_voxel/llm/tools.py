@@ -13,7 +13,7 @@ import os
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine
 from urllib.parse import urljoin
 
 from sensing_voxel.adapters.base import PrinterAdapter
@@ -874,6 +874,7 @@ class ToolExecutor:
         allowed_gcode_commands: set[str] | None = None,
         tool_cooldown_seconds: float = 0.0,
         memo_repository=None,
+        llm_analyze_fn: Callable[..., Coroutine[Any, Any, str]] | None = None,
     ):
         if adapters is None:
             adapters = {}
@@ -899,6 +900,7 @@ class ToolExecutor:
         self._last_tool_call: dict[str, float] = {}
         self._memo_repository = memo_repository
         self._print_monitors: dict[str, Any] = {}
+        self._llm_analyze_fn = llm_analyze_fn
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
             "get_printer_state": self._get_printer_state,
@@ -2136,6 +2138,48 @@ class ToolExecutor:
             except Exception:
                 logger.warning("Failed to send camera snapshot photo", exc_info=True)
 
+        independent_analysis = ""
+        if self._llm_analyze_fn:
+            try:
+                independent_analysis = await self._llm_analyze_fn(
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": b64,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Analyze this 3D printer camera snapshot objectively. "
+                                    "Describe: (1) what is visible, (2) is a printer visible and which type, "
+                                    "(3) is there any print on the bed, (4) any anomalies (spaghetti, residue, "
+                                    "fire, air printing, empty bed), (5) overall print quality if visible. "
+                                    "Be factual — describe only what you actually see."
+                                ),
+                            },
+                        ],
+                    }],
+                    system_prompt=(
+                        "You are a 3D printer vision analysis system. "
+                        "Analyze the image objectively. Do not make assumptions. "
+                        "Report only what is visible."
+                    ),
+                    max_tokens=300,
+                )
+                independent_analysis = independent_analysis.strip()
+            except Exception as e:
+                logger.warning(f"Independent snapshot analysis failed: {e}")
+
+        text_block = f"Camera snapshot captured at {datetime.now().strftime('%H:%M:%S')}"
+        if independent_analysis:
+            text_block += f"\n\nObjective analysis: {independent_analysis}"
+
         return {
             "snapshot_path": str(snapshot_path),
             "content": [
@@ -2149,7 +2193,7 @@ class ToolExecutor:
                 },
                 {
                     "type": "text",
-                    "text": f"Camera snapshot captured at {datetime.now().strftime('%H:%M:%S')}",
+                    "text": text_block,
                 },
             ]
         }

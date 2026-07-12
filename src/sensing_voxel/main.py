@@ -154,6 +154,9 @@ async def main() -> None:
         db = create_database(config.storage.data_dir)
         memo_repo = PrinterMemoRepository(db)
 
+        async def _llm_analyze(**kwargs):
+            return await llm_client._client.send_message(**kwargs)
+
         context_collector = PrinterContextCollector(
             state_machine=state_machine,
             adapters=adapters,
@@ -178,6 +181,7 @@ async def main() -> None:
             allowed_gcode_commands=set(config.llm.allowed_gcode_commands),
             verbose_tool_use=config.llm.verbose_tool_use,
             memo_repository=memo_repo,
+            llm_analyze_fn=_llm_analyze,
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")

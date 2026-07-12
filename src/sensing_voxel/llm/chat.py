@@ -181,6 +181,7 @@ class ChatManager:
         allowed_gcode_commands: set[str] | None = None,
         verbose_tool_use: bool = True,
         memo_repository=None,
+        llm_analyze_fn=None,
     ):
         self._client = client
         self._context_collector = context_collector
@@ -223,6 +224,7 @@ class ChatManager:
                 allowed_gcode_commands=allowed_gcode_commands,
                 tool_cooldown_seconds=tool_cooldown_seconds,
                 memo_repository=memo_repository,
+                llm_analyze_fn=llm_analyze_fn,
             )
             self._tools = list(PRINTER_TOOLS) if self._adapters else []
             if getattr(self._tool_executor._shell_config, "enabled", False):
