@@ -874,13 +874,17 @@ class TelegramBot:
             await update.message.reply_text(response)
         except Exception as e:
             logger.error(f"LLM chat error: {e}", exc_info=True)
+            error_detail = str(e)[:200] if str(e) else type(e).__name__
             error_msg = (
-                "Sorry, I encountered an error processing your request. "
-                f"Please try again later. (Error: {type(e).__name__})"
+                f"⚠️ I ran into an error: {type(e).__name__}: {error_detail}\n\n"
+                "This may be a temporary issue (network timeout, camera unreachable, "
+                "or LLM service down). You can try again, or ask me to check "
+                "printer status instead."
             )
             session = self.chat_manager._get_or_create_session(user_id)
             if session:
                 session.add_assistant_message(error_msg)
+            self.chat_manager.save_history()
             await update.message.reply_text(error_msg)
 
     async def _handle_ask(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

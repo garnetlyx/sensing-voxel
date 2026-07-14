@@ -366,6 +366,21 @@ async def main() -> None:
         if bot:
             await bot.start()
 
+        for printer_id, adapter in adapters.items():
+            monitor = print_monitors.get(printer_id)
+            if not monitor or not monitor._auto_enabled:
+                continue
+            try:
+                progress = await adapter.get_print_progress()
+                state = ""
+                if hasattr(progress, "data") and progress.data:
+                    state = str(progress.data.get("state", ""))
+                if state == "printing":
+                    logger.info(f"Printer {printer_id} already printing — auto-starting monitor")
+                    await monitor.start_monitoring()
+            except Exception as e:
+                logger.warning(f"Startup monitor check failed for {printer_id}: {e}")
+
         # Keep running until shutdown
         await asyncio.Event().wait()
 
