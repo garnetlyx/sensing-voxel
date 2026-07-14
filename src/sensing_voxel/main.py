@@ -146,13 +146,14 @@ async def main() -> None:
         from sensing_voxel.llm.chat import ChatManager
         from sensing_voxel.llm.client import LlmClient
         from sensing_voxel.llm.context import PrinterContextCollector
-        from sensing_voxel.storage import PrinterMemoRepository, create_database
+        from sensing_voxel.storage import JobRepository, PrinterMemoRepository, create_database
 
         llm_client = LlmClient(config.llm)
         await llm_client.initialize()
 
         db = create_database(config.storage.data_dir)
         memo_repo = PrinterMemoRepository(db)
+        job_repo = JobRepository(db)
 
         async def _llm_analyze(**kwargs):
             return await llm_client.send_message(**kwargs)
@@ -230,6 +231,8 @@ async def main() -> None:
                 else "dashboard-user"
             )
             dashboard_runner.app["app_state"]["default_logical_user_id"] = default_logical_user_id
+            if job_repo:
+                dashboard_runner.app["app_state"]["job_repository"] = job_repo
 
     if chat_manager:
         async def notify_chat_runtime(request_context, message: str, level: str = "info", data=None):

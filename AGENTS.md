@@ -24,19 +24,14 @@ src/sensing_voxel/
   api/          - Web dashboard REST/WebSocket API
   llm/          - LLM chat with tool use (50 tools incl. web_search, print monitor, printer memo)
   camera/       - PTZ camera control (Tapo ONVIF)
-  slicer/       - STL/STEP/3MF slicing pipeline + geometry analysis (module-complete, unwired)
-  vision/       - First-layer, calibration, filament, usb_camera (module-complete, unwired)
-  monitoring/   - PrintMonitor (wired, auto-activates on PRINTING), MonitoringOrchestrator/Z-offset/predictive maintenance (module-complete, unwired)
-  audio/        - YAMNet anomaly detection (Phase 2, module-complete, unwired, no AudioConfig yet)
-  calibration/  - Tower generation, visual scoring, config injection (Phase 2, module-complete, unwired)
-  storage/      - SQLite job/calibration repositories (Phase 2, module-complete, unwired)
-  queue/        - Multi-printer queue + schedulers (Phase 2, module-complete, unwired)
-  modeling/     - Photo-to-print pipeline, image-to-3D, mesh repair (Phase 3, module-complete, unwired)
+  slicer/       - STL/STEP/3MF slicing pipeline + geometry analysis
+  monitoring/   - PrintMonitor (background camera check + LLM anomaly detection)
+  storage/      - SQLite job/memo repositories + Database
   dashboard/    - Static web dashboard files
   infra/        - Shared utilities (retry.py, gcode.py)
 ```
 
-> **Wired vs. module-complete.** Only `core`, `adapters`, `bot`, `api`, `llm`, `camera`, and `infra` are instantiated by `main.py` today. Every other module is real, tested code that is not yet started at runtime. See `docs/ARCHITECTURE.md` §9 and `.project/TODO.md`.
+> **Deleted modules** (2026-07-13): `vision/`, `audio/`, `calibration/`, `queue/`, `modeling/`, `monitoring/monitor.py+z_offset.py+maintenance.py` — all removed to enforce deduplication. Vision analysis is now done via LLM multimodal (camera_snapshot tool + PrintMonitor). These modules exist in git history if needed.
 
 ## Development
 
@@ -63,6 +58,7 @@ pytest --cov=sensing_voxel --cov-report=html
 - **Emergency path**: Dedicated session for emergency cancel, bypasses the command queue
 - **G-code validation**: Shared `validate_gcode_command()` in `infra/gcode.py` (blocks M112/M410/M80/M81/M23, validates axis + temperature bounds)
 - **Printer config safety**: **ALWAYS backup printer.cfg before any modification.** Moonraker auto-creates timestamped backups (e.g. `printer-20260516_075252.cfg`) but never overwrite printer.cfg without confirming a backup exists. SVA's `update_printer_config` tool MUST create a backup copy before writing. A single-line overwrite can brick the printer's startup.
+- **Deduplicate + consolidate**: No two modules may co-exist if they serve overlapping functions — even under different names or abstractions. If a new module replaces an old one (e.g. PrintMonitor replaces MonitoringOrchestrator, LLM multimodal replaces vision/), **delete the old one immediately and migrate any still-needed logic into the new module**. Renaming is not enough — if `vision/camera.py` (RTSP stream) and `monitoring/print_monitor.py` (RTSP snapshot) both capture camera frames, consolidate into one place. Every module in the codebase must have a unique, non-overlapping responsibility.
 - **Local lifecycle state**: `.project/` holds `TODO.md`, `SESSION_LOG.md`, `EVAL.md` (gitignored)
 
 ## Printer Connectivity
@@ -208,12 +204,11 @@ Key tools for each step:
 
 See `.project/EVAL.md` for the full review and `.project/TODO.md` for the actionable list. Highlights:
 
-- **Test suite is green**: 1,181 passed / 0 failed / 18 skipped / 13 xfailed on default `pytest` run (resolved 2026-07-09, P0 in `.project/TODO.md`). Historical note: was 537/1,234 failing before P0 — root causes were `MockPrinterAdapter` missing `get_current_position`, `pytest-aiohttp` `TestClient` event-loop runner conflict, Playwright browser pin drift, stale `.venv` pip shebang.
-- **Phase 2/3 modules are runtime-unwired**: `SlicerPipeline`, `MonitoringOrchestrator`, `AudioAnomalyDetector`, `FilamentMonitor`, `ImageTo3D` pipeline, `QueueManager`, SQLite repositories, and calibration automation all exist as tested code but `main.py` does not start them. Wiring plan in `.project/TODO.md` P1.
-- **`audio/` has no `AudioConfig` dataclass** — blocks wiring.
-- **`llm/tools.py` is 2,007 LOC** — split into a package before adding more tools.
+- **Test suite is green**: 639 passed / 0 failed / 13 xfailed on default `pytest` run. Reduced from 1,181 after deleting orphaned module tests (vision, audio, calibration, queue, modeling, old monitoring).
+- **Orphaned modules DELETED** (2026-07-13): vision/, audio/, calibration/, queue/, modeling/, monitoring/monitor.py+z_offset.py+maintenance.py — all removed. Rationale: either superseded by PrintMonitor (vision → LLM multimodal), blocked by missing hardware/config (audio, calibration), not needed for single-user (queue), or too many bugs + external deps (modeling). Git history preserved.
+- **Remaining wiring work**: `SlicerPipeline` needs PrusaSlicer CLI install + Telegram upload flow integration. `JobRepository` needs dashboard app_state wiring.
+- **`llm/tools.py` is 2,630 LOC** — split into a package before adding more tools.
 - **Emergency cancel** now uses a dedicated session (resolved). Historical note: it once shared the primary session.
-- Historical test-failure files (`test_adversarial_*`, `test_concurrency_bugs`, `test_decision_bugs`, `test_qa_critical_bugs`) were updated to guard the fixed behavior as regression tests during the P0 fix. See `.project/SESSION_LOG.md` for details.
 
 ## Documentation
 
