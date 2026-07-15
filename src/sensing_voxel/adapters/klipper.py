@@ -208,14 +208,19 @@ class KlipperAdapter(PrinterAdapter):
 
             logger.info("WebSocket connected and subscribed")
 
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        await self._handle_ws_message(msg.json())
-                    except Exception as e:
-                        logger.error(f"Error handling WebSocket message: {e}", exc_info=True)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    raise AdapterConnectionError(f"WebSocket error: {ws.exception()}")
+            poll_task = asyncio.create_task(self._poll_state_loop())
+
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            await self._handle_ws_message(msg.json())
+                        except Exception as e:
+                            logger.error(f"Error handling WebSocket message: {e}", exc_info=True)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        raise AdapterConnectionError(f"WebSocket error: {ws.exception()}")
+            finally:
+                poll_task.cancel()
 
     async def _ws_subscribe(self, ws: aiohttp.ClientWebSocketResponse):
         """Subscribe to Moonraker printer objects for live updates."""
@@ -311,6 +316,29 @@ class KlipperAdapter(PrinterAdapter):
         telemetry = self._parse_telemetry(self._cached_status, print_stats)
         if telemetry:
             await self._emit_telemetry_update(telemetry)
+
+    async def _poll_state_loop(self):
+        """Periodic REST poll to catch state changes missed by WS incremental updates."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                result = await self._rest_request("GET", "/printer/objects/query?print_stats")
+                if result.status == CommandResultStatus.SUCCESS and result.data:
+                    status = result.data.get("status", result.data)
+                    print_stats = status.get("print_stats", {})
+                    state_str = print_stats.get("state", "unknown").lower()
+                    normalized_state = self.STATE_MAP.get(state_str, NormalizedPrinterState.UNKNOWN)
+
+                    if hasattr(self, "_last_state") and self._last_state != normalized_state:
+                        logger.info(f"REST poll detected state change: {self._last_state.name} -> {normalized_state.name}")
+                        await self._emit_state_changed(self._last_state, normalized_state)
+
+                    self._last_state = normalized_state
+                    self._cached_status.setdefault("print_stats", {}).update(print_stats)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     def _handle_gcode_output(self, params: dict):
         """Handle G-code output notification from Klipper"""
