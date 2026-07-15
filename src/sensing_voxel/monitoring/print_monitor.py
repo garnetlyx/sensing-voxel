@@ -198,7 +198,9 @@ class PrintMonitor:
             await self.stop_monitoring(reason="print_complete")
             return
 
+        logger.info(f"Check #{self._state.check_count}: capturing RTSP...")
         snapshot_b64 = await self._capture_rtsp()
+        logger.info(f"Check #{self._state.check_count}: RTSP result: {'OK' if snapshot_b64 else 'FAILED'}")
         if snapshot_b64 is None:
             self._state.camera_failures += 1
             if self._config.notify_on_camera_failure and not self._state.camera_notified:
@@ -235,14 +237,32 @@ class PrintMonitor:
             },
         }
 
-        result = await self._analyze(snapshot_b64, context)
+        logger.info(f"Check #{self._state.check_count}: analyzing snapshot...")
+        try:
+            result = await asyncio.wait_for(
+                self._analyze(snapshot_b64, context),
+                timeout=60,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Check #{self._state.check_count}: LLM analysis timed out after 60s")
+            result = AnalysisResult(
+                severity=MonitorSeverity.UNKNOWN,
+                anomaly_type="llm_timeout",
+                confidence=0.0,
+                printer_visible=True,
+                summary="LLM analysis timed out",
+            )
+        logger.info(f"Check #{self._state.check_count}: analysis done: severity={result.severity.value} confidence={result.confidence} anomaly_type={result.anomaly_type} summary={result.summary[:100]}")
         self._state.last_analysis = result
 
         if not result.printer_visible and self._config.camera_search_enabled:
             logger.info(f"Printer not visible, searching...")
             result = await self._search_and_reanalyze(context)
 
-        if self._is_anomaly(result):
+        is_anom = self._is_anomaly(result)
+        logger.info(f"Check #{self._state.check_count}: _is_anomaly={is_anom}")
+        if is_anom:
+            logger.warning(f"ANOMALY DETECTED on {self.printer_id}: {result.anomaly_type} — {result.summary[:100]}")
             await self._handle_anomaly(result)
         elif result.severity == MonitorSeverity.OK:
             logger.info(
@@ -326,19 +346,30 @@ class PrintMonitor:
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
+            found = False
             for line in text.split("\n"):
                 line = line.strip()
                 if line.startswith("{"):
                     try:
                         data = json.loads(line)
+                        found = True
                         break
                     except json.JSONDecodeError:
                         continue
-            else:
+            if not found:
+                text_lower = text.lower()
+                if any(w in text_lower for w in ["fire", "smoke", "spaghetti", "critical", "failed", "detached"]):
+                    return AnalysisResult(
+                        severity=MonitorSeverity.WARNING,
+                        anomaly_type="natural_language_warning",
+                        confidence=0.7,
+                        printer_visible=True,
+                        summary=text[:200],
+                    )
                 return AnalysisResult(
-                    severity=MonitorSeverity.UNKNOWN,
-                    anomaly_type="parse_error",
-                    confidence=0.0,
+                    severity=MonitorSeverity.OK,
+                    anomaly_type=None,
+                    confidence=0.5,
                     printer_visible=True,
                     summary=text[:200],
                 )
@@ -387,11 +418,17 @@ class PrintMonitor:
         )
 
     def _is_anomaly(self, result: AnalysisResult) -> bool:
-        return (
-            result.severity in {MonitorSeverity.WARNING, MonitorSeverity.CRITICAL}
-            and result.confidence >= 0.6
-            and result.anomaly_type not in (None, "printer_not_visible", "llm_error")
-        )
+        if result.anomaly_type in ("llm_error", "llm_timeout", "parse_error", None):
+            return False
+        if result.severity == MonitorSeverity.CRITICAL:
+            return True
+        if result.severity == MonitorSeverity.WARNING and result.confidence >= 0.6:
+            return True
+        if not result.printer_visible:
+            return True
+        if result.anomaly_type and "obstruct" in str(result.anomaly_type).lower():
+            return True
+        return False
 
     async def _handle_anomaly(self, result: AnalysisResult) -> None:
         if self._state and self._state.anomaly_pending:
