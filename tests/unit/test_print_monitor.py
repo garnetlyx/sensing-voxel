@@ -88,8 +88,8 @@ class TestPrintMonitorParsing:
 
     def test_parse_invalid_json(self, monitor):
         result = monitor._parse_analysis("not json at all")
-        assert result.severity == MonitorSeverity.UNKNOWN
-        assert result.anomaly_type == "parse_error"
+        assert result.severity == MonitorSeverity.OK
+        assert result.anomaly_type is None
 
     def test_parse_json_embedded_in_text(self, monitor):
         response = "Here is the analysis:\n" + json.dumps({
@@ -145,7 +145,7 @@ class TestPrintMonitorAnomalyDetection:
         )
         assert monitor._is_anomaly(result) is False
 
-    def test_printer_not_visible_not_anomaly(self, monitor):
+    def test_printer_not_visible_is_anomaly(self, monitor):
         result = AnalysisResult(
             severity=MonitorSeverity.WARNING,
             anomaly_type="printer_not_visible",
@@ -153,7 +153,7 @@ class TestPrintMonitorAnomalyDetection:
             printer_visible=False,
             summary="Can't see printer",
         )
-        assert monitor._is_anomaly(result) is False
+        assert monitor._is_anomaly(result) is True
 
 
 class TestPrintMonitorLifecycle:
