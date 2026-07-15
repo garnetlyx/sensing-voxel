@@ -161,11 +161,12 @@ class PrintMonitor:
     async def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                logger.info(f"Monitor loop: starting check for {self.printer_id}")
                 await self._check_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Monitor check failed")
+            except Exception as e:
+                logger.exception(f"Monitor check failed: {e}")
 
             try:
                 await asyncio.wait_for(
@@ -179,8 +180,10 @@ class PrintMonitor:
         if not self._state:
             return
         self._state.check_count += 1
+        logger.info(f"Check #{self._state.check_count} starting for {self.printer_id}")
 
         progress = await self._adapter.get_print_progress()
+        logger.info(f"Check #{self._state.check_count}: got progress")
         progress_data = progress.data if hasattr(progress, "data") else {}
         state_str = str(progress_data.get("state", "unknown"))
 
