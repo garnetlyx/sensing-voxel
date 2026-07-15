@@ -191,6 +191,23 @@ Key tools for each step:
 - **Reproduce**: Playwright browser at `http://localhost:8080` — type in `#chat-input`, click `#chat-send`
 - **Verify**: `grep "Tool call:\|cooldown\|error" /tmp/sv-server.log`, `pytest tests/unit/ -x -q`
 
+### Pre-action state check (MANDATORY)
+
+**Before SVA or the operator performs ANY action on a printer** (start print, pause, cancel, set temp, move axis, run gcode, modify config), the current state MUST be read first. This is not optional — it is a hard protocol hook.
+
+What to read:
+1. **Printer state**: `curl -s http://<printer>:80/printer/objects/query?print_stats&extruder&heater_bed`
+2. **Camera snapshot**: capture RTSP frame → look_at (if camera available)
+3. **Server log tail**: `tail -20 /tmp/sv-server.log`
+
+Why:
+- Prevents acting on stale assumptions (printer may have finished/failed since last check)
+- Catches unexpected states (someone else started a print, print failed, etc.)
+- Provides evidence trail for post-mortem analysis
+- The "pre-print validation" feature depends on this — SVA should never start a print without first reading printer.cfg, memo DB, and current printer state
+
+Implementation: SVA's system prompt instructs the LLM to always call `get_print_progress` before any printer action. The operator (you, the AI agent reading this file) must do the equivalent via direct API calls before driving SVA to act.
+
 ## LLM Integration
 
 - 50 tools covering Fluidd-equivalent functionality plus `run_shell`, `web_search` (SearXNG), background tasks, approvals, printer memo, print monitoring, hardware fingerprinting
