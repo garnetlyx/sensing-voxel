@@ -322,7 +322,7 @@ async def main() -> None:
         rtsp_url = config.dashboard.camera_rtsp_url
 
         async def _llm_send(**kwargs):
-            return await llm_client._client.send_message(**kwargs)
+            return await llm_client.send_message(**kwargs)
 
         async def _notify(pid: str, level: str, message: str):
             if ws_manager:
@@ -375,12 +375,11 @@ async def main() -> None:
                 continue
             try:
                 progress = await adapter.get_print_progress()
-                state = ""
-                if hasattr(progress, "data") and progress.data:
-                    state = str(progress.data.get("state", ""))
-                if state == "printing":
+                state = getattr(progress, "state", None)
+                state_name = state.name if hasattr(state, "name") else str(state)
+                if state_name == "PRINTING":
                     logger.info(f"Printer {printer_id} already printing — auto-starting monitor")
-                    await monitor.start_monitoring()
+                    await monitor.start_monitoring(filename=getattr(progress, "filename", None))
             except Exception as e:
                 logger.warning(f"Startup monitor check failed for {printer_id}: {e}")
 
