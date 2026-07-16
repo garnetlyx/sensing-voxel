@@ -647,6 +647,25 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
             "required": ["approval_token"],
         },
     },
+    {
+        "name": "slice_model",
+        "description": (
+            "Slice an STL file into G-code using OrcaSlicer in Docker. "
+            "Returns the G-code filename, estimated print time, and filament usage. "
+            "Use this when a user uploads an STL file and wants to print it. "
+            "After slicing, use start_print_with_monitor to upload and start printing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "STL filename in data/uploads/ (e.g. benchy.stl)",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
 ]
 
 
@@ -963,6 +982,7 @@ class ToolExecutor:
         self._dispatch["acknowledge_anomaly"] = self._acknowledge_anomaly
         self._dispatch["get_monitor_status"] = self._get_monitor_status
         self._dispatch["approve_pending"] = self._approve_pending
+        self._dispatch["slice_model"] = self._slice_model
 
     @staticmethod
     def _coerce_shell_config(config: ShellToolConfig | dict[str, Any] | None) -> ShellToolConfig:
@@ -2628,3 +2648,41 @@ class ToolExecutor:
                 }
 
         return {"error": f"Token {token} not found among pending approvals"}
+
+    async def _slice_model(self, tool_input: dict) -> dict:
+        filename = tool_input.get("filename", "").strip()
+        if not filename:
+            return {"error": "filename is required"}
+
+        stl_path = Path("data/uploads") / filename
+        if not stl_path.exists():
+            return {"error": f"File not found: {stl_path}"}
+
+        from sensing_voxel.slicer.pipeline import SlicerPipeline
+        from sensing_voxel.config import SlicerConfig
+
+        pipeline = SlicerPipeline(SlicerConfig())
+        result = await pipeline.process_model(
+            model_path=stl_path,
+            output_name=stl_path.stem,
+            timeout_seconds=600,
+        )
+
+        if result.errors:
+            return {"filename": filename, "errors": result.errors}
+
+        output_name = result.gcode_path.name
+        summary = pipeline.format_summary(result)
+
+        return {
+            "status": "sliced",
+            "input": filename,
+            "output": output_name,
+            "output_path": str(result.gcode_path),
+            "size_kb": result.gcode_path.stat().st_size // 1024 if result.gcode_path.exists() else 0,
+            "estimated_print_time": str(result.estimated_print_time) if result.estimated_print_time else None,
+            "estimated_filament_mm": result.estimated_filament_mm,
+            "total_layers": result.first_layer_params.layer_height if result.first_layer_params else None,
+            "summary": summary,
+            "next_step": f"Use start_print_with_monitor with filename='{output_name}' to upload and print.",
+        }
