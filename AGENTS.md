@@ -195,18 +195,24 @@ Key tools for each step:
 
 **Before SVA or the operator performs ANY action on a printer** (start print, pause, cancel, set temp, move axis, run gcode, modify config), the current state MUST be read first. This is not optional — it is a hard protocol hook.
 
-What to read:
-1. **Printer state**: `curl -s http://<printer>:80/printer/objects/query?print_stats&extruder&heater_bed`
-2. **Camera snapshot**: capture RTSP frame → look_at (if camera available)
-3. **Server log tail**: `tail -20 /tmp/sv-server.log`
+**Mandatory four-point observation — ALL FOUR must be checked, none can be skipped:**
 
-Why:
-- Prevents acting on stale assumptions (printer may have finished/failed since last check)
-- Catches unexpected states (someone else started a print, print failed, etc.)
-- Provides evidence trail for post-mortem analysis
-- The "pre-print validation" feature depends on this — SVA should never start a print without first reading printer.cfg, memo DB, and current printer state
+1. **Klipper/Moonraker state**: `curl -s http://<printer>:80/printer/objects/query?print_stats&extruder&heater_bed` — actual printer state, temps, progress, filename. This is ground truth from the hardware.
 
-Implementation: SVA's system prompt instructs the LLM to always call `get_print_progress` before any printer action. The operator (you, the AI agent reading this file) must do the equivalent via direct API calls before driving SVA to act.
+2. **Monitor camera**: capture RTSP frame → `look_at` — what does the physical printer look like RIGHT NOW? Is there a print on the bed? Is it spaghetti? Is the bed clear? Camera reveals what Klipper can't (visual reality vs reported state).
+
+3. **SVA messages**: check dashboard chat (`GET /api/v1/chat/history`) or Telegram — what has SVA told the user? What is SVA's current understanding? SVA may have sent alerts, errors, or status updates that contradict the printer state. Never assume SVA's messages match reality — verify.
+
+4. **Server log**: `tail -50 /tmp/sv-server.log` — tool calls, errors, monitor checks, upload status. The log shows what SVA actually did (not what it said it did). Discrepancies between log and SVA messages indicate bugs.
+
+**Why all four are required:**
+- Klipper says "printing" but camera shows empty bed → print failed but Klipper doesn't know yet
+- Camera shows normal print but SVA sent "anomaly detected" → false positive in LLM analysis
+- SVA says "print started successfully" but log shows "upload timeout" → SVA lied (hallucinated success)
+- Log shows "Check #1 OK" but camera shows spaghetti → LLM missed the failure
+- Any single source alone is insufficient. Cross-verification across all four is the only way to catch real issues.
+
+**Implementation**: SVA's system prompt instructs the LLM to always call `get_print_progress` before any printer action. The operator (you, the AI agent reading this file) must do ALL FOUR checks before driving SVA to act, and must cross-verify results after SVA acts.
 
 ## LLM Integration
 
