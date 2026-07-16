@@ -4,6 +4,14 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 
 > **SVA** (Sensing-Voxel Agent) is the AI agent runtime at the core — it drives the LLM tool-use loop, state machine, and all wired subsystems. Interact with SVA via the Telegram bot or web dashboard chat.
 
+## Safety Disclaimer
+
+Sensing Voxel is experimental software. It combines LLM-driven automation, camera-based interpretation, printer control APIs, and physical 3D printers, all of which can behave unpredictably in real-world conditions.
+
+The author has made best efforts to design safer workflows, approval gates, validation checks, and conservative defaults, but no software layer can predict every printer state, hardware failure, model error, configuration mistake, network issue, or unsafe operating condition. Use this project only with appropriate supervision and at your own risk.
+
+By using Sensing Voxel, you accept full responsibility for any print outcome, machine behavior, hardware damage, material loss, fire risk, or other consequence. The author is not responsible for damage to printers, tools, property, or any other losses arising from use, modification, or deployment of this software.
+
 ## Features
 
 - 🤖 **Telegram Bot Interface**: Upload G-code files, receive notifications, and control prints
