@@ -548,7 +548,7 @@ class KlipperAdapter(PrinterAdapter):
                 content_type="application/octet-stream",
             )
 
-            result = await self._rest_request("POST", "/server/files/upload", data=data)
+            result = await self._rest_request("POST", "/server/files/upload", data=data, timeout=120)
 
             if result.status == CommandResultStatus.SUCCESS:
                 logger.info(f"Uploaded file: {remote_name}")

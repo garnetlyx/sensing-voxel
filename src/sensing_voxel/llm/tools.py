@@ -2536,7 +2536,9 @@ class ToolExecutor:
 
         local_path = Path("data/uploads") / filename
         if not local_path.exists():
-            return {"error": f"File not found locally: {local_path}"}
+            local_path = Path("data/sliced") / filename
+        if not local_path.exists():
+            return {"error": f"File not found locally: data/uploads/{filename} or data/sliced/{filename}"}
 
         remote_name = _normalize_filename(filename)
         upload_result = await adapter.upload_file(str(local_path), remote_name)
