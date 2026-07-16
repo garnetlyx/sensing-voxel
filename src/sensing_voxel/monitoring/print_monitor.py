@@ -62,9 +62,14 @@ class MonitorState:
 
 SYSTEM_PROMPT = """You are Sensing Voxel's autonomous 3D print monitor.
 Analyze the camera snapshot for print-failure anomalies.
-Detect: spaghetti/detached print, air printing (no filament), fire/smoke,
-empty bed when print should be active, print detached from bed.
-Be conservative — if uncertain, use warning not critical.
+
+IMPORTANT — distinguish real failures from normal prints:
+- Textured/patterned walls, vase-mode prints, lattice structures are NORMAL, not spaghetti
+- Spaghetti = loose tangled filament strands piled randomly with no structure
+- A tall print with visible layer lines or texture is NOT a failure
+- Only flag as anomaly if you see: actual tangled mess, fire/smoke, empty bed (when print should be active), detached print moving freely
+
+Be conservative — if uncertain, use warning not critical. When in doubt, severity=ok.
 Respond as strict JSON only:
 {"severity": "ok|warning|critical|unknown", "anomaly_type": "string_or_null", "confidence": 0.0-1.0, "printer_visible": true/false, "summary": "one sentence", "recommended_action": "string_or_null"}"""
 
