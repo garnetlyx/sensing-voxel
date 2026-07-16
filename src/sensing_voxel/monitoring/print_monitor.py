@@ -115,11 +115,25 @@ class PrintMonitor:
         old_name = old_state.name if hasattr(old_state, "name") else str(old_state)
 
         if new_name == "PRINTING" and old_name != "PRINTING":
+            await asyncio.sleep(5)
+            progress = await self._adapter.get_print_progress()
+            current_state = getattr(progress, "state", None)
+            current_name = current_state.name if hasattr(current_state, "name") else str(current_state)
+            if current_name != "PRINTING":
+                logger.info(f"Skipping monitor activation: state changed to {current_name} within 5s debounce")
+                return
             if not self.is_monitoring:
                 logger.info(f"Auto-activating monitor: {self.printer_id} entered PRINTING")
                 await self.start_monitoring()
 
         if old_name == "PRINTING" and new_name in ("STANDBY", "COMPLETE", "IDLE_NO_ACTIVE_PRINT", "CANCELLED", "ERROR"):
+            await asyncio.sleep(5)
+            progress = await self._adapter.get_print_progress()
+            current_state = getattr(progress, "state", None)
+            current_name = current_state.name if hasattr(current_state, "name") else str(current_state)
+            if current_name == "PRINTING":
+                logger.info(f"Skipping 'Print ended' notification: state returned to PRINTING within 5s debounce")
+                return
             if self.is_monitoring:
                 if self._config.notify_on_completion:
                     await self._notify(
@@ -189,10 +203,11 @@ class PrintMonitor:
 
         progress = await self._adapter.get_print_progress()
         logger.info(f"Check #{self._state.check_count}: got progress")
-        progress_data = progress.data if hasattr(progress, "data") else {}
-        state_str = str(progress_data.get("state", "unknown"))
 
-        if state_str in ("standby", "complete", "cancelled", "error"):
+        progress_state = getattr(progress, "state", None)
+        progress_state_name = progress_state.name if hasattr(progress_state, "name") else str(progress_state)
+
+        if progress_state_name not in ("PRINTING", "PAUSED"):
             if self._config.notify_on_completion:
                 await self._notify(
                     self.printer_id,
@@ -202,6 +217,12 @@ class PrintMonitor:
                 )
             await self.stop_monitoring(reason="print_complete")
             return
+
+        if progress_state_name == "PAUSED":
+            logger.info(f"Check #{self._state.check_count}: printer paused, skipping check")
+            return
+
+        progress_data = progress.data if hasattr(progress, "data") else {}
 
         logger.info(f"Check #{self._state.check_count}: capturing RTSP...")
         snapshot_b64 = await self._capture_rtsp()
@@ -235,10 +256,10 @@ class PrintMonitor:
         context = {
             "printer_id": self.printer_id,
             "filename": self._state.filename,
-            "state": state_str,
+            "state": progress_state_name,
             "temps": {
-                "nozzle": progress_data.get("extruder_temp"),
-                "bed": progress_data.get("bed_temp"),
+                "nozzle": getattr(progress, "nozzle_temp", None),
+                "bed": getattr(progress, "bed_temp", None),
             },
         }
 
