@@ -123,6 +123,12 @@ class SlicerConfig:
     orcaslicer_path: str = "orca-slicer"
     profile_path: str | None = None
     output_dir: str = "data/sliced"
+    docker_image: str = "linuxserver/orcaslicer:latest"
+    docker_binary: str = "/opt/orcaslicer/bin/orca-slicer"
+    docker_datadir: str = "/opt/orcaslicer/resources"
+    machine_profile: str = "Elegoo Neptune 4 Max 0.6 nozzle"
+    process_profile: str = "0.30mm Standard @Elegoo N4Max 0.6 nozzle"
+    filament_profile: str = "Elegoo PLA Basic @EN4 Series"
 
 
 @dataclass

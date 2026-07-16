@@ -1,10 +1,11 @@
 """
-Slicer pipeline for STL to G-code conversion via PrusaSlicer/OrcaSlicer CLI.
+Slicer pipeline for STL to G-code conversion via OrcaSlicer CLI in Docker.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from dataclasses import dataclass
@@ -162,6 +163,64 @@ class SlicerPipeline:
             self._slicer_info = await SlicerDetector.detect_slicer(self.config)
         return self._slicer_info
 
+    def _build_docker_command(
+        self,
+        stl_path: Path,
+        output_dir: Path,
+        output_name: str,
+    ) -> tuple[list[str], Path]:
+        cfg = self.config
+        gcode_3mf_name = f"{output_name}.gcode.3mf"
+        override_name = "sva_override.json"
+
+        override_path = output_dir / override_name
+        override_path.write_text(json.dumps({
+            "type": "machine",
+            "name": cfg.machine_profile,
+            "from": "system",
+            "setting_id": "sva_override",
+            "inherits": cfg.machine_profile,
+            "use_relative_e_distances": ["0"],
+            "gcode_flavor": "klipper",
+        }))
+
+        machine_json = ""
+        process_json = self._find_profile_json(cfg.docker_datadir, "process", cfg.process_profile)
+        filament_json = self._find_profile_json(cfg.docker_datadir, "filament", cfg.filament_profile)
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--entrypoint", "",
+            "-e", "XDG_RUNTIME_DIR=/tmp",
+            f"-v={output_dir.absolute()}:/output",
+            f"-v={stl_path.absolute()}:/input.stl:ro",
+            f"-v={override_path.absolute()}:/override.json:ro",
+            cfg.docker_image,
+            cfg.docker_binary,
+            "--slice", "1",
+            "--datadir", cfg.docker_datadir,
+            "--load-settings", f"/override.json;{process_json}",
+            "--load-filaments", filament_json,
+            "--outputdir", "/output",
+            "--export-3mf", gcode_3mf_name,
+            "--allow-newer-file",
+            "/input.stl",
+        ]
+        return cmd, output_dir / gcode_3mf_name
+
+    @staticmethod
+    def _find_profile_json(datadir: str, category: str, name: str) -> str:
+        import subprocess
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint", "", "linuxserver/orcaslicer:latest",
+             "find", datadir + "/profiles", "-name", f"*{name}*"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.endswith(".json") and category in line.lower():
+                return line
+        return ""
+
     def _build_slice_command(
         self,
         slicer_info: SlicerInfo,
@@ -170,13 +229,14 @@ class SlicerPipeline:
         profile: Path | None = None,
     ) -> list[str]:
         if slicer_info.backend == SlicerBackend.ORCASLICER:
+            out_3mf = str(gcode_path).replace(".gcode", ".gcode.3mf")
             cmd = [
                 slicer_info.executable_path,
-                "slice",
-                "--export-gcode",
+                "--slice", "1",
+                "--outputdir", str(gcode_path.parent),
+                "--export-3mf", gcode_path.name.replace(".gcode", ".gcode.3mf"),
+                "--allow-newer-file",
                 str(stl_path),
-                "--output",
-                str(gcode_path),
             ]
             if profile and profile.exists():
                 cmd.extend(["--load-settings", str(profile)])
@@ -277,30 +337,35 @@ class SlicerPipeline:
                 errors=[f"STL file not found: {stl_path}"],
             )
 
-        profile = profile_path or (
-            Path(self.config.profile_path) if self.config.profile_path else None
-        )
-
-        try:
-            slicer_info = await self._get_slicer()
-        except FileNotFoundError as e:
-            return SlicingResult(
-                gcode_path=Path(""),
-                gcode_hash="",
-                errors=[str(e)],
-            )
-
-        profile = ProfileMapper.map_profile_path(profile, slicer_info.backend)
-
         stem = output_name or stl_path.stem
         gcode_path = self.output_dir / f"{stem}.gcode"
 
-        cmd = self._build_slice_command(slicer_info, stl_path, gcode_path, profile)
+        use_docker = shutil.which("docker") is not None
 
-        logger.info(
-            f"Slicing {stl_path.name} with {slicer_info.backend.value} "
-            f"({slicer_info.executable_path})"
-        )
+        if use_docker:
+            cmd, gcode_3mf_path = self._build_docker_command(
+                stl_path, self.output_dir, stem,
+            )
+            logger.info(f"Slicing {stl_path.name} via Docker ({self.config.docker_image})")
+        else:
+            try:
+                slicer_info = await self._get_slicer()
+            except FileNotFoundError as e:
+                return SlicingResult(
+                    gcode_path=Path(""),
+                    gcode_hash="",
+                    errors=[str(e)],
+                )
+            profile = profile_path or (
+                Path(self.config.profile_path) if self.config.profile_path else None
+            )
+            profile = ProfileMapper.map_profile_path(profile, slicer_info.backend)
+            cmd = self._build_slice_command(slicer_info, stl_path, gcode_path, profile)
+            gcode_3mf_path = gcode_path.with_suffix(".gcode.3mf")
+            logger.info(
+                f"Slicing {stl_path.name} with {slicer_info.backend.value} "
+                f"({slicer_info.executable_path})"
+            )
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -319,28 +384,55 @@ class SlicerPipeline:
                 return SlicingResult(
                     gcode_path=gcode_path,
                     gcode_hash="",
-                    errors=[f"Slicer exited with code {proc.returncode}: {stderr_text.strip()}"],
-                    slicer_backend=slicer_info.backend.value,
-                    slicer_version=slicer_info.version,
+                    errors=[f"Slicer exited with code {proc.returncode}: {stderr_text.strip() or stdout_text.strip()[:200]}"],
+                    slicer_backend="docker-orcaslicer" if use_docker else (slicer_info.backend.value if 'slicer_info' in dir() else "unknown"),
                 )
+
+            if gcode_3mf_path.exists() and not gcode_path.exists():
+                import zipfile
+                with zipfile.ZipFile(gcode_3mf_path, "r") as zf:
+                    for name in zf.namelist():
+                        if name.endswith("plate_1.gcode"):
+                            with open(gcode_path, "wb") as out:
+                                out.write(zf.read(name))
+                            logger.info(f"Extracted G-code from {gcode_3mf_path.name}/{name}")
+                            break
+                gcode_3mf_path.unlink(missing_ok=True)
+
+            # Check result.json for OrcaSlicer error codes
+            result_json = self.output_dir / "result.json"
+            if result_json.exists():
+                import json as _json
+                try:
+                    rj = _json.loads(result_json.read_text())
+                    rc = rj.get("return_code", 0)
+                    if rc != 0:
+                        err = rj.get("error_string", "Unknown slicing error")
+                        result_json.unlink(missing_ok=True)
+                        return SlicingResult(
+                            gcode_path=gcode_path,
+                            gcode_hash="",
+                            errors=[f"OrcaSlicer error (code {rc}): {err}"],
+                            slicer_backend="docker-orcaslicer",
+                        )
+                    result_json.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if not gcode_path.exists():
                 return SlicingResult(
                     gcode_path=gcode_path,
                     gcode_hash="",
                     errors=["Slicer completed but no G-code file was produced"],
-                    slicer_backend=slicer_info.backend.value,
-                    slicer_version=slicer_info.version,
+                    slicer_backend="docker-orcaslicer" if use_docker else (slicer_info.backend.value if 'slicer_info' in dir() else "unknown"),
                 )
 
-            # Extract metadata from generated G-code
             extractor = GcodeMetadataExtractor
             gcode_hash = extractor.compute_file_hash(gcode_path)
             first_layer_params = extractor.extract_first_layer_params(gcode_path)
             first_layer_bounds = extractor.extract_first_layer_bounds(gcode_path)
             metadata = extractor.extract_metadata(gcode_path)
 
-            # Parse warnings from slicer output
             warnings = []
             for line in (stdout_text + stderr_text).splitlines():
                 lower = line.lower()
@@ -350,6 +442,9 @@ class SlicerPipeline:
             estimated_time = None
             if "estimated_time" in metadata:
                 estimated_time = timedelta(seconds=metadata["estimated_time"])
+
+            backend_name = "docker-orcaslicer" if use_docker else (slicer_info.backend.value if 'slicer_info' in dir() else "unknown")
+            backend_ver = None if use_docker else (slicer_info.version if 'slicer_info' in dir() else None)
 
             logger.info(
                 f"Slicing complete: {gcode_path.name} "
@@ -363,8 +458,8 @@ class SlicerPipeline:
                 first_layer_bounds=first_layer_bounds,
                 estimated_print_time=estimated_time,
                 estimated_filament_mm=metadata.get("filament_used_mm"),
-                slicer_backend=slicer_info.backend.value,
-                slicer_version=slicer_info.version,
+                slicer_backend=backend_name,
+                slicer_version=backend_ver,
                 warnings=warnings,
             )
 
@@ -374,26 +469,15 @@ class SlicerPipeline:
                 gcode_path=gcode_path,
                 gcode_hash="",
                 errors=[f"Slicer timed out after {timeout_seconds}s"],
-                slicer_backend=slicer_info.backend.value,
-                slicer_version=slicer_info.version,
-            )
-        except FileNotFoundError:
-            logger.error(f"Slicer not found: {slicer_info.executable_path}")
-            return SlicingResult(
-                gcode_path=gcode_path,
-                gcode_hash="",
-                errors=[f"Slicer executable not found: {slicer_info.executable_path}"],
-                slicer_backend=slicer_info.backend.value,
-                slicer_version=slicer_info.version,
+                slicer_backend="docker-orcaslicer" if use_docker else "unknown",
             )
         except Exception as e:
-            logger.error(f"Slicer error: {e}", exc_info=True)
+            logger.error(f"Slicer error: {e}")
             return SlicingResult(
                 gcode_path=gcode_path,
                 gcode_hash="",
-                errors=[str(e)],
-                slicer_backend=slicer_info.backend.value,
-                slicer_version=slicer_info.version,
+                errors=[f"Slicer error: {str(e)}"],
+                slicer_backend="docker-orcaslicer" if use_docker else "unknown",
             )
 
     def format_summary(self, result: SlicingResult) -> str:
