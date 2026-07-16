@@ -1,14 +1,9 @@
 """
 Storage module for Sensing Voxel
 
-SQLite-based persistence for job history and calibration records.
+SQLite-based persistence for job history and printer memos.
 """
 
-from sensing_voxel.storage.calibration_repository import (
-    CalibrationRecord,
-    CalibrationRepository,
-    CalibrationType,
-)
 from sensing_voxel.storage.database import (
     Database,
     DatabaseConfig,
@@ -29,7 +24,6 @@ from sensing_voxel.storage.printer_memo_repository import (
 )
 
 __all__ = [
-    # Database
     "Database",
     "DatabaseConfig",
     "DatabaseError",
@@ -37,15 +31,9 @@ __all__ = [
     "DatabaseSchemaError",
     "create_database",
     "get_default_db_path",
-    # Job Repository
     "JobRepository",
     "JobRecord",
     "JobStatus",
-    # Calibration Repository
-    "CalibrationRepository",
-    "CalibrationRecord",
-    "CalibrationType",
-    # Printer Memo Repository
     "PrinterMemoRepository",
     "MemoRecord",
 ]

@@ -544,64 +544,6 @@ async def get_job_stats(request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError(text="Failed to fetch job stats")
 
 
-async def get_queue_status(request: web.Request) -> web.Response:
-    """Get current command queue status"""
-    app_state = request.app["app_state"]
-
-    # Get command queue from adapters if available
-    queue_info = []
-    for printer_id, adapter in app_state.get("adapters", {}).items():
-        if hasattr(adapter, "_command_queue"):
-            queue = adapter._command_queue
-            queue_info.append(
-                {
-                    "printer_id": printer_id,
-                    "queue_size": queue.size(),
-                    "processing": queue._processing if hasattr(queue, "_processing") else False,
-                }
-            )
-
-    return web.json_response(
-        {
-            "queues": queue_info,
-            "total_pending": sum(q["queue_size"] for q in queue_info),
-        }
-    )
-
-
-async def post_queue_clear(request: web.Request) -> web.Response:
-    """Clear command queue for a printer"""
-    app_state = request.app["app_state"]
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
-
-    printer_id = body.get("printer_id")
-    if not printer_id:
-        raise web.HTTPBadRequest(text="Missing printer_id")
-
-    adapter = app_state.get("adapters", {}).get(printer_id)
-    if not adapter:
-        raise web.HTTPNotFound(text=f"Unknown printer: {printer_id}")
-
-    if not hasattr(adapter, "_command_queue"):
-        raise web.HTTPServiceUnavailable(text=f"Printer {printer_id} has no command queue")
-
-    try:
-        adapter._command_queue.clear()
-        return web.json_response(
-            {
-                "status": "cleared",
-                "printer_id": printer_id,
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error clearing queue: {e}", exc_info=True)
-        raise web.HTTPInternalServerError(text="Failed to clear queue")
-
-
 async def post_approve(request: web.Request) -> web.Response:
     """Approve or reject a pending SVA tool approval."""
     app_state = request.app.get("app_state", {})
@@ -669,8 +611,5 @@ def setup_routes(app: web.Application, ws_manager):
     # Job history endpoints
     app.router.add_get("/api/v1/jobs/history", get_job_history)
     app.router.add_get("/api/v1/jobs/stats", get_job_stats)
-    # Queue management endpoints
-    app.router.add_get("/api/v1/queue", get_queue_status)
-    app.router.add_post("/api/v1/queue/clear", post_queue_clear)
     app.router.add_post("/api/v1/approve", post_approve)
     app.router.add_get("/api/v1/ws", ws_manager.handle_websocket)
