@@ -90,6 +90,7 @@ class TestKlipperAdapter:
                 "POST",
                 "/printer/print/start",
                 json={"filename": "test.gcode"},
+                timeout=10,
             )
 
     @pytest.mark.asyncio

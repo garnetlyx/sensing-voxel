@@ -466,10 +466,21 @@ class KlipperAdapter(PrinterAdapter):
     # --- Commands ---
 
     async def start_print(self, gcode_path: str) -> CommandResult:
-        return await self._rest_request(
+        result = await self._rest_request(
             "POST",
             "/printer/print/start",
             json={"filename": gcode_path},
+            timeout=10,
+        )
+        if result.status == CommandResultStatus.SUCCESS:
+            return result
+
+        await asyncio.sleep(2)
+        return await self._rest_request(
+            "POST",
+            "/printer/gcode/script",
+            json={"script": f"SDCARD_PRINT_FILE FILENAME={gcode_path}"},
+            timeout=15,
         )
 
     async def pause_print(self) -> CommandResult:
