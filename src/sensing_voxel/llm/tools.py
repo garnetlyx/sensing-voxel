@@ -2541,21 +2541,83 @@ class ToolExecutor:
             return {"error": f"File not found locally: data/uploads/{filename} or data/sliced/{filename}"}
 
         gcode_content = local_path.read_text(errors="replace")[:5000]
+
         has_g28 = any(line.strip().startswith("G28") for line in gcode_content.split("\n"))
-        has_heat = "M104" in gcode_content or "M109" in gcode_content
         if not has_g28:
-            return {"error": "G-code validation FAILED: no G28 (homing) command found in first 5000 chars. Refusing to print — this caused a crash on 2026-07-16."}
+            return {"error": "SAFETY BLOCKER: G-code has no G28 (homing). Refusing to print — this caused a crash on 2026-07-16."}
+
+        has_heat = "M104" in gcode_content or "M109" in gcode_content
         if not has_heat:
-            return {"error": "G-code validation FAILED: no M104/M109 (nozzle heating) found in first 5000 chars."}
+            return {"error": "SAFETY BLOCKER: G-code has no M104/M109 (nozzle heating). Refusing to print."}
+
+        config_result = await adapter.get_config_file(filename="printer.cfg", max_bytes=200000)
+        if config_result.status != CommandResultStatus.SUCCESS:
+            return {"error": f"SAFETY BLOCKER: Cannot read printer.cfg for pre-print validation: {config_result.message}"}
+        config_text = config_result.data.get("content", "")
+
+        cfg_nozzle = "0.4"
+        for line in config_text.split("\n"):
+            if "nozzle_diameter" in line and not line.strip().startswith("#"):
+                cfg_nozzle = line.split(":")[1].strip()
+                break
+
+        import re as _re
+        gcode_nozzle_match = _re.search(r"nozzle_diameter.*?(\d+\.?\d*)", gcode_content)
+        gcode_nozzle = gcode_nozzle_match.group(1) if gcode_nozzle_match else None
+
+        progress = await adapter.get_print_progress()
+        nozzle_temp = getattr(progress, "nozzle_temp", 0) or 0
+        bed_temp = getattr(progress, "bed_temp", 0) or 0
+
+        from sensing_voxel.core.models import NormalizedPrinterState
+        progress_state = getattr(progress, "state", None)
+        state_name = progress_state.name if hasattr(progress_state, "name") else str(progress_state)
+        if state_name == "PRINTING":
+            return {"error": f"SAFETY BLOCKER: {printer_id} is already printing. Cannot start new print."}
+
+        probe_data = {}
+        if hasattr(adapter, "_rest_request"):
+            probe_result = await adapter._rest_request("GET", "/printer/objects/query?probe")
+            if probe_result.status == CommandResultStatus.SUCCESS and probe_result.data:
+                probe_data = probe_result.data.get("status", {}).get("probe", {})
+        probe_z_offset = probe_data.get("z_offset") if probe_data else None
+        if probe_z_offset is not None and probe_z_offset == 0.0:
+            return {"error": f"SAFETY BLOCKER: probe z_offset is 0.0 — probe is not calibrated or damaged. Refusing to print (this caused Z crash on 2026-07-16). Run Z_ENDSTOP_CALIBRATE or PROBE_CALIBRATE first."}
+
+        validation_report = {
+            "printer": printer_id,
+            "printer_state": state_name,
+            "nozzle_in_cfg": f"{cfg_nozzle}mm",
+            "nozzle_in_gcode": f"{gcode_nozzle}mm" if gcode_nozzle else "not found in header",
+            "nozzle_match": (gcode_nozzle is None or gcode_nozzle == cfg_nozzle),
+            "current_nozzle_temp": f"{nozzle_temp:.0f}°C",
+            "current_bed_temp": f"{bed_temp:.0f}°C",
+            "probe_z_offset": probe_z_offset,
+            "g28_present": has_g28,
+            "heating_present": has_heat,
+        }
+
+        if gcode_nozzle and gcode_nozzle != cfg_nozzle:
+            return {"error": f"SAFETY BLOCKER: nozzle mismatch — G-code sliced for {gcode_nozzle}mm but printer.cfg says {cfg_nozzle}mm.", "validation": validation_report}
+
+        validation_summary = (
+            f"Pre-print validation:\n"
+            f"  Printer: {printer_id} (state: {state_name})\n"
+            f"  Nozzle: cfg={cfg_nozzle}mm gcode={gcode_nozzle or '?'}mm {'✅' if validation_report['nozzle_match'] else '❌'}\n"
+            f"  Temps: nozzle={nozzle_temp:.0f}°C bed={bed_temp:.0f}°C\n"
+            f"  Probe z_offset: {probe_z_offset}\n"
+            f"  G28: {'✅' if has_g28 else '❌'}  Heating: {'✅' if has_heat else '❌'}\n"
+        )
+        logger.info(f"Pre-print validation for {printer_id}: {validation_report}")
 
         remote_name = _normalize_filename(filename)
         upload_result = await adapter.upload_file(str(local_path), remote_name)
         if upload_result.status != CommandResultStatus.SUCCESS:
-            return {"error": f"Upload failed: {upload_result.message}"}
+            return {"error": f"Upload failed: {upload_result.message}", "validation": validation_report}
 
         start_result = await adapter.start_print(remote_name)
         if start_result.status != CommandResultStatus.SUCCESS:
-            return {"error": f"Start print failed: {start_result.message}"}
+            return {"error": f"Start print failed: {start_result.message}", "validation": validation_report}
 
         monitor = self._print_monitors.get(printer_id)
         if monitor:
