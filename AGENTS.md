@@ -58,6 +58,13 @@ pytest --cov=sensing_voxel --cov-report=html
 - **Emergency path**: Dedicated session for emergency cancel, bypasses the command queue
 - **G-code validation**: Shared `validate_gcode_command()` in `infra/gcode.py` (blocks M112/M410/M80/M81/M23, validates axis + temperature bounds)
 - **Printer config safety**: **ALWAYS backup printer.cfg before any modification.** Moonraker auto-creates timestamped backups (e.g. `printer-20260516_075252.cfg`) but never overwrite printer.cfg without confirming a backup exists. SVA's `update_printer_config` tool MUST create a backup copy before writing. A single-line overwrite can brick the printer's startup.
+- **G-code safety barriers** (MANDATORY, enforced in code):
+  1. **G28 validation**: `start_print_with_monitor` refuses to print if G-code has no G28 (homing). This is a hard code barrier — not configurable.
+  2. **Heating validation**: refuses to print if no M104/M109 (nozzle heating) in G-code.
+  3. **Slice preview**: after slicing, SVA should show the user a summary (print time, filament, layer count, preview image if possible) before starting print.
+  4. **Pre-print confirmation**: SVA must display material, build plate surface, hotend size, and z-offset, and get explicit user approval before starting.
+  5. **First-layer monitoring**: during first layer, monitor checks every 1 minute (not 30). After first layer completes, switch to normal interval.
+  6. **Z-offset sanity check**: if probe z_offset is 0.0 or homing_origin Z is positive, BLOCK print and warn user — this indicates broken/uninitialized probe state.
 - **Deduplicate + consolidate**: No two modules may co-exist if they serve overlapping functions — even under different names or abstractions. If a new module replaces an old one (e.g. PrintMonitor replaces MonitoringOrchestrator, LLM multimodal replaces vision/), **delete the old one immediately and migrate any still-needed logic into the new module**. Renaming is not enough — if `vision/camera.py` (RTSP stream) and `monitoring/print_monitor.py` (RTSP snapshot) both capture camera frames, consolidate into one place. Every module in the codebase must have a unique, non-overlapping responsibility.
 - **Local lifecycle state**: `.project/` holds `TODO.md`, `SESSION_LOG.md`, `EVAL.md` (gitignored)
 
