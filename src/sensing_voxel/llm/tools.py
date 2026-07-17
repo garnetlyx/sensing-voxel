@@ -2575,6 +2575,18 @@ class ToolExecutor:
         if state_name == "PRINTING":
             return {"error": f"SAFETY BLOCKER: {printer_id} is already printing. Cannot start new print."}
 
+        gcode_move_data = {}
+        if hasattr(adapter, "_rest_request"):
+            gm_result = await adapter._rest_request("GET", "/printer/objects/query?gcode_move")
+            if gm_result.status == CommandResultStatus.SUCCESS and gm_result.data:
+                gcode_move_data = gm_result.data.get("status", {}).get("gcode_move", {})
+        homing_origin_z = gcode_move_data.get("homing_origin", [0,0,0,0])[2] if gcode_move_data else 0
+        current_z = gcode_move_data.get("position", [0,0,0,0])[2] if gcode_move_data else 0
+        if abs(homing_origin_z) > 2.0:
+            return {"error": f"SAFETY BLOCKER: homing_origin Z = {homing_origin_z:.2f}mm — abnormal (should be near 0 after G28 homing). This means Z-axis reference is corrupted. Refusing to print — would cause crash."}
+        if current_z < -1.0:
+            return {"error": f"SAFETY BLOCKER: current Z position = {current_z:.2f}mm — below bed surface. Z-axis is in crashed state. Refusing to print."}
+
         probe_data = {}
         if hasattr(adapter, "_rest_request"):
             probe_result = await adapter._rest_request("GET", "/printer/objects/query?probe")
