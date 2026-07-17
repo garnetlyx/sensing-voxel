@@ -2540,6 +2540,14 @@ class ToolExecutor:
         if not local_path.exists():
             return {"error": f"File not found locally: data/uploads/{filename} or data/sliced/{filename}"}
 
+        gcode_content = local_path.read_text(errors="replace")[:5000]
+        has_g28 = any(line.strip().startswith("G28") for line in gcode_content.split("\n"))
+        has_heat = "M104" in gcode_content or "M109" in gcode_content
+        if not has_g28:
+            return {"error": "G-code validation FAILED: no G28 (homing) command found in first 5000 chars. Refusing to print — this caused a crash on 2026-07-16."}
+        if not has_heat:
+            return {"error": "G-code validation FAILED: no M104/M109 (nozzle heating) found in first 5000 chars."}
+
         remote_name = _normalize_filename(filename)
         upload_result = await adapter.upload_file(str(local_path), remote_name)
         if upload_result.status != CommandResultStatus.SUCCESS:

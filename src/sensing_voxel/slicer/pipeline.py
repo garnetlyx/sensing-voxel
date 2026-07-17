@@ -182,7 +182,7 @@ class SlicerPipeline:
             "inherits": cfg.machine_profile,
             "use_relative_e_distances": ["0"],
             "gcode_flavor": "klipper",
-            "machine_start_gcode": "PRINT_START\nM140 S60\nM190 S60\nM104 S220\nM109 S220\n",
+            "machine_start_gcode": "G28\nPRINT_START\nM140 S60\nM190 S60\nM104 S220\nM109 S220\n",
             "machine_end_gcode": "PRINT_END\n",
         }))
 
