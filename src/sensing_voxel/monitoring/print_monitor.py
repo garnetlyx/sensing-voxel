@@ -17,21 +17,25 @@ import asyncio
 import base64
 import json
 import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-from pathlib import Path
-from typing import Any, Callable, Coroutine
+from enum import StrEnum
+from typing import Any
 
 import cv2
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.config import PrintMonitorConfig
+from sensing_voxel.safety.models import MonitorStartContract
 
 logger = logging.getLogger(__name__)
 
+FIRST_LAYER_CHECK_INTERVAL_SECONDS = 60.0
+WaitFn = Callable[[asyncio.Event, float], Coroutine[Any, Any, bool]]
 
-class MonitorSeverity(str, Enum):
+
+class MonitorSeverity(StrEnum):
     OK = "ok"
     WARNING = "warning"
     CRITICAL = "critical"
@@ -58,6 +62,9 @@ class MonitorState:
     anomaly_pending: bool = False
     camera_failures: int = 0
     camera_notified: bool = False
+    first_layer_complete: bool = False
+    first_layer_z: float | None = None
+    required: bool = False
 
 
 SYSTEM_PROMPT = """You are Sensing Voxel's autonomous 3D print monitor.
@@ -69,7 +76,7 @@ IMPORTANT — distinguish real failures from normal prints:
 - A tall print with visible layer lines or texture is NOT a failure
 - Only flag as anomaly if you see: actual tangled mess, fire/smoke, empty bed (when print should be active), detached print moving freely
 
-Be conservative — if uncertain, use warning not critical. When in doubt, severity=ok.
+Be conservative — if uncertain, use warning not critical. Never report an analysis failure or unknown state as ok.
 Respond as strict JSON only:
 {"severity": "ok|warning|critical|unknown", "anomaly_type": "string_or_null", "confidence": 0.0-1.0, "printer_visible": true/false, "summary": "one sentence", "recommended_action": "string_or_null"}"""
 
@@ -86,6 +93,7 @@ class PrintMonitor:
         llm_send_fn: Callable[..., Coroutine[Any, Any, str]],
         notifier_fn: Callable[[str, str, str], Coroutine[Any, Any, None]],
         config: PrintMonitorConfig,
+        wait_fn: WaitFn | None = None,
     ):
         self.printer_id = printer_id
         self._adapter = adapter
@@ -93,6 +101,7 @@ class PrintMonitor:
         self._llm_send = llm_send_fn
         self._notify = notifier_fn
         self._config = config
+        self._wait_fn = wait_fn or self._wait_for_stop
         self._task: asyncio.Task | None = None
         self._pause_task: asyncio.Task | None = None
         self._state: MonitorState | None = None
@@ -132,7 +141,7 @@ class PrintMonitor:
             current_state = getattr(progress, "state", None)
             current_name = current_state.name if hasattr(current_state, "name") else str(current_state)
             if current_name == "PRINTING":
-                logger.info(f"Skipping 'Print ended' notification: state returned to PRINTING within 5s debounce")
+                logger.info("Skipping 'Print ended' notification: state returned to PRINTING within 5s debounce")
                 return
             if self.is_monitoring:
                 if self._config.notify_on_completion:
@@ -142,11 +151,40 @@ class PrintMonitor:
                     )
                 await self.stop_monitoring(reason=f"state_changed_to_{new_name}")
 
-    async def start_monitoring(self, filename: str | None = None) -> None:
+    async def start_monitoring(
+        self,
+        filename: str | None = None,
+        *,
+        contract: MonitorStartContract | None = None,
+    ) -> None:
+        if contract is not None:
+            if filename is not None and filename != contract.filename:
+                raise ValueError("monitor filename conflicts with start contract")
+            filename = contract.filename
+        if contract is not None and contract.required:
+            if not filename:
+                raise RuntimeError("required monitor filename is unavailable")
+            if not contract.source_trust:
+                raise RuntimeError("required monitor source identity is unavailable")
+            if contract.first_layer_z is None:
+                raise RuntimeError("required monitor first-layer preview data is unavailable")
+
         if self._task and not self._task.done():
+            if contract is not None and self._state and self._state.required is True:
+                if self._state.filename == contract.filename:
+                    return
+                raise RuntimeError("required print monitor is already active for another print")
             await self.stop_monitoring(reason="replaced")
 
-        self._state = MonitorState(printer_id=self.printer_id, filename=filename)
+        if contract is not None and contract.required:
+            await self._validate_required_readiness(contract)
+
+        self._state = MonitorState(
+            printer_id=self.printer_id,
+            filename=filename,
+            first_layer_z=contract.first_layer_z if contract else None,
+            required=bool(contract and contract.required),
+        )
         self._stop_event.clear()
         self._ack_event.clear()
         self._task = asyncio.create_task(
@@ -154,15 +192,52 @@ class PrintMonitor:
         )
         logger.info(f"Print monitoring started for {self.printer_id}: {filename}")
 
+    async def _validate_required_readiness(self, contract: MonitorStartContract) -> None:
+        try:
+            progress = await self._adapter.get_print_progress()
+        except Exception as exc:
+            raise RuntimeError("required monitor progress is unavailable") from exc
+        state = getattr(progress, "state", None)
+        state_name = state.name if hasattr(state, "name") else str(state)
+        if state_name in ("UNKNOWN", "None", ""):
+            raise RuntimeError("required monitor progress state is unknown")
+
+        try:
+            snapshot = await self._capture_rtsp()
+        except Exception as exc:
+            raise RuntimeError("required monitor camera is unavailable") from exc
+        if snapshot is None:
+            raise RuntimeError("required monitor camera is unavailable")
+
+        context = {
+            "printer_id": self.printer_id,
+            "filename": contract.filename,
+            "state": state_name,
+            "first_layer_z": contract.first_layer_z,
+        }
+        try:
+            result = await asyncio.wait_for(self._analyze(snapshot, context), timeout=60)
+        except Exception as exc:
+            raise RuntimeError("required monitor LLM analysis is unavailable") from exc
+        if (
+            result.severity == MonitorSeverity.UNKNOWN
+            or result.anomaly_type in {"llm_timeout", "llm_error", "parse_error", "analysis_unknown"}
+        ):
+            raise RuntimeError("required monitor LLM analysis is unavailable")
+        if not result.printer_visible:
+            raise RuntimeError("required monitor camera view is unknown")
+
     async def stop_monitoring(self, reason: str = "manual") -> None:
         self._stop_event.set()
-        for t in (self._task, self._pause_task):
-            if t and not t.done():
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+        current_task = asyncio.current_task()
+        for task in (self._task, self._pause_task):
+            if task is current_task or task is None or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self._task = None
         self._pause_task = None
         self._state = None
@@ -184,16 +259,58 @@ class PrintMonitor:
                 await self._check_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                logger.exception(f"Monitor check failed: {e}")
+            except Exception as exc:
+                logger.exception(f"Monitor check failed: {exc}")
+                if self._state and self._state.required is True:
+                    await self._fail_closed("monitor_check_unavailable", exc)
+                    return
 
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(),
-                    timeout=self._config.check_interval_seconds,
-                )
-            except asyncio.TimeoutError:
-                pass
+            if self._stop_event.is_set():
+                return
+            interval = self._current_check_interval()
+            if await self._wait_fn(self._stop_event, interval):
+                return
+
+    @staticmethod
+    async def _wait_for_stop(stop_event: asyncio.Event, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    def _current_check_interval(self) -> float:
+        if self._state and not self._state.first_layer_complete:
+            return FIRST_LAYER_CHECK_INTERVAL_SECONDS
+        return self._config.check_interval_seconds
+
+    def _update_first_layer_state(self, progress: Any) -> None:
+        if not self._state or self._state.first_layer_complete:
+            return
+        current_layer = getattr(progress, "current_layer", None)
+        if isinstance(current_layer, int) and not isinstance(current_layer, bool):
+            if current_layer > 1:
+                self._state.first_layer_complete = True
+            return
+        if current_layer is not None:
+            logger.warning("Ignoring unreliable current_layer value: %r", current_layer)
+
+    async def _fail_closed(self, reason: str, error: Exception | None = None) -> None:
+        detail = f": {error}" if error else ""
+        logger.error("Required monitoring failed closed for %s: %s%s", self.printer_id, reason, detail)
+        try:
+            await self._adapter.pause_print()
+        except Exception:
+            logger.exception("Failed to pause %s after required monitor failure", self.printer_id)
+        try:
+            await self._notify(
+                self.printer_id,
+                "critical",
+                f"Required print monitoring is unavailable on {self.printer_id} ({reason}). Print paused.",
+            )
+        except Exception:
+            logger.exception("Failed to notify required monitor failure for %s", self.printer_id)
+        self._stop_event.set()
 
     async def _check_once(self) -> None:
         if not self._state:
@@ -203,11 +320,19 @@ class PrintMonitor:
 
         progress = await self._adapter.get_print_progress()
         logger.info(f"Check #{self._state.check_count}: got progress")
+        self._update_first_layer_state(progress)
 
         progress_state = getattr(progress, "state", None)
         progress_state_name = progress_state.name if hasattr(progress_state, "name") else str(progress_state)
 
+        if progress_state_name in ("UNKNOWN", "None", ""):
+            if self._state.required is True:
+                await self._fail_closed("printer_progress_unknown")
+            return
         if progress_state_name not in ("PRINTING", "PAUSED"):
+            if self._state.check_count == 1 and self._state.required is True:
+                logger.info("Required monitor armed before printer start; waiting for printing state")
+                return
             if self._config.notify_on_completion:
                 await self._notify(
                     self.printer_id,
@@ -222,13 +347,23 @@ class PrintMonitor:
             logger.info(f"Check #{self._state.check_count}: printer paused, skipping check")
             return
 
-        progress_data = progress.data if hasattr(progress, "data") else {}
+        current_layer = getattr(progress, "current_layer", None)
+        if self._state.required is True and (
+            not isinstance(current_layer, int)
+            or isinstance(current_layer, bool)
+            or current_layer < 1
+        ):
+            await self._fail_closed("current_layer_unknown")
+            return
 
         logger.info(f"Check #{self._state.check_count}: capturing RTSP...")
         snapshot_b64 = await self._capture_rtsp()
         logger.info(f"Check #{self._state.check_count}: RTSP result: {'OK' if snapshot_b64 else 'FAILED'}")
         if snapshot_b64 is None:
             self._state.camera_failures += 1
+            if self._state.required is True:
+                await self._fail_closed("camera_unavailable")
+                return
             if self._config.notify_on_camera_failure and not self._state.camera_notified:
                 self._state.camera_notified = True
                 await self._notify(
@@ -269,10 +404,10 @@ class PrintMonitor:
                 self._analyze(snapshot_b64, context),
                 timeout=60,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"Check #{self._state.check_count}: LLM analysis timed out after 60s")
             result = AnalysisResult(
-                severity=MonitorSeverity.UNKNOWN,
+                severity=MonitorSeverity.WARNING,
                 anomaly_type="llm_timeout",
                 confidence=0.0,
                 printer_visible=True,
@@ -281,9 +416,21 @@ class PrintMonitor:
         logger.info(f"Check #{self._state.check_count}: analysis done: severity={result.severity.value} confidence={result.confidence} anomaly_type={result.anomaly_type} summary={result.summary[:100]}")
         self._state.last_analysis = result
 
+        if self._state.required is True and (
+            result.severity == MonitorSeverity.UNKNOWN
+            or result.anomaly_type in {"llm_timeout", "llm_error", "parse_error", "analysis_unknown"}
+        ):
+            await self._fail_closed("llm_analysis_unavailable")
+            return
+
         if not result.printer_visible and self._config.camera_search_enabled:
-            logger.info(f"Printer not visible, searching...")
+            logger.info("Printer not visible, searching...")
             result = await self._search_and_reanalyze(context)
+            self._state.last_analysis = result
+
+        if self._state.required is True and not result.printer_visible:
+            await self._fail_closed("camera_view_unknown")
+            return
 
         is_anom = self._is_anomaly(result)
         logger.info(f"Check #{self._state.check_count}: _is_anomaly={is_anom}")
@@ -349,7 +496,7 @@ class PrintMonitor:
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}")
             return AnalysisResult(
-                severity=MonitorSeverity.UNKNOWN,
+                severity=MonitorSeverity.WARNING,
                 anomaly_type="llm_error",
                 confidence=0.0,
                 printer_visible=False,
@@ -393,17 +540,35 @@ class PrintMonitor:
                         summary=text[:200],
                     )
                 return AnalysisResult(
-                    severity=MonitorSeverity.OK,
-                    anomaly_type=None,
-                    confidence=0.5,
-                    printer_visible=True,
-                    summary=text[:200],
+                    severity=MonitorSeverity.WARNING,
+                    anomaly_type="parse_error",
+                    confidence=1.0,
+                    printer_visible=False,
+                    summary=f"Could not parse monitor analysis: {text[:200]}",
                 )
 
+        try:
+            severity = MonitorSeverity(data.get("severity", "unknown"))
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return AnalysisResult(
+                severity=MonitorSeverity.WARNING,
+                anomaly_type="parse_error",
+                confidence=1.0,
+                printer_visible=False,
+                summary="Monitor analysis contained invalid severity or confidence",
+            )
+        anomaly_type = data.get("anomaly_type")
+        if severity == MonitorSeverity.UNKNOWN:
+            severity = MonitorSeverity.WARNING
+            anomaly_type = anomaly_type or "analysis_unknown"
+            confidence = max(confidence, 1.0)
+
         return AnalysisResult(
-            severity=MonitorSeverity(data.get("severity", "unknown")),
-            anomaly_type=data.get("anomaly_type"),
-            confidence=float(data.get("confidence", 0.0)),
+            severity=severity,
+            anomaly_type=anomaly_type,
+            confidence=confidence,
+
             printer_visible=bool(data.get("printer_visible", True)),
             summary=str(data.get("summary", "")),
             recommended_action=data.get("recommended_action"),
@@ -444,17 +609,14 @@ class PrintMonitor:
         )
 
     def _is_anomaly(self, result: AnalysisResult) -> bool:
-        if result.anomaly_type in ("llm_error", "llm_timeout", "parse_error", None):
-            return False
-        if result.severity == MonitorSeverity.CRITICAL:
+        if result.severity in (MonitorSeverity.WARNING, MonitorSeverity.CRITICAL, MonitorSeverity.UNKNOWN):
             return True
-        if result.severity == MonitorSeverity.WARNING and result.confidence >= 0.6:
+        if result.anomaly_type is not None:
             return True
         if not result.printer_visible:
             return True
-        if result.anomaly_type and "obstruct" in str(result.anomaly_type).lower():
-            return True
         return False
+
 
     async def _handle_anomaly(self, result: AnalysisResult) -> None:
         if self._state and self._state.anomaly_pending:
@@ -489,7 +651,7 @@ class PrintMonitor:
             )
             logger.info(f"Anomaly acknowledged by user for {self.printer_id}")
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         if not self._config.auto_pause_enabled:
