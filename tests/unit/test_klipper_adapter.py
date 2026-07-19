@@ -2,15 +2,16 @@
 Unit tests for Klipper/Moonraker adapter
 """
 
+from unittest.mock import AsyncMock, Mock, mock_open, patch
+
 import pytest
-from unittest.mock import Mock, AsyncMock, patch, mock_open
+
 from sensing_voxel.adapters.klipper import KlipperAdapter
 from sensing_voxel.core.models import (
-    NormalizedPrinterState,
+    AdapterCommandError,
     CommandResultStatus,
-    AdapterConnectionError,
+    NormalizedPrinterState,
 )
-import aiohttp
 
 
 class TestKlipperAdapter:
@@ -164,6 +165,109 @@ class TestKlipperAdapter:
 
             z_offset = await adapter.get_z_offset()
             assert z_offset == 0.5
+
+    @pytest.mark.asyncio
+    async def test_get_live_safety_snapshot_unwraps_moonraker_result_status(self, adapter):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = Mock(
+                status=CommandResultStatus.SUCCESS,
+                data={
+                    "result": {
+                        "status": {
+                            "configfile": {"settings": {"probe": {"z_offset": -1.25}}},
+                            "gcode_move": {"homing_origin": [0.0, 0.0, 0.0]},
+                        }
+                    }
+                },
+            )
+
+            snapshot = await adapter.get_live_safety_snapshot("printer-1")
+
+        assert snapshot.target_printer == "printer-1"
+        assert snapshot.probe_z_offset == -1.25
+        assert snapshot.homing_origin_z == 0.0
+        mock_request.assert_awaited_once_with(
+            "GET", "/printer/objects/query?configfile&gcode_move"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status",
+        [
+            {},
+            {"configfile": {}, "gcode_move": {"homing_origin": [0, 0, 0]}},
+            {
+                "configfile": {"settings": {}},
+                "gcode_move": {"homing_origin": [0, 0, 0]},
+            },
+            {
+                "configfile": {"settings": {"probe": {}}},
+                "gcode_move": {"homing_origin": [0, 0, 0]},
+            },
+            {
+                "configfile": {"settings": {"probe": {"z_offset": -1.25}}},
+                "gcode_move": {"homing_origin": [0, 0]},
+            },
+        ],
+    )
+    async def test_get_live_safety_snapshot_rejects_missing_or_ambiguous_values(
+        self, adapter, status
+    ):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = Mock(
+                status=CommandResultStatus.SUCCESS,
+                data={"status": status},
+            )
+
+            with pytest.raises(AdapterCommandError):
+                await adapter.get_live_safety_snapshot("printer-1")
+
+    @pytest.mark.asyncio
+    async def test_get_live_safety_snapshot_rejects_query_failure(self, adapter):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = Mock(
+                status=CommandResultStatus.FAILURE,
+                data=None,
+                message="offline",
+            )
+
+            with pytest.raises(AdapterCommandError, match="offline"):
+                await adapter.get_live_safety_snapshot("printer-1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("probe_z_offset", "homing_origin_z"),
+        [
+            (True, 0.0),
+            (-1.25, False),
+            ("not-a-number", 0.0),
+            (-1.25, "not-a-number"),
+            (float("nan"), 0.0),
+            (-1.25, float("inf")),
+        ],
+    )
+    async def test_get_live_safety_snapshot_rejects_invalid_numeric_values(
+        self, adapter, probe_z_offset, homing_origin_z
+    ):
+        with patch.object(adapter, "_rest_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = Mock(
+                status=CommandResultStatus.SUCCESS,
+                data={
+                    "result": {
+                        "status": {
+                            "configfile": {
+                                "settings": {"probe": {"z_offset": probe_z_offset}}
+                            },
+                            "gcode_move": {
+                                "homing_origin": [0.0, 0.0, homing_origin_z]
+                            },
+                        }
+                    }
+                },
+            )
+
+            with pytest.raises(AdapterCommandError):
+                await adapter.get_live_safety_snapshot("printer-1")
 
     @pytest.mark.asyncio
     async def test_set_z_offset(self, adapter):
@@ -446,7 +550,7 @@ class TestKlipperAdapter:
         mock_response_data = {
             "result": {
                 "system_info": {
-                    "hostname": "mkspi",
+                    "hostname": "printer-controller",
                     "cpu_info": {
                         "cpu_count": 4,
                         "processor": "aarch64",
@@ -454,10 +558,10 @@ class TestKlipperAdapter:
                     },
                     "network": {
                         "wlan0": {
-                            "mac_address": "54:78:c9:00:e7:08",
+                            "mac_address": "02:00:5e:10:00:01",
                             "ip_addresses": [
-                                {"family": "ipv4", "address": "192.168.68.86", "is_link_local": False},
-                                {"family": "ipv6", "address": "fe80::5678:c9ff:fe00:e708", "is_link_local": True},
+                                {"family": "ipv4", "address": "192.0.2.86", "is_link_local": False},
+                                {"family": "ipv6", "address": "2001:db8::86", "is_link_local": False},
                             ],
                         },
                         "lo": {
@@ -482,10 +586,10 @@ class TestKlipperAdapter:
 
             assert result.status == CommandResultStatus.SUCCESS
             data = result.data
-            assert data["mac_address"] == "54:78:c9:00:e7:08"
-            assert data["ip_address"] == "192.168.68.86"
+            assert data["mac_address"] == "02:00:5e:10:00:01"
+            assert data["ip_address"] == "192.0.2.86"
             assert data["network_interface"] == "wlan0"
-            assert data["hostname"] == "mkspi"
+            assert data["hostname"] == "printer-controller"
             assert data["cpu_count"] == 4
             assert data["processor"] == "aarch64"
 
@@ -503,9 +607,9 @@ class TestKlipperAdapter:
                             ],
                         },
                         "eth0": {
-                            "mac_address": "2c:cf:67:6a:c7:c0",
+                            "mac_address": "02:00:5e:10:00:02",
                             "ip_addresses": [
-                                {"family": "ipv4", "address": "192.168.68.127", "is_link_local": False},
+                                {"family": "ipv4", "address": "192.0.2.127", "is_link_local": False},
                             ],
                         },
                     },
@@ -523,7 +627,7 @@ class TestKlipperAdapter:
             result = await adapter.get_hardware_info()
 
             assert result.status == CommandResultStatus.SUCCESS
-            assert result.data["mac_address"] == "2c:cf:67:6a:c7:c0"
+            assert result.data["mac_address"] == "02:00:5e:10:00:02"
             assert result.data["network_interface"] == "eth0"
 
     @pytest.mark.asyncio

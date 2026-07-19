@@ -4,6 +4,7 @@ Abstract base class for printer adapters
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from sensing_voxel.core.models import (
     AdapterCommandError,
@@ -12,6 +13,15 @@ from sensing_voxel.core.models import (
     PrintProgress,
     TelemetryData,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSafetySnapshot:
+    """Normalized, trusted live values required by the print-start gate."""
+
+    target_printer: str
+    probe_z_offset: float | None
+    homing_origin_z: float | None
 
 
 class PrinterAdapter(ABC):
@@ -173,6 +183,14 @@ class PrinterAdapter(ABC):
     async def get_current_position(self) -> dict[str, float] | None:
         """Get current toolhead/nozzle position if available."""
         pass
+
+    async def get_live_safety_snapshot(self, target_printer: str) -> LiveSafetySnapshot:
+        """Query trusted live Z/probe safety values for the selected printer.
+
+        Adapters must override this method to opt in. The default deliberately
+        fails closed so an unsupported backend can never start a print.
+        """
+        raise NotSupportedError("Live print safety snapshot is not supported")
 
     @abstractmethod
     async def is_connected(self) -> bool:

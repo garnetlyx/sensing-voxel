@@ -14,16 +14,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-
-def _normalize_filename(filename: str) -> str:
-    """Replace spaces and special characters with dashes to avoid Moonraker path issues."""
-    import os
-    import re
-    name, ext = os.path.splitext(filename)
-    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")
-    return f"{name}{ext}"
-
-from sensing_voxel.adapters.base import PrinterAdapter
+from sensing_voxel.adapters.base import LiveSafetySnapshot, PrinterAdapter
 from sensing_voxel.core.models import (
     AdapterCommandError,
     AdapterConnectionError,
@@ -35,6 +26,15 @@ from sensing_voxel.core.models import (
 )
 from sensing_voxel.infra.gcode import _strip_gcode_comment, validate_gcode_command
 from sensing_voxel.infra.retry import BackoffPolicy
+
+
+def _normalize_filename(filename: str) -> str:
+    """Replace spaces and special characters with dashes to avoid Moonraker path issues."""
+    import os
+    import re
+    name, ext = os.path.splitext(filename)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")
+    return f"{name}{ext}"
 
 logger = logging.getLogger(__name__)
 
@@ -1075,6 +1075,60 @@ class KlipperAdapter(PrinterAdapter):
             "y": float(position[1]),
             "z": float(position[2]),
         }
+
+    async def get_live_safety_snapshot(self, target_printer: str) -> LiveSafetySnapshot:
+        """Fetch probe and G-code-origin state in one fresh Moonraker query."""
+        result = await self._rest_request(
+            "GET", "/printer/objects/query?configfile&gcode_move"
+        )
+        if result.status is not CommandResultStatus.SUCCESS or not result.data:
+            raise AdapterCommandError(
+                result.message or "Failed to query live print safety snapshot"
+            )
+
+        data = result.data
+        payload = data.get("result", data)
+        if not isinstance(payload, dict):
+            raise AdapterCommandError("Moonraker safety response has an invalid result")
+        status = payload.get("status")
+        if not isinstance(status, dict):
+            raise AdapterCommandError("Moonraker safety response is missing result.status")
+
+        configfile = status.get("configfile")
+        gcode_move = status.get("gcode_move")
+        if not isinstance(configfile, dict) or not isinstance(gcode_move, dict):
+            raise AdapterCommandError("Moonraker safety response is missing required objects")
+
+        settings = configfile.get("settings")
+        homing_origin = gcode_move.get("homing_origin")
+        if not isinstance(settings, dict) or not isinstance(homing_origin, (list, tuple)):
+            raise AdapterCommandError("Moonraker safety response has ambiguous required values")
+        if len(homing_origin) != 3:
+            raise AdapterCommandError("Moonraker homing_origin is ambiguous")
+
+        probe_settings = settings.get("probe")
+        if not isinstance(probe_settings, dict):
+            raise AdapterCommandError("Moonraker probe settings are missing")
+
+        probe_z_offset = self._finite_float(probe_settings.get("z_offset"), "probe z_offset")
+        homing_origin_z = self._finite_float(homing_origin[2], "homing_origin Z")
+        return LiveSafetySnapshot(
+            target_printer=target_printer,
+            probe_z_offset=probe_z_offset,
+            homing_origin_z=homing_origin_z,
+        )
+
+    @staticmethod
+    def _finite_float(value: object, label: str) -> float:
+        if isinstance(value, bool):
+            raise AdapterCommandError(f"Moonraker {label} is ambiguous")
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise AdapterCommandError(f"Moonraker {label} is missing or invalid") from exc
+        if not math.isfinite(normalized):
+            raise AdapterCommandError(f"Moonraker {label} is not finite")
+        return normalized
 
     async def is_connected(self) -> bool:
         return self._connected and self._session is not None
