@@ -21,7 +21,7 @@ src/sensing_voxel/
   core/         - State machine, decision engine, persistence, data models
   safety/       - Validation, preview, authorization, and execution barriers
   adapters/     - Printer adapters (klipper.py, bambu.py, base.py)
-  bot/          - Telegram bot (telegram.py, auth.py, decisions.py)
+  bot/          - Telegram bot interface (telegram.py)
   api/          - Web dashboard REST/WebSocket API
   llm/          - LLM chat with tool use (50 tools incl. web_search, print monitor, printer memo)
   camera/       - PTZ camera control (Tapo ONVIF)
@@ -96,7 +96,7 @@ See `README.md` for current runtime status and `.project/TODO.md` for the action
 
 - **Reported default test baseline**: 719 passed / 18 skipped / 3 xfailed. This count was supplied for the documentation refresh; no persisted local pytest result artifact independently confirms it. Rerun `pytest` for current evidence.
 - **Current monitoring path**: `PrintMonitor` performs background camera checks with multimodal LLM anomaly assessment; deleted first-layer correction and legacy monitoring modules are historical only.
-- **Remaining wiring work**: `SlicerPipeline` needs PrusaSlicer CLI availability and Telegram model-upload flow integration. Runtime storage, including `JobRepository`, is already composed.
+- **Remaining wiring work**: Telegram model-upload handling exists but is not composed into the runtime. `SlicerPipeline` already detects available PrusaSlicer or OrcaSlicer CLIs. Runtime storage, including `JobRepository`, is already composed.
 - **`llm/tools.py` is large** — split it only as a dedicated, behavior-preserving refactor before adding substantial tool surface.
 - **Emergency cancel** uses a dedicated session; references to shared-session behavior are historical.
 

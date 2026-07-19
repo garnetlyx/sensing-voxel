@@ -342,7 +342,6 @@ class KlipperAdapter(PrinterAdapter):
 
     def _handle_gcode_output(self, params: dict):
         """Handle G-code output notification from Klipper"""
-        # TODO: parse LAYER_CHANGE markers for monitoring orchestrator (ARCHITECTURE.md §4.8)
         message = params.get("message", "")
         if message:
             logger.debug(f"G-code output: {message}")
