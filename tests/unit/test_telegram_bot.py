@@ -315,8 +315,9 @@ class TestTelegramBotFileUpload:
         assert "Homing Z: `0 mm`" in approval_text
 
     @pytest.mark.asyncio
-    async def test_accept_stl_extension(self):
-        """Test that .stl extension passes the extension check"""
+    @pytest.mark.parametrize("ext", [".stl", ".step", ".stp", ".3mf"])
+    async def test_reject_model_upload_when_slicing_unavailable(self, ext):
+        """Model files fail closed before download or job mutation."""
         state_machine = AgentStateMachine()
         bot = TelegramBot(
             token="test_token",
@@ -330,16 +331,50 @@ class TestTelegramBotFileUpload:
         update.effective_chat.id = 99
         update.message = Mock()
         update.message.document = Mock()
-        update.message.document.file_name = "model.stl"
+        update.message.document.file_name = f"model{ext}"
         update.message.document.file_size = 1024
+        update.message.document.get_file = AsyncMock()
         update.message.reply_text = AsyncMock()
-
-        state_machine.current_state = AgentState.MONITORING
 
         await bot._handle_file_upload(update, None)
 
-        calls = update.message.reply_text.call_args_list
-        assert any("Processing" in str(c) or "STL" in str(c) for c in calls)
+        update.message.document.get_file.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once()
+        call_text = update.message.reply_text.await_args.args[0]
+        assert "slicing is currently unavailable" in call_text
+        assert "pre-sliced G-code" in call_text
+        assert "Processing" not in call_text
+        assert "Starting" not in call_text
+        assert state_machine.current_state is AgentState.IDLE
+        assert state_machine.job_context is None
+
+    @pytest.mark.asyncio
+    async def test_busy_check_precedes_model_slicing_rejection(self):
+        state_machine = AgentStateMachine()
+        state_machine.current_state = AgentState.MONITORING
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+        )
+        update = Mock()
+        update.effective_user.id = 12345
+        update.message = Mock()
+        update.message.document = Mock()
+        update.message.document.file_name = "model.stl"
+        update.message.document.file_size = 1024
+        update.message.document.get_file = AsyncMock()
+        update.message.reply_text = AsyncMock()
+
+        await bot._handle_file_upload(update, None)
+
+        update.message.document.get_file.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once()
+        call_text = update.message.reply_text.await_args.args[0]
+        assert "Agent is busy" in call_text
+        assert "slicing" not in call_text.lower()
+        assert state_machine.current_state is AgentState.MONITORING
+        assert state_machine.job_context is None
 
     @pytest.mark.asyncio
     async def test_reject_oversized_stl_files(self):
@@ -361,11 +396,10 @@ class TestTelegramBotFileUpload:
 
         await bot._handle_file_upload(update, None)
 
-        # First call is "Processing", second is the size rejection
-        calls = update.message.reply_text.call_args_list
-        size_call = calls[-1]
-        call_text = size_call[0][0]
+        update.message.reply_text.assert_awaited_once()
+        call_text = update.message.reply_text.await_args.args[0]
         assert "too large" in call_text.lower()
+        update.message.document.get_file.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reject_oversized_gcode_files(self):

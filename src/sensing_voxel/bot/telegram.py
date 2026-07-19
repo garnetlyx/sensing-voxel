@@ -51,7 +51,7 @@ from sensing_voxel.llm.chat import ChatManager
 from sensing_voxel.llm.runtime import ChatRequestContext
 from sensing_voxel.safety.models import PrintRequest
 from sensing_voxel.safety.service import PrintSafetyService
-from sensing_voxel.slicer import FileFormatValidator, GcodeMetadataExtractor
+from sensing_voxel.slicer import GcodeMetadataExtractor
 
 # --- Error Classification ---
 
@@ -279,7 +279,6 @@ class TelegramBot:
             return
 
         is_gcode = ext in self.GCODE_EXTENSIONS
-        is_step_3mf = ext in self.STEP_EXTENSIONS or ext in self.THREE_MF_EXTENSIONS
         max_size = 200 * 1024 * 1024 if is_gcode else 100 * 1024 * 1024
 
         # Check file size
@@ -288,17 +287,23 @@ class TelegramBot:
             await update.message.reply_text(f"File too large (max {limit_mb}MB)")
             return
 
-        file_type = "G-code" if is_gcode else ("STEP/3MF" if is_step_3mf else "STL")
-        await update.message.reply_text(f"Processing your {file_type} file...")
-
-        # Store chat ID for future notifications
-        self._chat_id = update.effective_chat.id
+        if is_gcode:
+            await update.message.reply_text("Processing your G-code file...")
+            # Store chat ID for future notifications
+            self._chat_id = update.effective_chat.id
 
         # Check if we're already in a job
         if self.state_machine.current_state != AgentState.IDLE:
             await update.message.reply_text(
                 f"Agent is busy in state {self.state_machine.current_state.name}. "
                 "Please wait or cancel current job first."
+            )
+            return
+
+        if not is_gcode:
+            await update.message.reply_text(
+                "Model slicing is currently unavailable. Please upload pre-sliced "
+                "G-code (.gcode, .g, or .gco)."
             )
             return
 
@@ -321,65 +326,11 @@ class TelegramBot:
                 return
 
             await file.download_to_drive(str(staged_path))
-
-            # Validate STEP/3MF format before proceeding
-            if is_step_3mf:
-                validator = FileFormatValidator()
-                detected = validator.detect_format(staged_path)
-                if not detected:
-                    await update.message.reply_text(
-                        "Invalid file format. Could not validate as STEP or 3MF."
-                    )
-                    staged_path.unlink(missing_ok=True)
-                    return
-
-                await self._handle_model_upload(
-                    update, document, staged_path, job_id, is_converted=True
-                )
-            elif is_gcode:
-                await self._handle_gcode_upload(update, document, staged_path, job_id)
-            else:
-                await self._handle_model_upload(update, document, staged_path, job_id)
+            await self._handle_gcode_upload(update, document, staged_path, job_id)
 
         except Exception as e:
             logger.error(f"Error processing file upload: {e}", exc_info=True)
             await update.message.reply_text(f"Error processing file: {str(e)}")
-
-    async def _handle_model_upload(self, update, document, model_path, job_id, is_converted=False):
-        """Handle model file upload (STL, STEP, 3MF) — enters slicing pipeline"""
-        job_context = JobContext(
-            job_id=job_id,
-            job_file=str(model_path),
-            uploaded_at=datetime.now(),
-            decision_token=generate_decision_token(),
-            file_validation_status=FileValidationStatus.VALID,
-            is_external=False,
-            external_monitoring=False,
-            metadata={
-                "is_converted": is_converted,
-                "telegram_user_id": update.effective_user.id,
-                "telegram_chat_id": self._update_chat_id(update),
-            },
-        )
-
-        self.state_machine.job_context = job_context
-        success = await self.state_machine.transition_to(
-            AgentState.RECEIVING, persistence=self.persistence
-        )
-
-        if success:
-            extra_msg = " (will be converted to STL)" if is_converted else ""
-            await update.message.reply_text(
-                f"File received: {document.file_name}{extra_msg}\n"
-                f"Job ID: `{job_id}`\n\n"
-                "Starting slicing pipeline..."
-            )
-        else:
-            await update.message.reply_text("Failed to start job. Please try again.")
-
-    async def _handle_stl_upload(self, update, document, stl_path, job_id):
-        """Handle STL file upload — enters slicing pipeline"""
-        await self._handle_model_upload(update, document, stl_path, job_id)
 
     async def _handle_gcode_upload(self, update, document, gcode_path, job_id):
         """Validate uploaded G-code and present its immutable safety preview for approval."""
