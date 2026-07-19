@@ -5,9 +5,8 @@ Configuration management for Sensing Voxel
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from pathlib import Path
-from typing import Any
 
 
 class LlmProvider(Enum):
@@ -39,13 +38,15 @@ class KlipperConfig:
     host: str = "localhost"
     port: int = 7125
     api_key: str | None = None
-    base_url: str | None = None  # Override host:port (e.g. "http://printer.example")
+    base_url: str | None = None  # Override host:port (e.g. "http://printer.example.test")
     ws_reconnect_max_attempts: int = 10
     ws_reconnect_base_delay: float = 1.0
     ws_reconnect_max_delay: float = 30.0
     ws_reconnect_factor: float = 1.8
     ws_reconnect_jitter: float = 0.25
     compatibility_mode: bool = False  # For Elegoo/Neptune modified payloads
+    build_plate_surface: str | None = None
+    hotend_nozzle_size_mm: float | None = None
 
 
 @dataclass
@@ -64,6 +65,8 @@ class BambuConfig:
     mqtt_reconnect_max_attempts: int = 10
     mqtt_reconnect_base_delay: float = 1.0
     mqtt_reconnect_max_delay: float = 30.0
+    build_plate_surface: str | None = None
+    hotend_nozzle_size_mm: float | None = None
 
 
 @dataclass
@@ -147,9 +150,15 @@ class DashboardConfig:
     """Web dashboard configuration"""
 
     enabled: bool = False
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8080
-    api_token: str | None = None  # None = no auth (dev mode)
+    api_token: str | None = None
+    allowed_origins: list[str] = field(default_factory=list)
+    upload_dir: str = "data/uploads"
+    max_upload_bytes: int = 100 * 1024 * 1024
+    allowed_upload_extensions: list[str] = field(
+        default_factory=lambda: [".gcode", ".3mf", ".stl", ".step", ".stp"]
+    )
     camera_rtsp_url: str | None = None
     camera_mjpeg_fps: int = 5
     camera_mjpeg_quality: int = 80
@@ -157,12 +166,13 @@ class DashboardConfig:
 
 @dataclass
 class ShellToolConfig:
-    """LLM bash execution tool configuration."""
+    """Configuration for classified local system tools."""
 
     enabled: bool = False
     cwd: str = "/app"
     timeout_seconds: float = 10.0
     max_output_chars: int = 8000
+    allow_printer_config_updates: bool = False
 
 
 @dataclass
@@ -201,6 +211,7 @@ class LlmConfig:
 class PrintMonitorConfig:
     """Background print monitoring configuration"""
     enabled: bool = False
+    required: bool = False
     check_interval_seconds: float = 1800.0
     anomaly_response_timeout_seconds: float = 300.0
     llm_max_tokens: int = 800
