@@ -69,6 +69,7 @@ services:
     restart: unless-stopped
     environment:
       - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
     volumes:
       - ./config/searxng:/etc/searxng
       - searxng-data:/var/cache/searxng

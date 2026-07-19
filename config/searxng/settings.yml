@@ -13,4 +13,5 @@ server:
   method: "GET"
   limiter: false
   public_instance: false
-  secret_key: "replace-with-random-secret"
+  # The official container replaces this sentinel with SEARXNG_SECRET at startup.
+  secret_key: "ultrasecretkey"
