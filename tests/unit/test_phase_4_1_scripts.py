@@ -56,7 +56,7 @@ class TestHardwareVerifier:
                     {"name": "test_printer", "host": "localhost", "port": 80, "status": "ok"}
                 ],
             },
-            "camera": {"status": "ok", "host": "192.168.1.1", "port": 2020},
+            "camera": {"status": "ok", "host": "192.0.2.20", "port": 2020},
             "llm_proxy": {"status": "ok", "url": LLM_PROXY_URL},
         }
 
@@ -133,7 +133,7 @@ class TestPrintMonitor:
         snapshot_dir = tmp_path / "snapshots"
 
         return PrintMonitor(
-            printer_host="printer.example",
+            printer_host="192.0.2.10",
             printer_port=80,
             camera_url=None,
             log_file=str(log_file),
@@ -144,7 +144,7 @@ class TestPrintMonitor:
 
     def test_init(self, monitor, tmp_path):
         """Test monitor initialization."""
-        assert monitor.printer_host == "printer.example"
+        assert monitor.printer_host == "192.0.2.10"
         assert monitor.printer_port == 80
         assert monitor.camera_url is None
         assert str(monitor.log_file).endswith("telemetry.jsonl")
@@ -239,19 +239,19 @@ class TestScriptHelpers:
         """Test default printers configuration."""
         assert len(DEFAULT_PRINTERS) == 2
 
-        neptune = DEFAULT_PRINTERS[0]
-        assert neptune["name"] == "neptune_4_max"
-        assert neptune["host"] == "printer.example"
-        assert neptune["port"] == 80
+        printer_1 = DEFAULT_PRINTERS[0]
+        assert printer_1["name"] == "printer_1"
+        assert printer_1["host"] == "192.0.2.10"
+        assert printer_1["port"] == 80
 
-        ender = DEFAULT_PRINTERS[1]
-        assert ender["name"] == "ender_3"
-        assert ender["host"] == "printer.example"
-        assert ender["port"] == 80
+        printer_2 = DEFAULT_PRINTERS[1]
+        assert printer_2["name"] == "printer_2"
+        assert printer_2["host"] == "192.0.2.11"
+        assert printer_2["port"] == 80
 
     def test_llm_proxy_url(self):
         """Test LLM proxy URL constant."""
-        assert LLM_PROXY_URL == "https://api.minimaxi.com/v1/models"
+        assert LLM_PROXY_URL == "https://llm.example.com/v1/models"
         assert LLM_PROXY_URL.startswith("https://")
 
 

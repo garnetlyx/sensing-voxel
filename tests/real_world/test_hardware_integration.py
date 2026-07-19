@@ -333,8 +333,11 @@ async def test_application_startup_connects_services(
     )
 
     required_markers = [
-        "Connected to Moonraker at printer.example:80",
-        "Connected to Moonraker at printer.example:80",
+        *[
+            f"Connected to Moonraker at {printer.host}:{printer.port}"
+            for printer in loaded_config.printers
+            if isinstance(printer, KlipperConfig)
+        ],
         "Tapo camera connected via ONVIF",
         "LLM initialized:",
         "Telegram bot started",

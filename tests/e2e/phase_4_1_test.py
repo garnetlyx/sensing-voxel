@@ -5,7 +5,7 @@ End-to-end test that exercises the complete Sensing Voxel stack:
 1. Hardware verification (printers, camera, LLM proxy)
 2. LLM-based bed leveling via tool calls
 3. Camera PTZ movement to identify printers
-4. G-code upload to Ender 3
+4. G-code upload to example printer 2
 5. Print start and monitoring
 6. Report generation
 
@@ -39,18 +39,18 @@ from sensing_voxel.llm.client import AnthropicClient
 logger = logging.getLogger(__name__)
 
 DEFAULT_PRINTERS = {
-    "neptune_4_max": {"host": "printer.example", "port": 80},
-    "ender_3": {"host": "printer.example", "port": 80},
+    "printer_1": {"host": "192.0.2.10", "port": 80},
+    "printer_2": {"host": "192.0.2.11", "port": 80},
 }
 
 CAMERA_DEFAULTS = {
-    "host": "192.168.1.100",
-    "user": "admin",
-    "password": "admin",
+    "host": "192.0.2.20",
+    "user": "camera-user",
+    "password": "camera-password",
     "onvif_port": 2020,
 }
 
-LLM_PROXY_URL = "https://api.minimaxi.com/v1"
+LLM_PROXY_URL = "https://llm.example.com/v1"
 
 SIMPLE_GCODE = """; Simple test cube G-code
 ; Generated for Phase 4.1 E2E test
@@ -133,14 +133,14 @@ async def test_report():
 
 @pytest.fixture(scope="module")
 async def llm_client():
-    api_key = os.getenv("MINIMAX_API_KEY")
+    api_key = os.getenv("SVA_TEST_LLM_API_KEY")
     if not api_key:
-        pytest.skip("MINIMAX_API_KEY not set")
+        pytest.skip("SVA_TEST_LLM_API_KEY not set")
 
     config = LlmConfig(
         api_key=api_key,
         base_url=LLM_PROXY_URL,
-        model="claude-sonnet-4-20250514",
+        model=os.getenv("SVA_TEST_LLM_MODEL", "example-model"),
         max_tokens=2048,
         temperature=0.7,
     )
@@ -151,8 +151,8 @@ async def llm_client():
 
 
 @pytest.fixture(scope="module")
-async def neptune_adapter():
-    cfg = DEFAULT_PRINTERS["neptune_4_max"]
+async def printer_1_adapter():
+    cfg = DEFAULT_PRINTERS["printer_1"]
     adapter = KlipperAdapter(host=cfg["host"], port=cfg["port"])
     await adapter.connect()
     yield adapter
@@ -160,8 +160,8 @@ async def neptune_adapter():
 
 
 @pytest.fixture(scope="module")
-async def ender_adapter():
-    cfg = DEFAULT_PRINTERS["ender_3"]
+async def printer_2_adapter():
+    cfg = DEFAULT_PRINTERS["printer_2"]
     adapter = KlipperAdapter(host=cfg["host"], port=cfg["port"])
     await adapter.connect()
     yield adapter
@@ -184,15 +184,15 @@ class TestPhase41Hardware:
     """Test hardware connectivity."""
 
     @pytest.mark.asyncio
-    async def test_neptune_4_max_connectivity(self, neptune_adapter):
-        result = await neptune_adapter._rest_request("GET", "/server/info")
-        assert result.status.value == "success", f"Neptune 4 Max unreachable: {result.message}"
+    async def test_printer_1_connectivity(self, printer_1_adapter):
+        result = await printer_1_adapter._rest_request("GET", "/server/info")
+        assert result.status.value == "success", f"Example printer 1 unreachable: {result.message}"
         assert "klipper_version" in result.data
 
     @pytest.mark.asyncio
-    async def test_ender_3_connectivity(self, ender_adapter):
-        result = await ender_adapter._rest_request("GET", "/server/info")
-        assert result.status.value == "success", f"Ender 3 unreachable: {result.message}"
+    async def test_printer_2_connectivity(self, printer_2_adapter):
+        result = await printer_2_adapter._rest_request("GET", "/server/info")
+        assert result.status.value == "success", f"Example printer 2 unreachable: {result.message}"
         assert "klipper_version" in result.data
 
     @pytest.mark.asyncio
@@ -213,7 +213,7 @@ class TestPhase41LLMIntegration:
     """Test LLM tool integration for printer control."""
 
     @pytest.mark.asyncio
-    async def test_llm_bed_leveling(self, llm_client, neptune_adapter, test_report):
+    async def test_llm_bed_leveling(self, llm_client, printer_1_adapter, test_report):
         test_report.start_step("llm_bed_leveling")
 
         system_prompt = """You are a 3D printer assistant. Use the available tools to help with printer operations.
@@ -227,7 +227,7 @@ Respond with tool calls to execute actions."""
         messages = [
             {
                 "role": "user",
-                "content": "Home all axes on the Neptune 4 Max and then run a bed leveling sequence. Use G28 to home, then use BED_MESH_CALIBRATE if available.",
+                "content": "Home all axes on example printer 1 and then run a bed leveling sequence. Use G28 to home, then use BED_MESH_CALIBRATE if available.",
             }
         ]
 
@@ -298,15 +298,15 @@ class TestPhase41PrintWorkflow:
     """Test complete print workflow."""
 
     @pytest.mark.asyncio
-    async def test_upload_gcode_to_ender(self, ender_adapter, test_report):
-        test_report.start_step("upload_gcode_to_ender")
+    async def test_upload_gcode_to_printer_2(self, printer_2_adapter, test_report):
+        test_report.start_step("upload_gcode_to_printer_2")
 
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".gcode", delete=False) as f:
                 f.write(SIMPLE_GCODE)
                 temp_path = f.name
 
-            result = await ender_adapter.upload_file(temp_path, "phase41_test_cube.gcode")
+            result = await printer_2_adapter.upload_file(temp_path, "phase41_test_cube.gcode")
             os.unlink(temp_path)
 
             test_report.end_step(
@@ -321,14 +321,14 @@ class TestPhase41PrintWorkflow:
             raise
 
     @pytest.mark.asyncio
-    async def test_start_print_monitoring(self, ender_adapter, test_report):
+    async def test_start_print_monitoring(self, printer_2_adapter, test_report):
         test_report.start_step("start_print_monitoring")
 
         try:
-            result = await ender_adapter.start_print("phase41_test_cube.gcode")
+            result = await printer_2_adapter.start_print("phase41_test_cube.gcode")
             assert result.status.value == "success", f"Failed to start print: {result.message}"
 
-            progress = await ender_adapter.get_print_progress()
+            progress = await printer_2_adapter.get_print_progress()
             assert progress.state == NormalizedPrinterState.PRINTING
 
             poll_count = 0
@@ -336,7 +336,7 @@ class TestPhase41PrintWorkflow:
 
             while poll_count < max_polls:
                 await asyncio.sleep(5)
-                progress = await ender_adapter.get_print_progress()
+                progress = await printer_2_adapter.get_print_progress()
                 poll_count += 1
 
                 if progress.progress:
