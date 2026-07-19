@@ -216,8 +216,28 @@ class TestChatManagerToolUse:
         )
 
         tool_names = {tool["name"] for tool in manager._tools}
-        assert "run_bash" in tool_names
+        assert "run_bash" not in tool_names
+        assert "run_shell" in tool_names
+        assert "update_printer_config" not in tool_names
         assert "web_search" in tool_names
+
+    def test_exposes_printer_config_update_only_with_explicit_opt_in(
+        self, mock_tool_client, mock_context_collector
+    ):
+        manager = ChatManager(
+            client=mock_tool_client,
+            context_collector=mock_context_collector,
+            adapter=MagicMock(),
+            shell=ShellToolConfig(
+                enabled=True,
+                allow_printer_config_updates=True,
+            ),
+            max_turns=20,
+        )
+
+        tool_names = {tool["name"] for tool in manager._tools}
+        assert "update_printer_config" in tool_names
+        assert "run_bash" not in tool_names
 
     async def test_tool_use_single_round(self, chat_manager_with_tools, mock_tool_client, mock_tool_executor):
         """LLM calls a tool, gets the result, then produces a final text response."""
@@ -297,9 +317,9 @@ class TestChatManagerToolUse:
         tool_use_block = MagicMock()
         tool_use_block.type = "tool_use"
         tool_use_block.id = "toolu_01"
-        tool_use_block.name = "run_bash"
+        tool_use_block.name = "run_shell"
         tool_use_block.input = {
-            "cmd": ["echo", "hello"],
+            "command": "echo hello",
             "password": "super-secret",
         }
         tool_response.content = [tool_use_block]
@@ -330,10 +350,10 @@ class TestChatManagerToolUse:
 
         assert result == "Done."
         assert len(progress) == 2
-        assert progress[0].startswith("🔧 Tool use: run_bash")
+        assert progress[0].startswith("🔧 Tool use: run_shell")
         assert '"password": "<redacted>"' in progress[0]
         assert "super-secret" not in "\n".join(progress)
-        assert progress[1].startswith("✅ Tool result: run_bash")
+        assert progress[1].startswith("✅ Tool result: run_shell")
         assert '"token": "<redacted>"' in progress[1]
         assert "abc123" not in "\n".join(progress)
 

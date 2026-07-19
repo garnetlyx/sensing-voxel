@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import secrets
 import shlex
-import asyncio
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+import threading
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -65,26 +68,63 @@ class ToolAuditLogger:
         return [json.loads(line) for line in recent]
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class PendingApproval:
-    """A high-risk action waiting for explicit approval."""
+    """An immutable high-risk action waiting for explicit approval."""
 
     approval_token: str
     logical_user_id: str
     channel: str
     tool_name: str
-    payload: dict[str, Any]
+    payload_json: str
     reason: str
     created_at: str
+    expires_at: str
     status: str = "pending"
     approved_at: str | None = None
+    consumed_at: str | None = None
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        payload = json.loads(self.payload_json)
+        if not isinstance(payload, dict):
+            raise ValueError("Approval payload must be an object")
+        return payload
 
 
 class PendingApprovalStore:
-    """In-memory registry for approval-gated actions."""
+    """Thread-safe registry for expiring, exactly-bound approval actions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 300,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("Approval TTL must be positive")
         self._records: dict[str, PendingApproval] = {}
+        self._ttl = timedelta(seconds=ttl_seconds)
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _serialize_payload(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _now(self) -> datetime:
+        now = self._clock()
+        return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+
+    @staticmethod
+    def _parse_timestamp(timestamp: str) -> datetime:
+        parsed = datetime.fromisoformat(timestamp)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+    def _expire_locked(self, record: PendingApproval, now: datetime) -> PendingApproval:
+        if record.status in {"pending", "approved"} and now >= self._parse_timestamp(record.expires_at):
+            record = replace(record, status="expired")
+            self._records[record.approval_token] = record
+        return record
 
     def create(
         self,
@@ -94,35 +134,105 @@ class PendingApprovalStore:
         payload: dict[str, Any],
         reason: str,
     ) -> PendingApproval:
-        token = uuid4().hex[:12]
+        now = self._now()
+        token = secrets.token_urlsafe(32)
         record = PendingApproval(
             approval_token=token,
             logical_user_id=logical_user_id,
             channel=channel,
             tool_name=tool_name,
-            payload=payload,
+            payload_json=self._serialize_payload(payload),
             reason=reason,
-            created_at=datetime.now().isoformat(),
+            created_at=now.isoformat(),
+            expires_at=(now + self._ttl).isoformat(),
         )
-        self._records[token] = record
+        with self._lock:
+            while token in self._records:
+                token = secrets.token_urlsafe(32)
+                record = replace(record, approval_token=token)
+            self._records[token] = record
         return record
 
     def approve(
         self,
         token: str,
         logical_user_id: str,
+        channel: str,
         tool_name: str,
     ) -> PendingApproval | None:
-        record = self._records.get(token)
-        if record is None:
-            return None
-        if record.logical_user_id != logical_user_id or record.tool_name != tool_name:
-            return None
-        if record.status != "pending":
-            return None
-        record.status = "approved"
-        record.approved_at = datetime.now().isoformat()
-        return record
+        now = self._now()
+        with self._lock:
+            record = self._records.get(token)
+            if record is None:
+                return None
+            record = self._expire_locked(record, now)
+            if (
+                record.logical_user_id != logical_user_id
+                or record.channel != channel
+                or record.tool_name != tool_name
+                or record.status != "pending"
+            ):
+                return None
+            approved = replace(record, status="approved", approved_at=now.isoformat())
+            self._records[token] = approved
+            return approved
+
+    def consume(
+        self,
+        token: str,
+        logical_user_id: str,
+        channel: str,
+        tool_name: str,
+    ) -> PendingApproval | None:
+        now = self._now()
+        with self._lock:
+            record = self._records.get(token)
+            if record is None:
+                return None
+            record = self._expire_locked(record, now)
+            if (
+                record.logical_user_id != logical_user_id
+                or record.channel != channel
+                or record.tool_name != tool_name
+                or record.status != "approved"
+            ):
+                return None
+            consumed = replace(record, status="consumed", consumed_at=now.isoformat())
+            self._records[token] = consumed
+            return consumed
+
+    def reject(
+        self,
+        token: str,
+        logical_user_id: str,
+        channel: str,
+        tool_name: str,
+    ) -> PendingApproval | None:
+        now = self._now()
+        with self._lock:
+            record = self._records.get(token)
+            if record is None:
+                return None
+            record = self._expire_locked(record, now)
+            if (
+                record.logical_user_id != logical_user_id
+                or record.channel != channel
+                or record.tool_name != tool_name
+                or record.status != "pending"
+            ):
+                return None
+            rejected = replace(record, status="rejected")
+            self._records[token] = rejected
+            return rejected
+
+    def get(self, token: str) -> PendingApproval | None:
+        """Return the current immutable record, applying expiry first."""
+        now = self._now()
+        with self._lock:
+            record = self._records.get(token)
+            if record is None:
+                return None
+            return self._expire_locked(record, now)
 
     def tail(
         self,
@@ -130,13 +240,30 @@ class PendingApprovalStore:
         limit: int = 20,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        records = list(self._records.values())
+        now = self._now()
+        with self._lock:
+            records = [self._expire_locked(record, now) for record in self._records.values()]
         if logical_user_id is not None:
             records = [record for record in records if record.logical_user_id == logical_user_id]
         if status is not None:
             records = [record for record in records if record.status == status]
         records.sort(key=lambda record: record.created_at)
-        return [asdict(record) for record in records[-limit:]]
+        return [
+            {
+                "approval_token": record.approval_token,
+                "logical_user_id": record.logical_user_id,
+                "channel": record.channel,
+                "tool_name": record.tool_name,
+                "payload": record.payload,
+                "reason": record.reason,
+                "created_at": record.created_at,
+                "expires_at": record.expires_at,
+                "status": record.status,
+                "approved_at": record.approved_at,
+                "consumed_at": record.consumed_at,
+            }
+            for record in records[-limit:]
+        ]
 
 
 @dataclass(slots=True)

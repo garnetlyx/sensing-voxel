@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from sensing_voxel.adapters.base import PrinterAdapter
+from sensing_voxel.config import SlicerConfig
 from sensing_voxel.llm.client import LlmClient
 from sensing_voxel.llm.context import PrinterContextCollector
 from sensing_voxel.llm.runtime import (
@@ -24,6 +25,7 @@ from sensing_voxel.llm.runtime import (
     estimate_token_count,
     summarize_messages,
 )
+from sensing_voxel.safety import PrintSafetyService
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +184,9 @@ class ChatManager:
         verbose_tool_use: bool = True,
         memo_repository=None,
         llm_analyze_fn=None,
+        safety_services: dict[str, PrintSafetyService] | None = None,
+        slicer_config: SlicerConfig | None = None,
+        print_monitors: dict[str, Any] | None = None,
     ):
         self._client = client
         self._context_collector = context_collector
@@ -225,10 +230,22 @@ class ChatManager:
                 tool_cooldown_seconds=tool_cooldown_seconds,
                 memo_repository=memo_repository,
                 llm_analyze_fn=llm_analyze_fn,
+                safety_services=safety_services,
+                slicer_config=slicer_config,
+                print_monitors=print_monitors,
             )
-            self._tools = list(PRINTER_TOOLS) if self._adapters else []
+            self._tools = (
+                [
+                    tool
+                    for tool in PRINTER_TOOLS
+                    if tool["name"] != "update_printer_config"
+                    or self._tool_executor._shell_config.allow_printer_config_updates
+                ]
+                if self._adapters
+                else []
+            )
             if getattr(self._tool_executor._shell_config, "enabled", False):
-                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "run_bash"])
+                self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "run_shell"])
             if getattr(self._tool_executor._web_search_config, "enabled", False):
                 self._tools.extend([t for t in SYSTEM_TOOLS if t["name"] == "web_search"])
             if camera or rtsp_url:
@@ -343,7 +360,7 @@ class ChatManager:
                         self._format_tool_result(block_name, result),
                     )
                     if isinstance(result, dict) and "content" in result:
-                        logger.info(f"Tool result: [image + text content blocks]")
+                        logger.info("Tool result: [image + text content blocks]")
                         session.add_tool_result(block_id, result["content"])
                     else:
                         logger.info(f"Tool result: {result[:200]}")
