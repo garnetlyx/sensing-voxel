@@ -25,7 +25,7 @@ def mock_config():
     return Config(
         telegram=TelegramConfig(
             bot_token="test_token",
-            allowed_users=[123456789],
+            allowed_users=[100000001],
         ),
         klipper=KlipperConfig(
             host="localhost",
