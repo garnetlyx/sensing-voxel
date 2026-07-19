@@ -6,8 +6,12 @@ Adapted from OpenClaw's telegram patterns
 
 import asyncio
 import html
+import json
 import logging
+import tempfile
+import uuid
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -30,8 +34,6 @@ from telegram.ext import (
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.config import Config
-from sensing_voxel.llm.chat import ChatManager
-from sensing_voxel.llm.runtime import ChatRequestContext
 from sensing_voxel.core.decision import DecisionEngine
 from sensing_voxel.core.models import (
     AgentState,
@@ -40,13 +42,16 @@ from sensing_voxel.core.models import (
     DecisionAction,
     FileValidationStatus,
     JobContext,
-    ModelFileType,
     generate_decision_token,
     generate_job_id,
 )
 from sensing_voxel.core.persistence import StatePersistence
 from sensing_voxel.core.state_machine import AgentStateMachine
-from sensing_voxel.slicer import FileFormatValidator, Step3MFConverter
+from sensing_voxel.llm.chat import ChatManager
+from sensing_voxel.llm.runtime import ChatRequestContext
+from sensing_voxel.safety.models import PrintRequest
+from sensing_voxel.safety.service import PrintSafetyService
+from sensing_voxel.slicer import FileFormatValidator, GcodeMetadataExtractor
 
 # --- Error Classification ---
 
@@ -91,6 +96,8 @@ class TelegramBot:
         config: Config | None = None,
         persistence: StatePersistence | None = None,
         chat_manager: ChatManager | None = None,
+        safety_services: dict[str, PrintSafetyService] | None = None,
+        active_printer: str | None = None,
     ):
         self.token = token
         self.allowed_users = set(allowed_users)
@@ -99,6 +106,8 @@ class TelegramBot:
         self.config = config
         self.persistence = persistence
         self.chat_manager = chat_manager
+        self.safety_services = safety_services or {}
+        self.active_printer = active_printer or next(iter(self.safety_services), None)
         self.decision_engine = DecisionEngine()
 
         self._app = Application.builder().token(token).build()
@@ -193,6 +202,63 @@ class TelegramBot:
     THREE_MF_EXTENSIONS = {".3mf"}
     MODEL_EXTENSIONS = STL_EXTENSIONS | STEP_EXTENSIONS | THREE_MF_EXTENSIONS
     ALLOWED_EXTENSIONS = MODEL_EXTENSIONS | GCODE_EXTENSIONS
+
+    @staticmethod
+    def _update_chat_id(update: Update) -> int | None:
+        """Return the chat that originated this update."""
+        chat = update.effective_chat
+        if chat is not None:
+            return chat.id
+        query = update.callback_query
+        message = query.message if query is not None else None
+        message_chat = message.chat if message is not None else None
+        return message_chat.id if message_chat is not None else None
+
+    @staticmethod
+    def _job_chat_id(job: JobContext) -> int | None:
+        """Return the persisted routing destination for a job."""
+        chat_id = job.metadata.get("telegram_chat_id")
+        return chat_id if isinstance(chat_id, int) and not isinstance(chat_id, bool) else None
+
+    @staticmethod
+    def _job_owner_user_id(job: JobContext) -> str | None:
+        """Return the persisted Telegram owner for a job."""
+        user_id = job.metadata.get("telegram_user_id")
+        if isinstance(user_id, (str, int)) and not isinstance(user_id, bool):
+            return str(user_id)
+        return None
+
+    def _authorize_job_owner(self, job: JobContext, *, user_id: str) -> bool:
+        """Authorize control actions against the persisted job owner."""
+        owner_id = self._job_owner_user_id(job)
+        return owner_id is not None and owner_id == user_id
+
+    def _authorize_staged_print_owner(
+        self, job: JobContext, *, user_id: str
+    ) -> tuple[bool, PrintRequest | None]:
+        """Resolve the current safety request and authorize its binding owner."""
+        safety = job.metadata.get("safety")
+        if not isinstance(safety, dict):
+            return False, None
+        printer_id = safety.get("printer_id")
+        request_id = safety.get("request_id")
+        operation_id = safety.get("operation_id")
+        if not isinstance(printer_id, str) or not isinstance(request_id, str):
+            return False, None
+        service = self.safety_services.get(printer_id)
+        if service is None:
+            return False, None
+        try:
+            request = service.get_request(request_id)
+        except Exception:
+            logger.warning("Unable to resolve safety request for job %s", job.job_id)
+            return False, None
+        authorized = (
+            request.operation_id == operation_id
+            and request.binding.user_id == user_id
+            and self._authorize_job_owner(job, user_id=user_id)
+        )
+        return authorized, request if authorized else None
 
     async def _handle_file_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle file upload (STL or G-code)"""
@@ -289,7 +355,11 @@ class TelegramBot:
             file_validation_status=FileValidationStatus.VALID,
             is_external=False,
             external_monitoring=False,
-            metadata={"is_converted": is_converted},
+            metadata={
+                "is_converted": is_converted,
+                "telegram_user_id": update.effective_user.id,
+                "telegram_chat_id": self._update_chat_id(update),
+            },
         )
 
         self.state_machine.job_context = job_context
@@ -312,8 +382,73 @@ class TelegramBot:
         await self._handle_model_upload(update, document, stl_path, job_id)
 
     async def _handle_gcode_upload(self, update, document, gcode_path, job_id):
-        """Handle G-code file upload — bypasses slicing, goes to approval"""
+        """Validate uploaded G-code and present its immutable safety preview for approval."""
+        printer_id = self.active_printer
+        service = self.safety_services.get(printer_id or "")
+        user = update.effective_user
+        if service is None or printer_id is None or user is None:
+            await update.message.reply_text(
+                "Print safety service is unavailable; the G-code cannot be approved."
+            )
+            gcode_path.unlink(missing_ok=True)
+            return
+
+        try:
+            binding = await service.create_binding(
+                user_id=str(user.id), source_trust="user_gcode"
+            )
+            request = await service.request_from_path(
+                gcode_path,
+                operation_id=uuid.uuid4().hex,
+                binding=binding,
+                printer_file=Path(gcode_path).name,
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"G-code safety validation failed: {exc}")
+            gcode_path.unlink(missing_ok=True)
+            return
+
+        confirmation = request.confirmation
         metadata = self._parse_gcode_metadata(gcode_path)
+        metadata["telegram_user_id"] = user.id
+        metadata["telegram_chat_id"] = self._update_chat_id(update)
+        metadata["safety"] = {
+            "printer_id": printer_id,
+            "request_id": request.request_id,
+            "operation_id": request.operation_id,
+            "artifact_sha256": request.artifact.sha256,
+            "preview_sha256": request.preview.sha256,
+            "rendered_preview_sha256": request.preview.rendered_sha256,
+            "validation_sha256": request.validation.result_sha256,
+            "confirmation_sha256": request.confirmation.confirmation_sha256,
+            "binding": {
+                "target_printer": request.binding.target_printer,
+                "hardware_digest": request.binding.hardware_digest,
+                "profile_digest": request.binding.profile_digest,
+                "config_digest": request.binding.config_digest,
+                "macro_digest": request.binding.macro_digest,
+                "source_trust": request.binding.source_trust,
+                "user_id": request.binding.user_id,
+                "probe_z_offset": request.binding.probe_z_offset,
+                "homing_origin_z": request.binding.homing_origin_z,
+            },
+            "confirmation": {
+                "material": request.confirmation.material,
+                "build_plate_surface": request.confirmation.build_plate_surface,
+                "hotend_nozzle_size_mm": request.confirmation.hotend_nozzle_size_mm,
+                "estimated_print_time_seconds": request.confirmation.estimated_print_time_seconds,
+                "filament_usage_mm": request.confirmation.filament_usage_mm,
+                "z_offset_mm": request.confirmation.z_offset_mm,
+                "artifact_sha256": request.confirmation.artifact_sha256,
+                "preview_sha256": request.confirmation.preview_sha256,
+                "rendered_preview_sha256": request.confirmation.rendered_preview_sha256,
+                "confirmation_sha256": request.confirmation.confirmation_sha256,
+            },
+            "preview": json.loads(request.preview.content),
+            "rendered_preview": request.preview.rendered_content.decode("utf-8"),
+            "rendered_preview_media_type": request.preview.rendered_media_type,
+
+        }
 
         job_context = JobContext(
             job_id=job_id,
@@ -355,11 +490,39 @@ class TelegramBot:
                 ]
             )
 
+            preview_file = BytesIO(request.preview.rendered_content)
+            preview_file.name = f"{Path(document.file_name).stem}-preview.svg"
+            await update.message.reply_document(
+                document=preview_file,
+                caption=(
+                    "Deterministic toolpath preview for the exact artifact below.\n"
+                    f"SVG SHA-256: `{request.preview.rendered_sha256}`"
+                ),
+            )
             await update.message.reply_text(
                 f"G-code file received: {document.file_name}\n"
                 f"Job ID: `{job_id}`\n\n"
                 f"{meta_text}\n\n"
-                "Approve to upload and start print?",
+                f"Material: `{confirmation.material}`\n"
+                f"Build plate: `{confirmation.build_plate_surface}`\n"
+                f"Nozzle: `{confirmation.hotend_nozzle_size_mm:g} mm`\n"
+                f"Estimated time: `{confirmation.estimated_print_time_seconds} s`\n"
+                f"Filament: `{confirmation.filament_usage_mm:g} mm`\n"
+                f"Live Z offset: `{confirmation.z_offset_mm:g} mm`\n\n"
+                f"Artifact: `{request.artifact.sha256}`\n"
+                f"JSON preview: `{request.preview.sha256}`\n"
+                f"SVG preview: `{request.preview.rendered_sha256}`\n"
+                f"Validation: `{request.validation.result_sha256}`\n"
+                f"Confirmation: `{confirmation.confirmation_sha256}`\n"
+                f"Printer: `{request.binding.target_printer}`\n"
+                f"Profile: `{request.binding.profile_digest}`\n"
+                f"Config: `{request.binding.config_digest}`\n"
+                f"Macros: `{request.binding.macro_digest}`\n"
+                f"Hardware: `{request.binding.hardware_digest}`\n"
+                f"Probe Z: `{request.binding.probe_z_offset:g} mm`\n"
+                f"Homing Z: `{request.binding.homing_origin_z:g} mm`\n\n"
+                "Approve this exact validated artifact, both previews, confirmation, and "
+                "binding to upload and start print?",
                 reply_markup=keyboard,
             )
 
@@ -370,45 +533,13 @@ class TelegramBot:
 
     @staticmethod
     def _parse_gcode_metadata(gcode_path: Path) -> dict:
-        """Parse metadata from G-code file header (first 10KB)"""
-        import re
-
-        try:
-            with open(gcode_path, "r", errors="replace") as f:
-                header = f.read(10240)
-        except OSError:
-            return {}
-
-        metadata = {}
-        patterns = {
-            "total_layers": r";\s*total layer(?:s| number|_count)\s*[:=]\s*(\d+)",
-            "estimated_time": r";\s*(?:estimated[_ ]?(?:printing[_ ]?)?time|TIME)\s*[:=]\s*(\d+)",
-            "filament_type": r";\s*filament_type\s*[:=]\s*(\S+)",
-            "layer_height": r";\s*layer_height\s*[:=]\s*([\d.]+)",
-            "filament_used_mm": r";\s*filament used\s*\[mm\]\s*[:=]\s*([\d.]+)",
-        }
-
-        for key, regex in patterns.items():
-            m = re.search(regex, header, re.IGNORECASE)
-            if m:
-                val = m.group(1).strip()
-                if key in ("total_layers", "estimated_time"):
-                    metadata[key] = int(val)
-                elif key in ("layer_height", "filament_used_mm"):
-                    metadata[key] = float(val)
-                else:
-                    metadata[key] = val
-
-        return metadata
+        """Extract display metadata through the shared exact-byte parser."""
+        return GcodeMetadataExtractor.extract_metadata(gcode_path)
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callback"""
         if not await self._check_auth(update):
             return
-
-        # Ensure chat_id is set from callback context (handles bot restart before first upload)
-        if self._chat_id is None:
-            self._chat_id = update.effective_chat.id
 
         query = update.callback_query
         if not query:
@@ -433,26 +564,59 @@ class TelegramBot:
             await query.edit_message_text("❌ Job not found or expired")
             return
 
-        action: DecisionAction | None = None
-
-        if prefix == "apr":
-            action = DecisionAction.APPROVE
-        elif prefix == "rej":
-            action = DecisionAction.REJECT
-        elif prefix == "res":
-            action = DecisionAction.RESUME
-        elif prefix == "can":
-            action = DecisionAction.CANCEL
-
-        if not action:
+        action_map = {
+            "apr": DecisionAction.APPROVE,
+            "rej": DecisionAction.REJECT,
+            "res": DecisionAction.RESUME,
+            "can": DecisionAction.CANCEL,
+        }
+        expected_state_map = {
+            DecisionAction.APPROVE: AgentState.AWAITING_APPROVAL,
+            DecisionAction.REJECT: AgentState.AWAITING_APPROVAL,
+            DecisionAction.RESUME: AgentState.PAUSED_PENDING_USER,
+            DecisionAction.CANCEL: AgentState.PAUSED_PENDING_USER,
+        }
+        action = action_map.get(prefix)
+        if action is None:
             return
 
-        # Consume decision via decision engine
+        user = update.effective_user
+        if user is None:
+            return
+        user_id = str(user.id)
+        callback_chat_id = self._update_chat_id(update) or self._job_chat_id(job)
+        print_request: PrintRequest | None = None
+        if action in {DecisionAction.APPROVE, DecisionAction.REJECT}:
+            authorized, print_request = self._authorize_staged_print_owner(
+                job, user_id=user_id
+            )
+        else:
+            authorized = self._authorize_job_owner(job, user_id=user_id)
+
+        if not authorized:
+            logger.warning(
+                "Rejected %s for job %s from non-owner user %s",
+                action.name,
+                job.job_id,
+                user_id,
+            )
+            if callback_chat_id is not None:
+                await self._app.bot.send_message(
+                    chat_id=callback_chat_id,
+                    text="This job belongs to another user; the decision is still pending.",
+                )
+            return
+
+        decision_token = job.decision_token
+        if not decision_token:
+            await query.edit_message_text("❌ Decision token is missing or expired")
+            return
+
         result = await self.decision_engine.consume_decision(
             job_context=job,
-            decision_token=job.decision_token,
+            decision_token=decision_token,
             action=action,
-            expected_state=self.state_machine.current_state,
+            expected_state=expected_state_map[action],
             current_state=self.state_machine.current_state,
         )
 
@@ -464,18 +628,30 @@ class TelegramBot:
 
             # Handle action-specific transitions
             if action == DecisionAction.APPROVE:
-                await self._app.bot.send_message(chat_id=self._chat_id, text="Starting print...")
-                await self._execute_print_approval(job)
+                if callback_chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=callback_chat_id, text="Starting print..."
+                    )
+                await self._execute_print_approval(
+                    job, user_id=user_id, chat_id=callback_chat_id
+                )
             elif action == DecisionAction.REJECT:
+                assert print_request is not None
+                safety = job.metadata["safety"]
+                service = self.safety_services[str(safety["printer_id"])]
+                service.reject(
+                    print_request.request_id, binding=print_request.binding
+                )
                 # Cleanup staged file
                 if job.gcode_path:
                     Path(job.gcode_path).unlink(missing_ok=True)
                 await self.state_machine.transition_to(
                     AgentState.IDLE, persistence=self.persistence
                 )
-                await self._app.bot.send_message(
-                    chat_id=self._chat_id, text="Job rejected. Back to idle."
-                )
+                if callback_chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=callback_chat_id, text="Job rejected. Back to idle."
+                    )
                 logger.info(f"gcode_upload_rejected job_id={job.job_id}")
             elif action == DecisionAction.RESUME:
                 # Resume print
@@ -484,82 +660,113 @@ class TelegramBot:
                 await self.state_machine.transition_to(
                     AgentState.MONITORING, persistence=self.persistence
                 )
-                await self._app.bot.send_message(chat_id=self._chat_id, text="▶️ Print resumed.")
+                if callback_chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=callback_chat_id, text="▶️ Print resumed."
+                    )
             elif action == DecisionAction.CANCEL:
-                # Cancel print
                 if self.adapter:
                     await self.adapter.cancel_print()
-                await self.state_machine.transition_to(
-                    AgentState.IDLE, persistence=self.persistence
-                )
-                await self._app.bot.send_message(chat_id=self._chat_id, text="⏹️ Print cancelled.")
+                if await self.state_machine.transition_to(
+                    AgentState.FAILED, persistence=self.persistence
+                ):
+                    await self.state_machine.transition_to(
+                        AgentState.IDLE, persistence=self.persistence
+                    )
+                if callback_chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=callback_chat_id, text="⏹️ Print cancelled."
+                    )
 
         elif result == ConsumeResult.ALREADY_HANDLED:
             await query.edit_message_text("ℹ️ Decision already processed for this job.")
         else:
             await query.edit_message_text(f"⚠️ Decision rejected: {result.name}")
 
-    async def _execute_print_approval(self, job: JobContext):
-        """Upload G-code to printer and start print after approval"""
-        if not self.adapter:
-            await self._app.bot.send_message(chat_id=self._chat_id, text="No printer connected.")
-            return
-
-        gcode_path = job.gcode_path or job.job_file
-        if not gcode_path:
-            await self._app.bot.send_message(
-                chat_id=self._chat_id, text="No G-code file found for this job."
-            )
+    async def _execute_print_approval(
+        self, job: JobContext, *, user_id: str, chat_id: int | None
+    ):
+        """Upload approved immutable bytes and execute through the safety service."""
+        safety = job.metadata.get("safety", {})
+        printer_id = safety.get("printer_id")
+        request_id = safety.get("request_id")
+        operation_id = safety.get("operation_id")
+        service = self.safety_services.get(printer_id or "")
+        adapter = self.adapter
+        if service is None or adapter is None or not request_id or not operation_id:
+            if chat_id is not None:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text="Print safety approval is unavailable or incomplete.",
+                )
             return
 
         try:
-            # Transition to UPLOADING
+            request = service.get_request(request_id)
+            if request.operation_id != operation_id:
+                raise ValueError("stored operation does not match the approved request")
+            if request.binding.user_id != user_id:
+                raise ValueError("approving user does not match the staged request")
+            if request.binding.source_trust != "user_gcode":
+                raise ValueError("unexpected print source trust")
+
             await self.state_machine.transition_to(
                 AgentState.UPLOADING, persistence=self.persistence
             )
 
-            # Upload file to printer
-            remote_name = Path(gcode_path).name
-            upload_result = await self.adapter.upload_file(gcode_path, remote_name)
+            with tempfile.NamedTemporaryFile(suffix=".gcode") as staged:
+                staged.write(request.artifact.content)
+                staged.flush()
+                upload_result = await adapter.upload_file(
+                    staged.name, request.printer_file
+                )
 
             if upload_result.status != CommandResultStatus.SUCCESS:
-                await self._app.bot.send_message(
-                    chat_id=self._chat_id,
-                    text=f"Upload failed: {upload_result.message}",
-                )
+                if chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Upload failed: {upload_result.message}",
+                    )
                 await self.state_machine.transition_to(
                     AgentState.ERROR, persistence=self.persistence
                 )
                 return
 
-            # Start print
-            start_result = await self.adapter.start_print(remote_name)
-
-            if start_result.status != CommandResultStatus.SUCCESS:
-                await self._app.bot.send_message(
-                    chat_id=self._chat_id,
-                    text=f"Failed to start print: {start_result.message}",
-                )
+            approval = service.approve(request.request_id, binding=request.binding)
+            receipt = await service.execute(
+                approval.token,
+                operation_id=request.operation_id,
+                binding=request.binding,
+            )
+            if not receipt.started:
+                if chat_id is not None:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Failed to start print: {receipt.message}",
+                    )
                 await self.state_machine.transition_to(
                     AgentState.ERROR, persistence=self.persistence
                 )
                 return
 
-            # Transition to PRINTING
             await self.state_machine.transition_to(
                 AgentState.PRINTING, persistence=self.persistence
             )
-            await self._app.bot.send_message(
-                chat_id=self._chat_id, text="Print started successfully!"
-            )
-            logger.info(f"gcode_upload_approved job_id={job.job_id}")
+            if chat_id is not None:
+                await self._app.bot.send_message(
+                    chat_id=chat_id, text="Print started successfully!"
+                )
+            logger.info("gcode_upload_approved job_id=%s", job.job_id)
 
-        except Exception as e:
-            logger.error(f"Error executing print approval: {e}", exc_info=True)
-            await self._app.bot.send_message(
-                chat_id=self._chat_id, text=f"Error starting print: {e}"
+        except Exception as exc:
+            logger.error("Error executing print approval: %s", exc, exc_info=True)
+            if chat_id is not None:
+                await self._app.bot.send_message(
+                    chat_id=chat_id, text=f"Error starting print: {exc}"
+                )
+            await self.state_machine.transition_to(
+                AgentState.ERROR, persistence=self.persistence
             )
-            await self.state_machine.transition_to(AgentState.ERROR, persistence=self.persistence)
 
     async def _handle_reset_z_offset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset_z_offset command"""
@@ -776,9 +983,18 @@ class TelegramBot:
                     reply_markup=reply_markup,
                 )
 
+    def _notification_chat_id(self, *, job_id: str | None = None) -> int | None:
+        if job_id is None:
+            return self._chat_id
+        job = self.state_machine.job_context
+        if job is None or job.job_id != job_id:
+            return None
+        return self._job_chat_id(job)
+
     async def notify_print_complete(self, job_context: JobContext):
         """Notify user that print is complete"""
-        if not self._chat_id:
+        chat_id = self._job_chat_id(job_context)
+        if chat_id is None:
             return
 
         message = (
@@ -790,7 +1006,7 @@ class TelegramBot:
 
         try:
             await self.send(
-                chat_id=self._chat_id,
+                chat_id=chat_id,
                 content=message,
                 content_type="text",
                 parse_mode=ParseMode.HTML,
@@ -800,7 +1016,8 @@ class TelegramBot:
 
     async def notify_error(self, error_message: str, job_id: str | None = None):
         """Notify user of error"""
-        if not self._chat_id:
+        chat_id = self._notification_chat_id(job_id=job_id)
+        if chat_id is None:
             return
 
         message = "❌ <b>Error</b>\n\n" + error_message
@@ -809,7 +1026,7 @@ class TelegramBot:
 
         try:
             await self.send(
-                chat_id=self._chat_id,
+                chat_id=chat_id,
                 content=message,
                 content_type="text",
                 parse_mode=ParseMode.HTML,
@@ -819,7 +1036,8 @@ class TelegramBot:
 
     async def notify_warning(self, warning_message: str, job_id: str | None = None):
         """Notify user of warning"""
-        if not self._chat_id:
+        chat_id = self._notification_chat_id(job_id=job_id)
+        if chat_id is None:
             return
 
         message = "⚠️ <b>Warning</b>\n\n" + warning_message
@@ -828,7 +1046,7 @@ class TelegramBot:
 
         try:
             await self.send(
-                chat_id=self._chat_id,
+                chat_id=chat_id,
                 content=message,
                 content_type="text",
                 parse_mode=ParseMode.HTML,

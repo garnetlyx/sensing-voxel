@@ -1,21 +1,26 @@
 """
 Unit tests for TelegramBot
 """
-import pytest
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from datetime import datetime
 from pathlib import Path
-import asyncio
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
+from sensing_voxel.adapters.base import LiveSafetySnapshot, PrinterAdapter
+from sensing_voxel.bot.telegram import TelegramBot
 from sensing_voxel.core.models import (
     AgentState,
-    JobContext,
     DecisionAction,
     FileValidationStatus,
+    JobContext,
 )
 from sensing_voxel.core.state_machine import AgentStateMachine
-from sensing_voxel.adapters.base import PrinterAdapter
-from sensing_voxel.bot.telegram import TelegramBot
+from sensing_voxel.safety import (
+    PhysicalConfirmationSnapshot,
+    PrintSafetyService,
+    SafetyBinding,
+)
 
 
 class TestTelegramBotAuth:
@@ -215,6 +220,101 @@ class TestTelegramBotFileUpload:
         assert any("Processing" in str(c) or "G-code" in str(c) for c in calls)
 
     @pytest.mark.asyncio
+    async def test_gcode_upload_stages_complete_safety_evidence_and_svg_preview(
+        self, tmp_path
+    ):
+        state_machine = AgentStateMachine()
+        adapter = AsyncMock(spec=PrinterAdapter)
+        adapter.get_live_safety_snapshot.return_value = LiveSafetySnapshot(
+            target_printer="default",
+            probe_z_offset=-1.25,
+            homing_origin_z=0.0,
+        )
+        trusted_binding = SafetyBinding(
+            user_id="runtime",
+            source_trust="runtime",
+            target_printer="default",
+            hardware_digest="hardware-v1",
+            profile_digest="profile-v1",
+            config_digest="config-v1",
+            macro_digest="macros-v1",
+        )
+
+        async def binding_provider():
+            return trusted_binding
+
+        async def confirmation_provider(_artifact, binding):
+            return PhysicalConfirmationSnapshot(
+                "textured PEI", 0.6, binding.probe_z_offset
+            )
+
+        service = PrintSafetyService(
+            adapter,
+            binding_provider=binding_provider,
+            confirmation_provider=confirmation_provider,
+        )
+        bot = TelegramBot(
+            token="test_token",
+            allowed_users=[12345],
+            state_machine=state_machine,
+            adapter=adapter,
+            safety_services={"default": service},
+            active_printer="default",
+        )
+        gcode_path = tmp_path / "part.gcode"
+        gcode_path.write_bytes(
+            b"; filament_type = PLA\n"
+            b"; estimated_time = 3600\n"
+            b"; filament used [mm] = 1234.5\n"
+            b"G28\nM104 S200\nG90\nM83\n"
+            b"G1 X10 Y10 Z0.2 F1200\nG1 X20 E1\n"
+        )
+        document = Mock(file_name="part.gcode")
+        update = Mock()
+        update.effective_user = Mock(id=12345)
+        update.message = Mock()
+        update.message.reply_document = AsyncMock()
+        update.message.reply_text = AsyncMock()
+
+        await bot._handle_gcode_upload(update, document, gcode_path, "job-123")
+
+        assert state_machine.current_state is AgentState.AWAITING_APPROVAL
+        safety = state_machine.job_context.metadata["safety"]
+        assert safety["preview"]["artifact_sha256"] == safety["artifact_sha256"]
+        assert safety["rendered_preview_media_type"] == "image/svg+xml"
+        assert safety["rendered_preview"].startswith("<?xml")
+        assert "<svg " in safety["rendered_preview"]
+        confirmation = safety["confirmation"]
+        assert confirmation["material"] == "PLA"
+        assert confirmation["build_plate_surface"] == "textured PEI"
+        assert confirmation["hotend_nozzle_size_mm"] == 0.6
+        assert confirmation["estimated_print_time_seconds"] == 3600
+        assert confirmation["filament_usage_mm"] == 1234.5
+        assert confirmation["z_offset_mm"] == -1.25
+        assert confirmation["artifact_sha256"] == safety["artifact_sha256"]
+        assert confirmation["preview_sha256"] == safety["preview_sha256"]
+        assert confirmation["rendered_preview_sha256"] == safety[
+            "rendered_preview_sha256"
+        ]
+        assert confirmation["confirmation_sha256"] == safety["confirmation_sha256"]
+        binding = safety["binding"]
+        assert binding["target_printer"] == "default"
+        assert binding["probe_z_offset"] == -1.25
+        assert binding["homing_origin_z"] == 0.0
+
+        update.message.reply_document.assert_awaited_once()
+        preview_file = update.message.reply_document.await_args.kwargs["document"]
+        assert preview_file.name == "part-preview.svg"
+        assert preview_file.getvalue().decode("utf-8") == safety["rendered_preview"]
+        approval_text = update.message.reply_text.await_args.args[0]
+        assert safety["artifact_sha256"] in approval_text
+        assert safety["rendered_preview_sha256"] in approval_text
+        assert safety["confirmation_sha256"] in approval_text
+        assert "Live Z offset: `-1.25 mm`" in approval_text
+        assert "Probe Z: `-1.25 mm`" in approval_text
+        assert "Homing Z: `0 mm`" in approval_text
+
+    @pytest.mark.asyncio
     async def test_accept_stl_extension(self):
         """Test that .stl extension passes the extension check"""
         state_machine = AgentStateMachine()
@@ -295,16 +395,6 @@ class TestTelegramBotFileUpload:
     @pytest.mark.asyncio
     async def test_path_traversal_protection(self):
         """Test that path traversal is prevented"""
-        state_machine = AgentStateMachine()
-        bot = TelegramBot(
-            token="test_token",
-            allowed_users=[12345],
-            state_machine=state_machine,
-        )
-
-        # Test the path validation directly
-        from pathlib import Path
-
         uploads_dir = Path("/app/data/uploads")
         malicious_path = uploads_dir / "../../../etc/crontab"
 
@@ -355,41 +445,135 @@ class TestTelegramBotCallbackQuery:
         assert "not found" in call_text.lower()
 
     @pytest.mark.asyncio
-    async def test_callback_with_correct_job_id(self):
-        """Test that callbacks with correct job IDs are processed"""
+    @pytest.mark.parametrize(
+        ("prefix", "action", "state"),
+        [
+            ("apr", DecisionAction.APPROVE, AgentState.AWAITING_APPROVAL),
+            ("rej", DecisionAction.REJECT, AgentState.AWAITING_APPROVAL),
+            ("res", DecisionAction.RESUME, AgentState.PAUSED_PENDING_USER),
+            ("can", DecisionAction.CANCEL, AgentState.PAUSED_PENDING_USER),
+        ],
+    )
+    async def test_only_owner_can_consume_and_responses_use_callback_chat(
+        self, prefix, action, state
+    ):
+        owner_id = 12345
+        other_id = 67890
+        owner_chat_id = 111
+        other_chat_id = 222
+        stale_chat_id = 999
         state_machine = AgentStateMachine()
-        job_context = JobContext(
+        adapter = AsyncMock(spec=PrinterAdapter)
+        safety_services = {}
+        metadata = {
+            "telegram_user_id": owner_id,
+            "telegram_chat_id": owner_chat_id,
+        }
+        request = None
+
+        if action in {DecisionAction.APPROVE, DecisionAction.REJECT}:
+            async def confirmation_provider(_artifact, _binding):
+                return PhysicalConfirmationSnapshot("textured PEI", 0.6, 0.0)
+
+            service = PrintSafetyService(
+                adapter, confirmation_provider=confirmation_provider
+            )
+            binding = SafetyBinding(
+                user_id=str(owner_id),
+                source_trust="user_gcode",
+                target_printer="default",
+                hardware_digest="hardware-v1",
+                profile_digest="profile-v1",
+                config_digest="config-v1",
+                macro_digest="macros-v1",
+                probe_z_offset=-1.25,
+                homing_origin_z=0.0,
+            )
+            request = await service.request_print(
+                b"; filament_type = PLA\n"
+                b"; estimated_time = 60\n"
+                b"; filament used [mm] = 10\n"
+                b"G28\nM104 S200\nG90\nM83\n"
+                b"G1 X10 Y10 Z0.2 F1200\nG1 X20 E1\n",
+                operation_id="operation-1",
+                binding=binding,
+                printer_file="part.gcode",
+            )
+            safety_services["default"] = service
+            metadata["safety"] = {
+                "printer_id": "default",
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+            }
+
+        job = JobContext(
             job_id="job-123",
-            job_file="/tmp/test.stl",
+            job_file="/tmp/test.gcode",
             uploaded_at=datetime.now(),
             decision_token="token",
+            metadata=metadata,
             file_validation_status=FileValidationStatus.VALID,
             is_external=False,
             external_monitoring=False,
         )
-        state_machine.job_context = job_context
-        state_machine.current_state = AgentState.AWAITING_APPROVAL
-
+        state_machine.job_context = job
+        state_machine.current_state = state
         bot = TelegramBot(
             token="test_token",
-            allowed_users=[12345],
+            allowed_users=[owner_id, other_id],
             state_machine=state_machine,
+            adapter=adapter,
+            safety_services=safety_services,
+            active_printer="default",
         )
+        bot._chat_id = stale_chat_id
 
-        update = Mock()
-        update.effective_user.id = 12345
-        update.callback_query = Mock()
-        update.callback_query.answer = AsyncMock()
-        update.callback_query.edit_message_text = AsyncMock()
-        update.callback_query.data = "apr_job-123"  # Correct job ID
+        def callback_update(user_id, chat_id):
+            update = Mock()
+            update.effective_user = Mock(id=user_id)
+            update.effective_chat = Mock(id=chat_id)
+            update.callback_query = Mock()
+            update.callback_query.answer = AsyncMock()
+            update.callback_query.edit_message_text = AsyncMock()
+            update.callback_query.data = f"{prefix}_{job.job_id}"
+            return update
 
-        with patch.object(bot.decision_engine, 'consume_decision', return_value=Mock()) as mock_consume:
-            mock_consume.return_value = Mock(name='ConsumeResult.CONSUMED')
+        other_update = callback_update(other_id, other_chat_id)
+        owner_update = callback_update(owner_id, owner_chat_id)
+        send_message = AsyncMock()
+        bot._app.bot._frozen = False
+        bot._app.bot.send_message = send_message
+        bot._app.bot._frozen = True
 
-            await bot._handle_callback_query(update, None)
+        await bot._handle_callback_query(other_update, None)
 
-            # Should have called consume_decision
-            mock_consume.assert_called_once()
+        assert job.decision_consumed is False
+        assert job.decision_action is None
+        if request is not None:
+            assert safety_services["default"].get_request(request.request_id).state.name == "PENDING"
+        adapter.resume_print.assert_not_awaited()
+        adapter.cancel_print.assert_not_awaited()
+
+        if action is DecisionAction.APPROVE:
+            with patch.object(
+                bot, "_execute_print_approval", new_callable=AsyncMock
+            ) as execute:
+                await bot._handle_callback_query(owner_update, None)
+                execute.assert_awaited_once_with(
+                    job, user_id=str(owner_id), chat_id=owner_chat_id
+                )
+        else:
+            await bot._handle_callback_query(owner_update, None)
+
+        assert job.decision_consumed is True
+        assert job.decision_action is action
+        other_update.callback_query.edit_message_text.assert_not_awaited()
+        owner_update.callback_query.edit_message_text.assert_awaited_once()
+        assert send_message.await_args_list[0].kwargs["chat_id"] == other_chat_id
+        owner_chat_ids = [call.kwargs["chat_id"] for call in send_message.await_args_list[1:]]
+        assert owner_chat_ids
+        assert set(owner_chat_ids) == {owner_chat_id}
+        assert stale_chat_id not in owner_chat_ids
 
 
 class TestTelegramBotDecisionKeyboard:
@@ -552,13 +736,14 @@ class TestTelegramBotNotifications:
             allowed_users=[12345],
             state_machine=state_machine,
         )
-        bot._chat_id = 99999  # Set chat ID for notification
+        bot._chat_id = 99999
 
         job_context = JobContext(
             job_id="test-job-123",
             job_file="/tmp/test.stl",
             uploaded_at=datetime.now(),
             decision_token="token",
+            metadata={"telegram_chat_id": 12345, "telegram_user_id": 12345},
             file_validation_status=FileValidationStatus.VALID,
             is_external=False,
             external_monitoring=False,
@@ -583,13 +768,25 @@ class TestTelegramBotNotifications:
             allowed_users=[12345],
             state_machine=state_machine,
         )
-        bot._chat_id = 99999  # Set chat ID for notification
+        job_context = JobContext(
+            job_id="test-job-123",
+            job_file="/tmp/test.stl",
+            uploaded_at=datetime.now(),
+            decision_token="token",
+            metadata={"telegram_chat_id": 12345, "telegram_user_id": 12345},
+            file_validation_status=FileValidationStatus.VALID,
+            is_external=False,
+            external_monitoring=False,
+        )
+        state_machine.job_context = job_context
+        bot._chat_id = 99999
 
         with patch.object(bot, 'send', new_callable=AsyncMock) as mock_send:
             await bot.notify_error("Test error message", job_id="test-job-123")
 
             mock_send.assert_called_once()
             call_kwargs = mock_send.call_args[1]
+            assert call_kwargs['chat_id'] == 12345
             assert 'Error' in call_kwargs['content']
             assert 'Test error message' in call_kwargs['content']
 
