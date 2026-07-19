@@ -13,6 +13,14 @@ import re
 # Blocked G-code prefixes that could be dangerous or disruptive
 BLOCKED_GCODE_PREFIXES = ("M112", "M410", "M80", "M81", "M23", "\n", "\r")
 
+# File-print commands and conventional macro aliases must only be reached through
+# PrintSafetyService.  Generic raw-command approval is intentionally insufficient.
+PRINT_START_GCODE_COMMANDS = frozenset({"M23", "M24", "M32", "SDCARD_PRINT_FILE"})
+_PRINT_START_ALIAS_RE = re.compile(
+    r"(?:^|_)(?:PRINT_START|START_PRINT|SDCARD_PRINT_FILE|RESUME)(?:_|$)"
+)
+PRINT_START_SAFETY_FLOW = "the PrintSafetyService start_print flow"
+
 # Temperature bounds for heating commands (in Celsius)
 GCODE_TEMP_BOUNDS = {
     "M104": (0.0, 300.0),  # Set hotend temp
@@ -37,8 +45,38 @@ _GCODE_NUMBER_RE = re.compile(r"^[-+]?(?:\d+(?:\.\d+)?|\.\d+)$")
 
 
 def _strip_gcode_comment(command: str) -> str:
-    """Remove comments from G-code command (everything after ;)."""
+    """Strip semicolon comments while preserving the executable command text."""
     return command.split(";", 1)[0].strip()
+
+
+def is_print_start_command(command: str) -> bool:
+    """Return whether one lexical command can start or resume a file print."""
+    executable = _strip_gcode_comment(command)
+    if not executable or "\n" in executable or "\r" in executable:
+        return False
+    token = executable.split(maxsplit=1)[0].upper()
+    return token in PRINT_START_GCODE_COMMANDS or _PRINT_START_ALIAS_RE.search(token) is not None
+
+
+def validate_macro_command(command: str) -> str | None:
+    """Validate one macro invocation, including optional parameters."""
+    if "\n" in command or "\r" in command:
+        return "Only one macro command is allowed"
+    executable = _strip_gcode_comment(command)
+    if not executable:
+        return "Macro name cannot be empty"
+
+    parts = executable.split()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", parts[0]):
+        return "Invalid macro name"
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", part) for part in parts[1:]):
+        return "Macro parameters must use KEY=VALUE syntax"
+    return None
+
+
+def print_start_block_message() -> str:
+    return f"File print start/resume is blocked in generic tools; use {PRINT_START_SAFETY_FLOW}"
+
 
 
 def _extract_numeric_gcode_params(tokens: list[str]) -> dict[str, float]:

@@ -3,14 +3,16 @@
 import asyncio
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 
+from sensing_voxel.adapters.base import LiveSafetySnapshot
 from sensing_voxel.config import ShellToolConfig as ConfigShellToolConfig
 from sensing_voxel.config import WebSearchToolConfig as ConfigWebSearchToolConfig
-
 from sensing_voxel.core.models import (
     CommandResult,
     CommandResultStatus,
@@ -18,6 +20,7 @@ from sensing_voxel.core.models import (
     PrintProgress,
 )
 from sensing_voxel.llm import tools as llm_tools
+from sensing_voxel.llm.runtime import ChatRequestContext, PendingApprovalStore
 from sensing_voxel.llm.tools import (
     CAMERA_TOOLS,
     PRINTER_TOOLS,
@@ -26,6 +29,11 @@ from sensing_voxel.llm.tools import (
     ToolExecutor,
     WebSearchToolConfig,
     validate_gcode_command,
+)
+from sensing_voxel.safety import (
+    PhysicalConfirmationSnapshot,
+    PrintSafetyService,
+    SafetyBinding,
 )
 
 
@@ -41,6 +49,14 @@ def _failure(message="failed"):
 def mock_adapter():
     adapter = MagicMock()
     adapter.get_printer_state = AsyncMock(return_value=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT)
+    adapter.is_connected = AsyncMock(return_value=True)
+    adapter.get_live_safety_snapshot = AsyncMock(
+        side_effect=lambda target: LiveSafetySnapshot(
+            target_printer=target,
+            probe_z_offset=-1.25,
+            homing_origin_z=0.0,
+        )
+    )
     adapter.get_print_progress = AsyncMock(
         return_value=PrintProgress(
             state=NormalizedPrinterState.PRINTING,
@@ -131,12 +147,17 @@ def mock_camera():
 
 @pytest.fixture
 def executor(mock_adapter, mock_camera):
-    return ToolExecutor(adapter=mock_adapter, camera=mock_camera, rtsp_url="rtsp://cam/stream")
+    return ToolExecutor(
+        adapter=mock_adapter,
+        camera=mock_camera,
+        rtsp_url="rtsp://cam/stream",
+        shell=ShellToolConfig(enabled=True),
+    )
 
 
 @pytest.fixture
 def executor_no_camera(mock_adapter):
-    return ToolExecutor(adapter=mock_adapter)
+    return ToolExecutor(adapter=mock_adapter, shell=ShellToolConfig(enabled=True))
 
 
 def _load_json(result):
@@ -144,7 +165,102 @@ def _load_json(result):
     return json.loads(result)
 
 
+async def _approve_token(executor, token, request_context=None):
+    result = await executor.execute(
+        "approve_pending",
+        {"approval_token": token},
+        request_context=request_context,
+    )
+    payload = _load_json(result)
+    assert payload["status"] == "approved"
+    return payload
+
+
+class TestPendingApprovalStore:
+    def test_payload_is_snapshot_and_transitions_are_exactly_bound(self):
+        store = PendingApprovalStore()
+        source_payload = {"command": "dangerous", "options": {"timeout": 30}}
+        record = store.create("user-a", "dashboard", "run_shell", source_payload, "high risk")
+        source_payload["options"]["timeout"] = 1
+
+        decoded = record.payload
+        decoded["options"]["timeout"] = 2
+        assert store.get(record.approval_token).payload == {
+            "command": "dangerous",
+            "options": {"timeout": 30},
+        }
+        assert store.consume(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        ) is None
+        assert store.approve(
+            record.approval_token, "user-b", "dashboard", "run_shell"
+        ) is None
+        assert store.approve(
+            record.approval_token, "user-a", "telegram", "run_shell"
+        ) is None
+        assert store.approve(
+            record.approval_token, "user-a", "dashboard", "cancel_print"
+        ) is None
+
+        approved = store.approve(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        )
+        assert approved is not None
+        assert approved.status == "approved"
+        assert store.consume(
+            record.approval_token, "user-b", "dashboard", "run_shell"
+        ) is None
+        assert store.consume(
+            record.approval_token, "user-a", "telegram", "run_shell"
+        ) is None
+        assert store.consume(
+            record.approval_token, "user-a", "dashboard", "cancel_print"
+        ) is None
+
+        consumed = store.consume(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        )
+        assert consumed is not None
+        assert consumed.status == "consumed"
+        assert store.consume(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        ) is None
+
+    def test_expired_approval_cannot_be_approved_or_consumed(self):
+        now = [datetime(2026, 7, 18, tzinfo=UTC)]
+        store = PendingApprovalStore(ttl_seconds=10, clock=lambda: now[0])
+        record = store.create("user-a", "dashboard", "run_shell", {"command": "id"}, "risk")
+        now[0] += timedelta(seconds=10)
+
+        assert store.approve(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        ) is None
+        assert store.consume(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        ) is None
+        assert store.get(record.approval_token).status == "expired"
+
+    def test_approved_token_is_atomically_single_use(self):
+        store = PendingApprovalStore()
+        record = store.create("user-a", "dashboard", "run_shell", {"command": "id"}, "risk")
+        assert store.approve(
+            record.approval_token, "user-a", "dashboard", "run_shell"
+        ) is not None
+
+        def consume_once(_index):
+            return store.consume(
+                record.approval_token, "user-a", "dashboard", "run_shell"
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(consume_once, range(16)))
+
+        assert sum(result is not None for result in results) == 1
+        assert store.get(record.approval_token).status == "consumed"
+
+
 class TestToolCatalogAndDispatch:
+
     def test_catalog_includes_expected_tools(self):
         printer_names = {tool["name"] for tool in PRINTER_TOOLS}
         camera_names = {tool["name"] for tool in CAMERA_TOOLS}
@@ -154,7 +270,8 @@ class TestToolCatalogAndDispatch:
         assert "upload_to_printer" in printer_names
         assert "list_printer_config_files" in printer_names
         assert "get_printer_config_file" in printer_names
-        assert "run_bash" in system_names
+        assert "run_bash" not in system_names
+        assert "run_shell" in system_names
         assert "web_search" in system_names
         assert "camera_snapshot" in camera_names
         assert "camera_move_to" in camera_names
@@ -189,16 +306,23 @@ class TestToolCatalogAndDispatch:
 
 class TestSystemUtilityTools:
     @pytest.mark.asyncio
-    async def test_run_bash_executes_harmless_command(self, tmp_path):
+    async def test_run_bash_is_not_dispatched(self, executor):
+        payload = _load_json(await executor.execute("run_bash", {"command": "pwd"}))
+
+        assert payload == {"error": "Unknown tool: run_bash"}
+
+    @pytest.mark.asyncio
+    async def test_run_shell_executes_allowlisted_command(self, tmp_path):
         executor = ToolExecutor(
             shell=ShellToolConfig(enabled=True, cwd=str(tmp_path), timeout_seconds=2)
         )
-        payload = _load_json(await executor.execute("run_bash", {"command": "pwd && echo ok"}))
+        payload = _load_json(
+            await executor.execute("run_shell", {"command": "pwd", "cwd": str(tmp_path)})
+        )
 
+        assert payload["status"] == "success"
         assert payload["exit_code"] == 0
-        assert payload["cwd"] == str(tmp_path.resolve())
-        assert "ok" in payload["stdout"]
-        assert payload["timed_out"] is False
+        assert payload["stdout"].strip() == str(tmp_path.resolve())
 
     def test_executor_accepts_config_dataclasses(self, tmp_path):
         executor = ToolExecutor(
@@ -214,11 +338,32 @@ class TestSystemUtilityTools:
         assert executor._web_search_config.searxng_url == "http://searxng:8080"
 
     @pytest.mark.asyncio
-    async def test_run_bash_rejects_cwd_escape(self, tmp_path):
-        executor = ToolExecutor(shell=ShellToolConfig(enabled=True, cwd=str(tmp_path)))
-        payload = _load_json(await executor.execute("run_bash", {"command": "pwd", "cwd": ".."}))
+    async def test_update_printer_config_is_disabled_by_default(self, mock_adapter):
+        executor = ToolExecutor(adapter=mock_adapter)
 
-        assert "cwd must stay under" in payload["error"]
+        assert "update_printer_config" not in executor._dispatch
+        payload = await executor._update_printer_config(
+            {"section": "printer", "key": "max_velocity", "value": "500"}
+        )
+
+        assert payload == {"error": "Printer configuration updates are disabled by local policy"}
+
+    @pytest.mark.asyncio
+    async def test_update_printer_config_is_registered_only_with_opt_in(self, mock_adapter):
+        executor = ToolExecutor(
+            adapter=mock_adapter,
+            shell=ShellToolConfig(allow_printer_config_updates=True),
+        )
+
+        assert "update_printer_config" in executor._dispatch
+        payload = _load_json(
+            await executor.execute(
+                "update_printer_config",
+                {"section": "printer", "key": "max_velocity", "value": "500"},
+            )
+        )
+
+        assert payload["status"] == "approval_required"
 
     @pytest.mark.asyncio
     async def test_web_search_returns_searxng_results(self, aiohttp_client):
@@ -452,6 +597,7 @@ class TestPrinterControlTools:
             await executor.execute("run_gcode", {"command": "G1 X100 Y100 Z10 E5 F1200 ; move"})
         )
         token = first["approval_token"]
+        await _approve_token(executor, token)
         payload = _load_json(
             await executor.execute(
                 "run_gcode",
@@ -463,22 +609,126 @@ class TestPrinterControlTools:
         mock_adapter.run_gcode.assert_called_once_with("G1 X100 Y100 Z10 E5 F1200")
 
     @pytest.mark.asyncio
-    async def test_start_print_requires_approval_then_executes(self, executor, mock_adapter):
-        first = _load_json(await executor.execute("start_print", {"filename": "part.gcode"}))
+    async def test_start_print_requires_approval_then_executes(
+        self, mock_adapter, tmp_path, monkeypatch
+    ):
+        uploads = tmp_path / "data" / "uploads"
+        uploads.mkdir(parents=True)
+        gcode = (
+            b"; filament_type = PLA\n"
+            b"; estimated_time = 3600\n"
+            b"; filament used [mm] = 1234.5\n"
+            b"G28\nM104 S200\nG90\nM83\nG1 X10 Y10 Z0.2 F1200\nG1 X20 E1\n"
+        )
+        (uploads / "part.gcode").write_bytes(gcode)
+        monkeypatch.chdir(tmp_path)
+
+        trusted_binding = SafetyBinding(
+            user_id="runtime",
+            source_trust="runtime",
+            target_printer="default",
+            hardware_digest="hardware-v1",
+            profile_digest="profile-v1",
+            config_digest="config-v1",
+            macro_digest="macros-v1",
+        )
+
+        async def binding_provider():
+            return trusted_binding
+
+        async def confirmation_provider(_artifact, binding):
+            return PhysicalConfirmationSnapshot("textured PEI", 0.6, binding.probe_z_offset)
+
+        async def monitor_start(_contract):
+            return None
+
+        async def monitor_stop():
+            return None
+
+        service = PrintSafetyService(
+            mock_adapter,
+            binding_provider=binding_provider,
+            confirmation_provider=confirmation_provider,
+            monitor_start=monitor_start,
+            monitor_stop=monitor_stop,
+        )
+        executor = ToolExecutor(
+            adapter=mock_adapter,
+            safety_services={"default": service},
+        )
+        request_context = ChatRequestContext(
+            logical_user_id="user-1",
+            channel="dashboard",
+        )
+
+        first = _load_json(
+            await executor.execute(
+                "start_print",
+                {"filename": "part.gcode"},
+                request_context=request_context,
+            )
+        )
         assert first["status"] == "approval_required"
+        approval_payload = first["payload"]
+        assert approval_payload["binding"]["source_trust"] == "user_gcode"
+        assert approval_payload["binding"]["target_printer"] == "default"
+        assert approval_payload["binding"]["probe_z_offset"] == -1.25
+        assert approval_payload["binding"]["homing_origin_z"] == 0.0
+        assert "live probe Z offset -1.25 mm" in first["confirmation"]
+        assert "homing-origin Z 0.0 mm" in first["confirmation"]
+        assert approval_payload["artifact_sha256"]
+        assert approval_payload["preview_sha256"]
+        assert approval_payload["preview_media_type"] == "application/json"
+        assert approval_payload["preview"]["artifact_sha256"] == approval_payload[
+            "artifact_sha256"
+        ]
+        assert approval_payload["rendered_preview_sha256"]
+        assert approval_payload["rendered_preview_media_type"] == "image/svg+xml"
+        assert approval_payload["rendered_preview"].startswith("<?xml ")
+        assert "<svg " in approval_payload["rendered_preview"]
+        assert approval_payload["validation_sha256"] == approval_payload["validation"][
+            "validation_sha256"
+        ]
+        assert approval_payload["validation"]["artifact_sha256"] == approval_payload[
+            "artifact_sha256"
+        ]
+        assert approval_payload["validation"]["valid"] is True
+        confirmation = approval_payload["confirmation"]
+        assert confirmation["material"] == "PLA"
+        assert confirmation["build_plate_surface"] == "textured PEI"
+        assert confirmation["hotend_nozzle_size_mm"] == 0.6
+        assert confirmation["estimated_print_time_seconds"] == 3600
+        assert confirmation["filament_usage_mm"] == 1234.5
+        assert confirmation["z_offset_mm"] == -1.25
+        assert confirmation["artifact_sha256"] == approval_payload["artifact_sha256"]
+        assert confirmation["preview_sha256"] == approval_payload["preview_sha256"]
+        assert confirmation["rendered_preview_sha256"] == approval_payload[
+            "rendered_preview_sha256"
+        ]
+        assert confirmation["confirmation_sha256"] == approval_payload[
+            "confirmation_sha256"
+        ]
+
+        await _approve_token(executor, first["approval_token"], request_context)
         payload = _load_json(
             await executor.execute(
                 "start_print",
                 {"approval_token": first["approval_token"], "filename": "part.gcode"},
+                request_context=request_context,
             )
         )
-        assert payload["status"] == "SUCCESS"
-        mock_adapter.start_print.assert_called_once_with("part.gcode")
+
+        assert payload["status"] == "printing"
+        assert payload["artifact_sha256"] == approval_payload["artifact_sha256"]
+        mock_adapter.upload_file.assert_awaited_once()
+        assert mock_adapter.upload_file.await_args.args[1] == "part.gcode"
+        mock_adapter.start_print.assert_awaited_once_with("part.gcode")
 
     @pytest.mark.asyncio
     async def test_cancel_print_requires_approval_then_executes(self, executor, mock_adapter):
         first = _load_json(await executor.execute("cancel_print", {}))
         assert first["status"] == "approval_required"
+        await _approve_token(executor, first["approval_token"])
         payload = _load_json(
             await executor.execute("cancel_print", {"approval_token": first["approval_token"]})
         )
@@ -489,6 +739,7 @@ class TestPrinterControlTools:
     async def test_delete_file_requires_approval_then_executes(self, executor, mock_adapter):
         first = _load_json(await executor.execute("delete_file", {"filename": "old.gcode"}))
         assert first["status"] == "approval_required"
+        await _approve_token(executor, first["approval_token"])
         payload = _load_json(
             await executor.execute(
                 "delete_file",
@@ -500,21 +751,60 @@ class TestPrinterControlTools:
 
     @pytest.mark.asyncio
     async def test_execute_macro_requires_approval_then_executes(self, executor, mock_adapter):
-        first = _load_json(await executor.execute("execute_macro", {"name": "PRINT_START"}))
+        first = _load_json(await executor.execute("execute_macro", {"name": "BED_MESH_CALIBRATE"}))
         assert first["status"] == "approval_required"
+        await _approve_token(executor, first["approval_token"])
         payload = _load_json(
             await executor.execute(
                 "execute_macro",
-                {"approval_token": first["approval_token"], "name": "PRINT_START"},
+                {"approval_token": first["approval_token"], "name": "BED_MESH_CALIBRATE"},
             )
         )
         assert payload["status"] == "SUCCESS"
-        mock_adapter.execute_macro.assert_called_once_with("PRINT_START")
+        mock_adapter.execute_macro.assert_called_once_with("BED_MESH_CALIBRATE")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name",
+        ["PRINT_START", "start_print BED_TEMP=60", "resume ; ignored", "my_print_start_alias"],
+    )
+    async def test_execute_macro_blocks_print_starts(self, executor, mock_adapter, name):
+        payload = _load_json(await executor.execute("execute_macro", {"name": name}))
+        assert "PrintSafetyService" in payload["error"]
+        mock_adapter.execute_macro.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_macro_blocks_approved_print_start_payload(self, executor, mock_adapter):
+        record = executor._approval_store.create(
+            "unknown",
+            "unknown",
+            "execute_macro",
+            {"name": "PRINT_START", "printer_id": "default"},
+            "test",
+        )
+        await _approve_token(executor, record.approval_token)
+        payload = _load_json(
+            await executor.execute(
+                "execute_macro",
+                {"approval_token": record.approval_token, "name": "BED_MESH_CALIBRATE"},
+            )
+        )
+        assert "PrintSafetyService" in payload["error"]
+        mock_adapter.execute_macro.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_macro_rejects_multiple_commands(self, executor, mock_adapter):
+        payload = _load_json(
+            await executor.execute("execute_macro", {"name": "BED_MESH_CALIBRATE\nPRINT_START"})
+        )
+        assert payload["error"] == "Only one macro command is allowed"
+        mock_adapter.execute_macro.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restart_firmware_requires_approval_then_executes(self, executor, mock_adapter):
         first = _load_json(await executor.execute("restart_firmware", {}))
         assert first["status"] == "approval_required"
+        await _approve_token(executor, first["approval_token"])
         payload = _load_json(
             await executor.execute(
                 "restart_firmware",
@@ -528,6 +818,7 @@ class TestPrinterControlTools:
     async def test_restart_service_requires_approval_then_executes(self, executor, mock_adapter):
         first = _load_json(await executor.execute("restart_service", {}))
         assert first["status"] == "approval_required"
+        await _approve_token(executor, first["approval_token"])
         payload = _load_json(
             await executor.execute(
                 "restart_service",
@@ -549,16 +840,80 @@ class TestPrinterControlTools:
         mock_adapter.run_gcode.assert_called_once_with("M114")
 
     @pytest.mark.asyncio
-    async def test_run_shell_requires_approval_then_executes(self, executor):
-        first = _load_json(await executor.execute("run_shell", {"command": "rm -rf /tmp/nope"}))
+    @pytest.mark.parametrize(
+        "command",
+        ["SDCARD_PRINT_FILE FILENAME=test.gcode", "m23 test.gcode", "M24 ; resume", "print_start"],
+    )
+    async def test_run_gcode_blocks_print_starts(self, executor, mock_adapter, command):
+        payload = _load_json(await executor.execute("run_gcode", {"command": command}))
+        assert "PrintSafetyService" in payload["error"]
+        mock_adapter.run_gcode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_allowlist_cannot_enable_print_start(self, mock_adapter):
+        local_executor = ToolExecutor(
+            adapter=mock_adapter,
+            allowed_gcode_commands={"M24", "PRINT_START"},
+        )
+        payload = _load_json(await local_executor.execute("run_gcode", {"command": "m24"}))
+        assert "PrintSafetyService" in payload["error"]
+        mock_adapter.run_gcode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_gcode_blocks_approved_print_start_payload(self, executor, mock_adapter):
+        record = executor._approval_store.create(
+            "unknown",
+            "unknown",
+            "run_gcode",
+            {"command": "SDCARD_PRINT_FILE FILENAME=test.gcode", "printer_id": "default"},
+            "test",
+        )
+        await _approve_token(executor, record.approval_token)
+        payload = _load_json(
+            await executor.execute(
+                "run_gcode",
+                {"approval_token": record.approval_token, "command": "M114"},
+            )
+        )
+        assert "PrintSafetyService" in payload["error"]
+        mock_adapter.run_gcode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_shell_uses_approved_payload_once(self, executor, monkeypatch):
+        process = MagicMock(returncode=0)
+        process.communicate = AsyncMock(return_value=(b"approved\n", b""))
+        create_process = AsyncMock(return_value=process)
+        monkeypatch.setattr(llm_tools.asyncio, "create_subprocess_shell", create_process)
+
+        approved_command = "rm -rf /tmp/nope"
+        first = _load_json(
+            await executor.execute("run_shell", {"command": approved_command})
+        )
         assert first["status"] == "approval_required"
+        token = first["approval_token"]
+        await _approve_token(executor, token)
+
         payload = _load_json(
             await executor.execute(
                 "run_shell",
-                {"approval_token": first["approval_token"], "command": "rm -rf /tmp/nope"},
+                {
+                    "approval_token": token,
+                    "command": "touch /tmp/caller-override-must-not-run",
+                },
             )
         )
-        assert payload["status"] in {"success", "failure"}
+        assert payload["status"] == "success"
+        assert payload["command"] == approved_command
+        create_process.assert_awaited_once()
+        assert create_process.await_args.args[0] == approved_command
+
+        reused = _load_json(
+            await executor.execute(
+                "run_shell",
+                {"approval_token": token, "command": approved_command},
+            )
+        )
+        assert reused == {"error": "Invalid or expired approval_token for run_shell"}
 
     @pytest.mark.asyncio
     async def test_run_shell_background_task_lifecycle(self, executor):
@@ -590,10 +945,44 @@ class TestPrinterControlTools:
         assert matching[0]["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_get_pending_approvals_lists_created_tokens(self, executor):
-        await executor.execute("cancel_print", {})
-        payload = _load_json(await executor.execute("get_pending_approvals", {}))
-        assert payload["approvals"]
+    async def test_get_pending_approvals_lists_only_current_user(self, executor):
+        current = ChatRequestContext(logical_user_id="user-1", channel="dashboard")
+        other = ChatRequestContext(logical_user_id="user-2", channel="dashboard")
+        own = _load_json(
+            await executor.execute("cancel_print", {}, request_context=current)
+        )
+        await executor.execute("cancel_print", {}, request_context=other)
+
+        payload = _load_json(
+            await executor.execute("get_pending_approvals", {}, request_context=current)
+        )
+
+        assert [record["approval_token"] for record in payload["approvals"]] == [
+            own["approval_token"]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_approve_pending_rejects_other_identity_and_channel(self, executor):
+        owner = ChatRequestContext(logical_user_id="user-1", channel="dashboard")
+        wrong_user = ChatRequestContext(logical_user_id="user-2", channel="dashboard")
+        wrong_channel = ChatRequestContext(logical_user_id="user-1", channel="telegram")
+        first = _load_json(
+            await executor.execute("cancel_print", {}, request_context=owner)
+        )
+        token = first["approval_token"]
+
+        for context in (wrong_user, wrong_channel):
+            payload = _load_json(
+                await executor.execute(
+                    "approve_pending",
+                    {"approval_token": token},
+                    request_context=context,
+                )
+            )
+            assert payload == {"error": f"Token {token} not found among pending approvals"}
+
+        approved = await _approve_token(executor, token, owner)
+        assert approved["tool_name"] == "cancel_print"
 
     @pytest.mark.asyncio
     async def test_upload_to_printer_uses_sanitized_basename(

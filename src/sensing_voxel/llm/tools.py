@@ -10,16 +10,26 @@ import inspect
 import json
 import logging
 import os
+import tempfile
+import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any
 from urllib.parse import urljoin
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.adapters.klipper import _normalize_filename
+from sensing_voxel.config import SlicerConfig
 from sensing_voxel.core.models import CommandResultStatus
-from sensing_voxel.infra.gcode import _strip_gcode_comment, validate_gcode_command
+from sensing_voxel.infra.gcode import (
+    _strip_gcode_comment,
+    is_print_start_command,
+    print_start_block_message,
+    validate_gcode_command,
+    validate_macro_command,
+)
 from sensing_voxel.llm.runtime import (
     BackgroundTaskManager,
     ChatRequestContext,
@@ -29,6 +39,7 @@ from sensing_voxel.llm.runtime import (
     classify_gcode_command,
     classify_shell_command,
 )
+from sensing_voxel.safety import PrintSafetyService
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +50,13 @@ BED_TEMP_MAX = 120
 
 @dataclass
 class ShellToolConfig:
-    """Configuration for the run_bash LLM tool."""
+    """Configuration for classified local system tools."""
 
     enabled: bool = False
     cwd: str = "/app"
     timeout_seconds: float = 10.0
     max_output_chars: int = 8000
+    allow_printer_config_updates: bool = False
 
 
 @dataclass
@@ -59,27 +71,22 @@ class WebSearchToolConfig:
 
 SYSTEM_TOOLS: list[dict[str, Any]] = [
     {
-        "name": "run_bash",
+        "name": "run_shell",
         "description": (
-            "Run a short bash command inside the Sensing Voxel container for diagnostics, "
-            "file inspection, and harmless local automation. Do not use for destructive actions "
-            "unless the user explicitly confirms."
+            "Run a classified local shell command. Safe allowlisted commands execute "
+            "directly; higher-risk commands require an exact, single-use approval."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Bash command to run",
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Optional working directory under the configured shell root",
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "description": "Optional timeout in seconds",
-                },
+                "command": {"type": "string", "description": "Shell command to run"},
+                "timeout_seconds": {"type": "integer", "minimum": 1},
+                "cwd": {"type": "string"},
+                "background": {"type": "boolean"},
+                "task_name": {"type": "string"},
+                "completion_message": {"type": "string"},
+                "progress_interval_seconds": {"type": "integer", "minimum": 1},
+                "approval_token": {"type": "string"},
             },
             "required": ["command"],
         },
@@ -293,8 +300,8 @@ PRINTER_TOOLS: list[dict[str, Any]] = [
         "name": "list_printer_config_files",
         "description": (
             "List Klipper/Moonraker configuration files from the selected printer's remote "
-            "config root. Use this instead of run_bash when looking for printer.cfg or "
-            "other printer configuration files."
+            "config root. Use this when looking for printer.cfg or other printer "
+            "configuration files."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -894,6 +901,9 @@ class ToolExecutor:
         tool_cooldown_seconds: float = 0.0,
         memo_repository=None,
         llm_analyze_fn: Callable[..., Coroutine[Any, Any, str]] | None = None,
+        safety_services: dict[str, PrintSafetyService] | None = None,
+        slicer_config: SlicerConfig | None = None,
+        print_monitors: dict[str, Any] | None = None,
     ):
         if adapters is None:
             adapters = {}
@@ -918,7 +928,9 @@ class ToolExecutor:
         self._tool_cooldown_seconds = tool_cooldown_seconds
         self._last_tool_call: dict[str, float] = {}
         self._memo_repository = memo_repository
-        self._print_monitors: dict[str, Any] = {}
+        self._safety_services = safety_services or {}
+        self._slicer_config = slicer_config
+        self._print_monitors = print_monitors if print_monitors is not None else {}
         self._llm_analyze_fn = llm_analyze_fn
         self._dispatch: dict[str, Any] = {
             "list_printers": self._list_printers_tool,
@@ -955,8 +967,9 @@ class ToolExecutor:
             "get_background_tasks": self._get_background_tasks,
             "cancel_background_task": self._cancel_background_task,
             "get_pending_approvals": self._get_pending_approvals,
-            "run_shell": self._run_shell,
         }
+        if self._shell_config.enabled:
+            self._dispatch["run_shell"] = self._run_shell
         if camera:
             self._dispatch.update(
                 {
@@ -969,14 +982,13 @@ class ToolExecutor:
             )
         if rtsp_url:
             self._dispatch["camera_snapshot"] = self._camera_snapshot
-        if self._shell_config.enabled:
-            self._dispatch["run_bash"] = self._run_bash
         if self._web_search_config.enabled:
             self._dispatch["web_search"] = self._web_search
         if self._memo_repository:
             self._dispatch["get_printer_memo"] = self._get_printer_memo
             self._dispatch["set_printer_memo"] = self._set_printer_memo
-        self._dispatch["update_printer_config"] = self._update_printer_config
+        if self._shell_config.allow_printer_config_updates:
+            self._dispatch["update_printer_config"] = self._update_printer_config
         self._dispatch["get_printer_hardware"] = self._get_printer_hardware
         self._dispatch["start_print_with_monitor"] = self._start_print_with_monitor
         self._dispatch["acknowledge_anomaly"] = self._acknowledge_anomaly
@@ -1110,6 +1122,159 @@ class ToolExecutor:
             }
         return printer_id or "default", adapter
 
+    def _require_safety_service(self, printer_id: str) -> PrintSafetyService | dict[str, str]:
+        service = self._safety_services.get(printer_id)
+        if service is None:
+            return {"error": f"Print safety service is unavailable for {printer_id}"}
+        return service
+
+    @staticmethod
+    def _local_gcode_path(filename: str) -> Path | None:
+        if Path(filename).name != filename:
+            return None
+        for directory in (Path("data/uploads"), Path("data/sliced")):
+            candidate = directory / filename
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def _validation_payload(request: Any) -> dict[str, Any]:
+        validation = request.validation
+        return {
+            "valid": validation.valid,
+            "artifact_sha256": validation.artifact_sha256,
+            "validation_sha256": validation.result_sha256,
+            "command_count": validation.command_count,
+            "line_count": validation.line_count,
+            "first_layer_z": validation.first_layer_z,
+            "toolpath_envelope": asdict(validation.toolpath_envelope),
+            "first_layer_envelope": asdict(validation.first_layer_envelope),
+            "issues": [asdict(issue) for issue in validation.issues],
+        }
+
+    @staticmethod
+    def _binding_payload(binding: Any) -> dict[str, Any]:
+        return asdict(binding)
+
+    @classmethod
+    def _print_request_payload(cls, request: Any, *, source_path: Path) -> dict[str, Any]:
+        confirmation = asdict(request.confirmation)
+        confirmation["confirmation_sha256"] = request.confirmation.confirmation_sha256
+        return {
+            "request_id": request.request_id,
+            "operation_id": request.operation_id,
+            "filename": request.printer_file,
+            "printer_file": request.printer_file,
+            "source_path": str(source_path.resolve()),
+            "artifact_sha256": request.artifact.sha256,
+            "artifact_size_bytes": request.artifact.size_bytes,
+            "preview_sha256": request.preview.sha256,
+            "preview_media_type": request.preview.media_type,
+            "preview": json.loads(request.preview.content),
+            "rendered_preview_sha256": request.preview.rendered_sha256,
+            "rendered_preview_media_type": request.preview.rendered_media_type,
+            "rendered_preview": request.preview.rendered_content.decode("utf-8"),
+            "validation_sha256": request.validation.result_sha256,
+            "validation": cls._validation_payload(request),
+            "confirmation_sha256": request.confirmation.confirmation_sha256,
+            "confirmation": confirmation,
+            "binding": cls._binding_payload(request.binding),
+        }
+
+    async def _create_print_approval(
+        self,
+        *,
+        tool_name: str,
+        source_path: Path,
+        printer_id: str,
+        source_trust: str,
+        request_context: ChatRequestContext,
+    ) -> dict[str, Any]:
+        service = self._require_safety_service(printer_id)
+        if isinstance(service, dict):
+            return service
+        binding = await service.create_binding(
+            user_id=request_context.logical_user_id,
+            source_trust=source_trust,
+        )
+        request = await service.request_from_path(
+            source_path,
+            operation_id=uuid.uuid4().hex,
+            binding=binding,
+            printer_file=_normalize_filename(source_path.name),
+        )
+        payload = self._print_request_payload(request, source_path=source_path)
+        payload["printer_id"] = printer_id
+        approval = self._create_approval(
+            request_context,
+            tool_name,
+            payload,
+            (
+                f"Confirm the exact validated G-code artifact {request.artifact.sha256}, "
+                f"JSON preview {request.preview.sha256}, SVG preview "
+                f"{request.preview.rendered_sha256}, validation "
+                f"{request.validation.result_sha256}, confirmation "
+                f"{request.confirmation.confirmation_sha256}, material "
+                f"{request.confirmation.material}, build plate "
+                f"{request.confirmation.build_plate_surface}, nozzle "
+                f"{request.confirmation.hotend_nozzle_size_mm:g} mm, printer "
+                f"{binding.target_printer}, live probe Z offset "
+                f"{binding.probe_z_offset} mm, homing-origin Z "
+                f"{binding.homing_origin_z} mm, and current printer/profile/config "
+                "binding before printing."
+            ),
+        )
+        approval["confirmation"] = approval["reason"]
+        return approval
+
+    async def _execute_print_approval(
+        self,
+        *,
+        approved_input: dict[str, Any],
+        printer_id: str,
+        adapter: PrinterAdapter,
+        request_context: ChatRequestContext,
+    ) -> dict[str, Any]:
+        service = self._require_safety_service(printer_id)
+        if isinstance(service, dict):
+            return service
+        request_id = str(approved_input.get("request_id") or "")
+        operation_id = str(approved_input.get("operation_id") or "")
+        if not request_id or not operation_id:
+            return {"error": "Approved print payload is incomplete"}
+        request = service.get_request(request_id)
+        if request.operation_id != operation_id:
+            return {"error": "Approved print operation does not match its safety request"}
+        if request.binding.user_id != request_context.logical_user_id:
+            return {"error": "Approved print user does not match the authenticated user"}
+        if request.binding.target_printer != printer_id:
+            return {"error": "Approved print target does not match the selected printer"}
+
+        with tempfile.NamedTemporaryFile(suffix=Path(request.printer_file).suffix) as captured:
+            captured.write(request.artifact.content)
+            captured.flush()
+            upload = await adapter.upload_file(captured.name, request.printer_file)
+        if upload.status is not CommandResultStatus.SUCCESS:
+            return {"error": f"Upload failed: {upload.message}"}
+
+        approval = service.approve(request.request_id, binding=request.binding)
+        receipt = await service.execute(
+            approval.token,
+            operation_id=request.operation_id,
+            binding=request.binding,
+        )
+        return {
+            "printer_id": printer_id,
+            "filename": request.printer_file,
+            "status": "printing" if receipt.started else "rejected",
+            "adapter_status": receipt.adapter_status,
+            "message": receipt.message,
+            "operation_id": receipt.operation_id,
+            "request_id": receipt.request_id,
+            "artifact_sha256": receipt.artifact_sha256,
+        }
+
     # --- Read-only tools ---
 
     async def _get_printer_state(self, tool_input: dict) -> dict:
@@ -1163,22 +1328,38 @@ class ToolExecutor:
         if approval_error:
             return approval_error
         effective_input = approved_input or tool_input
-        filename = effective_input.get("filename", "")
+        filename = str(effective_input.get("filename") or "").strip()
         if not filename:
             return {"error": "filename is required"}
-        if approved_input is None:
-            return self._create_approval(
-                request_context,
-                "start_print",
-                {"filename": filename, "printer_id": effective_input.get("printer_id")},
-                "Starting a print job changes printer state and requires explicit approval.",
-            )
         selected = self._require_adapter(effective_input)
         if isinstance(selected, dict):
             return selected
-        _printer_id, adapter = selected
-        cmd = await adapter.start_print(filename)
-        return self._cmd_result(cmd)
+        printer_id, adapter = selected
+        if approved_input is not None:
+            return await self._execute_print_approval(
+                approved_input=approved_input,
+                printer_id=printer_id,
+                adapter=adapter,
+                request_context=request_context,
+            )
+
+        local_path = self._local_gcode_path(filename)
+        if local_path is None:
+            return {
+                "error": (
+                    "Print start requires a complete local G-code artifact in "
+                    "data/uploads or data/sliced; remote-only files cannot be "
+                    "validated and approved safely"
+                )
+            }
+        source_trust = "sva_generated" if local_path.parent.name == "sliced" else "user_gcode"
+        return await self._create_print_approval(
+            tool_name="start_print",
+            source_path=local_path,
+            printer_id=printer_id,
+            source_trust=source_trust,
+            request_context=request_context,
+        )
 
     async def _pause_print(self, tool_input: dict) -> dict:
         selected = self._require_adapter(tool_input)
@@ -1301,6 +1482,9 @@ class ToolExecutor:
         request_context = request_context or ChatRequestContext(
             logical_user_id="unknown", channel="unknown", active_printer=None
         )
+        submitted_command = str(tool_input.get("command", ""))
+        if is_print_start_command(submitted_command):
+            return {"error": print_start_block_message()}
         approved_input, approval_error = self._consume_approval(
             "run_gcode", tool_input, request_context
         )
@@ -1312,9 +1496,11 @@ class ToolExecutor:
         if isinstance(selected, dict):
             return selected
         printer_id, adapter = selected
-        command = effective_input.get("command", "").strip()
+        command = str(effective_input.get("command", "")).strip()
         if not command:
             return {"error": "command is required"}
+        if is_print_start_command(command):
+            return {"error": print_start_block_message()}
         validation_error = validate_gcode_command(command)
         if validation_error:
             return {"error": validation_error}
@@ -1327,12 +1513,10 @@ class ToolExecutor:
                     request_context,
                     "run_gcode",
                     {"command": safe_command, "printer_id": printer_id},
-                    (
-                        "Raw G-code is not in the configured allowlist. "
-                        f"{reason}. Explicit approval is required."
-                    ),
+                    reason,
                 )
         cmd = await adapter.run_gcode(safe_command)
+
         result = self._cmd_result(cmd)
         if cmd.data:
             result["data"] = cmd.data
@@ -1615,30 +1799,39 @@ class ToolExecutor:
         request_context = request_context or ChatRequestContext(
             logical_user_id="unknown", channel="unknown", active_printer=None
         )
+        submitted_name = str(tool_input.get("name", ""))
+        if is_print_start_command(submitted_name):
+            return {"error": print_start_block_message()}
         approved_input, approval_error = self._consume_approval(
             "execute_macro", tool_input, request_context
         )
         if approval_error:
             return approval_error
         effective_input = approved_input or tool_input
-        name = effective_input.get("name", "").strip()
+        name = str(effective_input.get("name", "")).strip()
         if not name:
             return {"error": "name is required"}
+        if is_print_start_command(name):
+            return {"error": print_start_block_message()}
+        validation_error = validate_macro_command(name)
+        if validation_error:
+            return {"error": validation_error}
+        safe_name = _strip_gcode_comment(name)
         if approved_input is None:
             return self._create_approval(
                 request_context,
                 "execute_macro",
-                {"name": name, "printer_id": effective_input.get("printer_id")},
+                {"name": safe_name, "printer_id": effective_input.get("printer_id")},
                 "Executing arbitrary printer macros requires explicit approval.",
             )
         selected = self._require_adapter(effective_input)
         if isinstance(selected, dict):
             return selected
         _printer_id, adapter = selected
-        cmd = await adapter.execute_macro(name)
+        cmd = await adapter.execute_macro(safe_name)
         result = self._cmd_result(cmd)
         if cmd.status == CommandResultStatus.SUCCESS:
-            result["message"] = f"Executed macro: {name}"
+            result["message"] = f"Executed macro: {safe_name}"
         return result
 
     # --- System ---
@@ -1718,60 +1911,6 @@ class ToolExecutor:
 
 
     # --- System utility tools ---
-
-    async def _run_bash(self, tool_input: dict) -> dict:
-        command = str(tool_input.get("command", "")).strip()
-        if not command:
-            return {"error": "command is required"}
-
-        timeout = min(
-            float(tool_input.get("timeout_seconds") or self._shell_config.timeout_seconds),
-            self._shell_config.timeout_seconds,
-        )
-        root = Path(self._shell_config.cwd).resolve()
-        requested_cwd = tool_input.get("cwd") or "."
-        cwd = (root / str(requested_cwd)).resolve()
-        if cwd != root and root not in cwd.parents:
-            return {"error": f"cwd must stay under {root}"}
-        if not cwd.exists() or not cwd.is_dir():
-            return {"error": f"cwd does not exist: {cwd}"}
-
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/bash",
-            "-lc",
-            command,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        timed_out = False
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            timed_out = True
-            proc.kill()
-            stdout_b, stderr_b = await proc.communicate()
-
-        stdout = stdout_b.decode("utf-8", errors="replace")
-        stderr = stderr_b.decode("utf-8", errors="replace")
-        truncated = False
-        max_chars = self._shell_config.max_output_chars
-        if len(stdout) > max_chars:
-            stdout = stdout[:max_chars] + "\n... [stdout truncated]"
-            truncated = True
-        if len(stderr) > max_chars:
-            stderr = stderr[:max_chars] + "\n... [stderr truncated]"
-            truncated = True
-
-        return {
-            "command": command,
-            "cwd": str(cwd),
-            "exit_code": proc.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timed_out": timed_out,
-            "truncated": truncated,
-        }
 
     async def _web_search(self, tool_input: dict) -> dict:
         query = str(tool_input.get("query", "")).strip()
@@ -2144,7 +2283,7 @@ class ToolExecutor:
             jpeg_bytes = await asyncio.wait_for(
                 asyncio.to_thread(_capture), timeout=15
             )
-        except (asyncio.TimeoutError, Exception) as e:
+        except Exception as e:
             logger.warning(f"RTSP capture failed ({type(e).__name__}): {e}")
             return {"error": f"Failed to capture frame from camera: {type(e).__name__}"}
         if not jpeg_bytes:
@@ -2315,30 +2454,19 @@ class ToolExecutor:
         tool_input: dict[str, Any],
         request_context: ChatRequestContext,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        token = (tool_input.get("approval_token") or "").strip()
-        if token:
-            record = self._approval_store.approve(
-                token, request_context.logical_user_id, tool_name
-            )
-            if record is None:
-                return None, {"error": f"Invalid or expired approval_token for {tool_name}"}
-            merged = dict(record.payload)
-            merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
-            return merged, None
+        token = str(tool_input.get("approval_token") or "").strip()
+        if not token:
+            return None, None
 
-        for record in self._approval_store._records.values():
-            if (
-                record.tool_name == tool_name
-                and record.logical_user_id == request_context.logical_user_id
-                and record.status == "approved"
-                and record.approved_at is not None
-            ):
-                record.status = "consumed"
-                merged = dict(record.payload)
-                merged.update({k: v for k, v in tool_input.items() if k != "approval_token"})
-                return merged, None
-
-        return None, None
+        record = self._approval_store.consume(
+            token,
+            request_context.logical_user_id,
+            request_context.channel,
+            tool_name,
+        )
+        if record is None:
+            return None, {"error": f"Invalid or expired approval_token for {tool_name}"}
+        return record.payload, None
 
     # --- Printer memo tools ---
 
@@ -2415,6 +2543,8 @@ class ToolExecutor:
         tool_input: dict,
         request_context: ChatRequestContext | None = None,
     ) -> dict:
+        if not self._shell_config.allow_printer_config_updates:
+            return {"error": "Printer configuration updates are disabled by local policy"}
         request_context = request_context or ChatRequestContext(
             logical_user_id="unknown", channel="unknown", active_printer=None,
         )
@@ -2424,13 +2554,14 @@ class ToolExecutor:
         if approval_error:
             return approval_error
 
-        section = tool_input.get("section", "").strip()
-        key = tool_input.get("key", "").strip()
-        value = str(tool_input.get("value", "")).strip()
+        effective_input = approved_input or tool_input
+        section = effective_input.get("section", "").strip()
+        key = effective_input.get("key", "").strip()
+        value = str(effective_input.get("value", "")).strip()
         if not section or not key:
             return {"error": "Both 'section' and 'key' are required"}
 
-        selected = self._require_adapter(tool_input)
+        selected = self._require_adapter(effective_input)
         if isinstance(selected, dict):
             return selected
         printer_id, adapter = selected
@@ -2516,134 +2647,38 @@ class ToolExecutor:
         if approval_error:
             return approval_error
 
-        filename = tool_input.get("filename", "").strip()
+        effective_input = approved_input or tool_input
+        filename = str(effective_input.get("filename") or "").strip()
         if not filename:
             return {"error": "filename is required"}
-
-        selected = self._require_adapter(tool_input)
+        selected = self._require_adapter(effective_input)
         if isinstance(selected, dict):
             return selected
         printer_id, adapter = selected
-
-        if approved_input is None:
-            return self._create_approval(
-                request_context,
-                "start_print_with_monitor",
-                {"filename": filename, "printer_id": printer_id},
-                f"Starting print '{filename}' on {printer_id} with background monitoring. "
-                "This will upload the file and begin printing.",
+        if approved_input is not None:
+            return await self._execute_print_approval(
+                approved_input=approved_input,
+                printer_id=printer_id,
+                adapter=adapter,
+                request_context=request_context,
             )
 
-        local_path = Path("data/uploads") / filename
-        if not local_path.exists():
-            local_path = Path("data/sliced") / filename
-        if not local_path.exists():
-            return {"error": f"File not found locally: data/uploads/{filename} or data/sliced/{filename}"}
-
-        gcode_content = local_path.read_text(errors="replace")[:5000]
-
-        has_g28 = any(line.strip().startswith("G28") for line in gcode_content.split("\n"))
-        if not has_g28:
-            return {"error": "SAFETY BLOCKER: G-code has no G28 (homing). Refusing to print — this caused a crash on 2026-07-16."}
-
-        has_heat = "M104" in gcode_content or "M109" in gcode_content
-        if not has_heat:
-            return {"error": "SAFETY BLOCKER: G-code has no M104/M109 (nozzle heating). Refusing to print."}
-
-        config_result = await adapter.get_config_file(filename="printer.cfg", max_bytes=200000)
-        if config_result.status != CommandResultStatus.SUCCESS:
-            return {"error": f"SAFETY BLOCKER: Cannot read printer.cfg for pre-print validation: {config_result.message}"}
-        config_text = config_result.data.get("content", "")
-
-        cfg_nozzle = "0.4"
-        for line in config_text.split("\n"):
-            if "nozzle_diameter" in line and not line.strip().startswith("#"):
-                cfg_nozzle = line.split(":")[1].strip()
-                break
-
-        import re as _re
-        gcode_nozzle_match = _re.search(r"nozzle_diameter.*?(\d+\.?\d*)", gcode_content)
-        gcode_nozzle = gcode_nozzle_match.group(1) if gcode_nozzle_match else None
-
-        progress = await adapter.get_print_progress()
-        nozzle_temp = getattr(progress, "nozzle_temp", 0) or 0
-        bed_temp = getattr(progress, "bed_temp", 0) or 0
-
-        from sensing_voxel.core.models import NormalizedPrinterState
-        progress_state = getattr(progress, "state", None)
-        state_name = progress_state.name if hasattr(progress_state, "name") else str(progress_state)
-        if state_name == "PRINTING":
-            return {"error": f"SAFETY BLOCKER: {printer_id} is already printing. Cannot start new print."}
-
-        gcode_move_data = {}
-        if hasattr(adapter, "_rest_request"):
-            gm_result = await adapter._rest_request("GET", "/printer/objects/query?gcode_move")
-            if gm_result.status == CommandResultStatus.SUCCESS and gm_result.data:
-                gcode_move_data = gm_result.data.get("status", {}).get("gcode_move", {})
-        homing_origin_z = gcode_move_data.get("homing_origin", [0,0,0,0])[2] if gcode_move_data else 0
-        current_z = gcode_move_data.get("position", [0,0,0,0])[2] if gcode_move_data else 0
-        if abs(homing_origin_z) > 2.0:
-            return {"error": f"SAFETY BLOCKER: homing_origin Z = {homing_origin_z:.2f}mm — abnormal (should be near 0 after G28 homing). This means Z-axis reference is corrupted. Refusing to print — would cause crash."}
-        if current_z < -1.0:
-            return {"error": f"SAFETY BLOCKER: current Z position = {current_z:.2f}mm — below bed surface. Z-axis is in crashed state. Refusing to print."}
-
-        probe_data = {}
-        if hasattr(adapter, "_rest_request"):
-            probe_result = await adapter._rest_request("GET", "/printer/objects/query?probe")
-            if probe_result.status == CommandResultStatus.SUCCESS and probe_result.data:
-                probe_data = probe_result.data.get("status", {}).get("probe", {})
-        probe_z_offset = probe_data.get("z_offset") if probe_data else None
-        if probe_z_offset is not None and probe_z_offset == 0.0:
-            return {"error": f"SAFETY BLOCKER: probe z_offset is 0.0 — probe is not calibrated or damaged. Refusing to print (this caused Z crash on 2026-07-16). Run Z_ENDSTOP_CALIBRATE or PROBE_CALIBRATE first."}
-
-        validation_report = {
-            "printer": printer_id,
-            "printer_state": state_name,
-            "nozzle_in_cfg": f"{cfg_nozzle}mm",
-            "nozzle_in_gcode": f"{gcode_nozzle}mm" if gcode_nozzle else "not found in header",
-            "nozzle_match": (gcode_nozzle is None or gcode_nozzle == cfg_nozzle),
-            "current_nozzle_temp": f"{nozzle_temp:.0f}°C",
-            "current_bed_temp": f"{bed_temp:.0f}°C",
-            "probe_z_offset": probe_z_offset,
-            "g28_present": has_g28,
-            "heating_present": has_heat,
-        }
-
-        if gcode_nozzle and gcode_nozzle != cfg_nozzle:
-            return {"error": f"SAFETY BLOCKER: nozzle mismatch — G-code sliced for {gcode_nozzle}mm but printer.cfg says {cfg_nozzle}mm.", "validation": validation_report}
-
-        validation_summary = (
-            f"Pre-print validation:\n"
-            f"  Printer: {printer_id} (state: {state_name})\n"
-            f"  Nozzle: cfg={cfg_nozzle}mm gcode={gcode_nozzle or '?'}mm {'✅' if validation_report['nozzle_match'] else '❌'}\n"
-            f"  Temps: nozzle={nozzle_temp:.0f}°C bed={bed_temp:.0f}°C\n"
-            f"  Probe z_offset: {probe_z_offset}\n"
-            f"  G28: {'✅' if has_g28 else '❌'}  Heating: {'✅' if has_heat else '❌'}\n"
+        local_path = self._local_gcode_path(filename)
+        if local_path is None:
+            return {
+                "error": (
+                    "Print start requires a complete local G-code artifact in "
+                    "data/uploads or data/sliced"
+                )
+            }
+        source_trust = "sva_generated" if local_path.parent.name == "sliced" else "user_gcode"
+        return await self._create_print_approval(
+            tool_name="start_print_with_monitor",
+            source_path=local_path,
+            printer_id=printer_id,
+            source_trust=source_trust,
+            request_context=request_context,
         )
-        logger.info(f"Pre-print validation for {printer_id}: {validation_report}")
-
-        remote_name = _normalize_filename(filename)
-        upload_result = await adapter.upload_file(str(local_path), remote_name)
-        if upload_result.status != CommandResultStatus.SUCCESS:
-            return {"error": f"Upload failed: {upload_result.message}", "validation": validation_report}
-
-        start_result = await adapter.start_print(remote_name)
-        if start_result.status != CommandResultStatus.SUCCESS:
-            return {"error": f"Start print failed: {start_result.message}", "validation": validation_report}
-
-        monitor = self._print_monitors.get(printer_id)
-        if monitor:
-            await monitor.start_monitoring(filename=remote_name)
-            monitor_status = "active"
-        else:
-            monitor_status = "not_configured"
-
-        return {
-            "printer_id": printer_id,
-            "filename": remote_name,
-            "status": "printing",
-            "monitor": monitor_status,
-        }
 
     async def _acknowledge_anomaly(self, tool_input: dict) -> dict:
         selected = self._require_adapter(tool_input)
@@ -2707,66 +2742,102 @@ class ToolExecutor:
                 "hint": "Call approve_pending with the approval_token, then retry the original tool with the payload + approval_token.",
             }
 
-        for record in self._approval_store.tail(
-            logical_user_id=request_context.logical_user_id,
-            limit=20,
-            status="pending",
+        record = self._approval_store.get(token)
+        if (
+            record is None
+            or record.status != "pending"
+            or record.logical_user_id != request_context.logical_user_id
+            or record.channel != request_context.channel
         ):
-            if record.get("approval_token") == token:
-                tool_name = record.get("tool_name", "")
-                payload = record.get("payload", {})
-                approved = self._approval_store.approve(
-                    token, request_context.logical_user_id, tool_name
-                )
-                if approved is None:
-                    return {"error": f"Approval failed for token {token}"}
-                return {
-                    "status": "approved",
-                    "tool_name": tool_name,
-                    "payload": payload,
-                    "approval_token": token,
-                    "instruction": (
-                        f"Now call {tool_name} with these parameters plus approval_token={token}. "
-                        f"Do NOT omit approval_token — it is required for the call to execute."
-                    ),
-                }
+            return {"error": f"Token {token} not found among pending approvals"}
 
-        return {"error": f"Token {token} not found among pending approvals"}
+        approved = self._approval_store.approve(
+            token,
+            request_context.logical_user_id,
+            request_context.channel,
+            record.tool_name,
+        )
+        if approved is None:
+            return {"error": f"Approval failed for token {token}"}
+        return {
+            "status": "approved",
+            "tool_name": approved.tool_name,
+            "payload": approved.payload,
+            "approval_token": token,
+            "instruction": (
+                f"Now call {approved.tool_name} with the approval_token={token}. "
+                "The approved payload is immutable and will be used exactly as stored."
+            ),
+        }
 
-    async def _slice_model(self, tool_input: dict) -> dict:
-        filename = tool_input.get("filename", "").strip()
+    async def _slice_model(
+        self,
+        tool_input: dict,
+        request_context: ChatRequestContext | None = None,
+    ) -> dict:
+        request_context = request_context or ChatRequestContext(
+            logical_user_id="unknown", channel="unknown", active_printer=None,
+        )
+        filename = str(tool_input.get("filename") or "").strip()
         if not filename:
             return {"error": "filename is required"}
+        if Path(filename).name != filename:
+            return {"error": "filename must not contain path components"}
+        if self._slicer_config is None:
+            return {"error": "Runtime slicer configuration is unavailable"}
 
-        stl_path = Path("data/uploads") / filename
-        if not stl_path.exists():
-            return {"error": f"File not found: {stl_path}"}
+        selected = self._require_adapter(tool_input)
+        if isinstance(selected, dict):
+            return selected
+        printer_id, _adapter = selected
+
+        model_path = Path("data/uploads") / filename
+        if not model_path.is_file():
+            return {"error": f"File not found: {model_path}"}
 
         from sensing_voxel.slicer.pipeline import SlicerPipeline
-        from sensing_voxel.config import SlicerConfig
 
-        pipeline = SlicerPipeline(SlicerConfig())
+        pipeline = SlicerPipeline(self._slicer_config)
         result = await pipeline.process_model(
-            model_path=stl_path,
-            output_name=stl_path.stem,
+            model_path=model_path,
+            output_name=model_path.stem,
             timeout_seconds=600,
         )
 
         if result.errors:
             return {"filename": filename, "errors": result.errors}
+        if not result.gcode_path.is_file():
+            return {"error": "Slicer did not produce a complete local G-code artifact"}
 
-        output_name = result.gcode_path.name
-        summary = pipeline.format_summary(result)
+        approval = await self._create_print_approval(
+            tool_name="start_print_with_monitor",
+            source_path=result.gcode_path,
+            printer_id=printer_id,
+            source_trust="sva_generated",
+            request_context=request_context,
+        )
+        if "error" in approval:
+            return approval
 
         return {
-            "status": "sliced",
+            "status": "sliced_approval_required",
             "input": filename,
-            "output": output_name,
-            "output_path": str(result.gcode_path),
-            "size_kb": result.gcode_path.stat().st_size // 1024 if result.gcode_path.exists() else 0,
-            "estimated_print_time": str(result.estimated_print_time) if result.estimated_print_time else None,
+            "output": result.gcode_path.name,
+            "size_kb": result.gcode_path.stat().st_size // 1024,
+            "estimated_print_time": (
+                str(result.estimated_print_time) if result.estimated_print_time else None
+            ),
             "estimated_filament_mm": result.estimated_filament_mm,
-            "total_layers": result.first_layer_params.layer_height if result.first_layer_params else None,
-            "summary": summary,
-            "next_step": f"Use start_print_with_monitor with filename='{output_name}' to upload and print.",
+            "layer_height": (
+                result.first_layer_params.layer_height
+                if result.first_layer_params else None
+            ),
+            "approval": approval,
+            "validation": approval["payload"]["validation"],
+            "preview": approval["payload"]["preview"],
+            "preview_sha256": approval["payload"]["preview_sha256"],
+            "artifact_sha256": approval["payload"]["artifact_sha256"],
+            "binding": approval["payload"]["binding"],
+            "request_id": approval["payload"]["request_id"],
+            "operation_id": approval["payload"]["operation_id"],
         }
