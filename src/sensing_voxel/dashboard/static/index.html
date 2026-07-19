@@ -6,7 +6,19 @@
   <title>Sensing Voxel</title>
   <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
-<body>
+<body class="auth-required">
+  <section id="auth-panel" class="auth-panel" aria-labelledby="auth-title">
+    <form id="auth-form" class="auth-card" autocomplete="off">
+      <div class="header-logo">Sensing <span>Voxel</span></div>
+      <h1 id="auth-title">Dashboard authentication</h1>
+      <p>Enter the operator API token. It is kept only for this browser tab.</p>
+      <label for="auth-token">API token</label>
+      <input id="auth-token" name="token" type="password" required autocomplete="off" spellcheck="false">
+      <p id="auth-error" class="auth-error" role="alert" aria-live="polite"></p>
+      <button id="auth-submit" class="btn auth-submit" type="submit">Connect</button>
+    </form>
+  </section>
+
   <!-- Header -->
   <header class="header">
     <div class="header-left">
@@ -19,6 +31,7 @@
       </select>
       <div id="connection-dot" class="connection-dot"></div>
       <span class="connection-label">Disconnected</span>
+      <button id="auth-logout" class="chat-clear-btn auth-logout" type="button">Log out</button>
     </div>
   </header>
 
@@ -97,20 +110,17 @@
       </div>
       <div class="camera-feed-container">
         <img id="camera-feed" class="camera-feed"
-             src="/api/v1/camera/stream"
-             alt="Camera feed"
-             onerror="this.style.display='none';document.getElementById('camera-no-feed').style.display='flex'"
-             onload="document.getElementById('camera-no-feed').style.display='none'">
+             alt="Camera feed">
         <div class="camera-no-feed" id="camera-no-feed">No camera feed</div>
       </div>
       <div class="camera-ptz-controls">
-        <button class="ptz-btn" onclick="cameraMove('up')" title="Tilt Up">&#9650;</button>
+        <button id="camera-up" class="ptz-btn" type="button" title="Tilt Up">&#9650;</button>
         <div class="ptz-row">
-          <button class="ptz-btn" onclick="cameraMove('left')" title="Pan Left">&#9664;</button>
+          <button id="camera-left" class="ptz-btn" type="button" title="Pan Left">&#9664;</button>
           <div class="ptz-center"></div>
-          <button class="ptz-btn" onclick="cameraMove('right')" title="Pan Right">&#9654;</button>
+          <button id="camera-right" class="ptz-btn" type="button" title="Pan Right">&#9654;</button>
         </div>
-        <button class="ptz-btn" onclick="cameraMove('down')" title="Tilt Down">&#9660;</button>
+        <button id="camera-down" class="ptz-btn" type="button" title="Tilt Down">&#9660;</button>
       </div>
     </section>
 
@@ -178,7 +188,7 @@
     <section class="card queue-panel">
       <div class="card-header">
         <span class="card-title">Print Queue</span>
-        <button class="btn-icon" onclick="clearQueue()" title="Clear queue">&#10005;</button>
+        <button id="queue-clear" class="btn-icon" type="button" title="Clear queue">&#10005;</button>
       </div>
       <div class="queue-list" id="queue-list">
         <p class="no-queue">Queue is empty</p>
@@ -192,7 +202,7 @@
           <div id="chat-connection-dot" class="connection-dot"></div>
           <span class="card-title">AI Chat</span>
         </div>
-        <button class="chat-clear-btn" onclick="clearChat()">Clear</button>
+        <button id="chat-clear" class="chat-clear-btn" type="button">Clear</button>
       </div>
       <div id="chat-messages" class="chat-messages drop-zone">
         <div class="chat-welcome">Ask me anything about 3D printing or your printer status.</div>
@@ -201,13 +211,13 @@
         <div id="file-indicator" class="chat-file-indicator">
           <span>&#128206;</span>
           <span id="file-name">filename.gcode</span>
-          <button class="chat-clear-btn" onclick="cancelUpload()" style="margin-left: auto">&times;</button>
+          <button id="file-cancel" class="chat-clear-btn file-cancel" type="button">&times;</button>
         </div>
         <div class="chat-input-row">
-          <button class="btn-icon" onclick="document.getElementById('chat-file-input').click()" title="Attach file">&#128206;</button>
+          <button id="file-attach" class="btn-icon" type="button" title="Attach file">&#128206;</button>
           <input type="file" id="chat-file-input" style="display: none" accept=".gcode,.bgcode">
           <input type="text" id="chat-input" placeholder="Ask about printing..." autocomplete="off">
-          <button class="btn chat-send-btn" id="chat-send" onclick="sendChatMessage()">Send</button>
+          <button class="btn chat-send-btn" id="chat-send" type="button">Send</button>
         </div>
       </div>
     </section>

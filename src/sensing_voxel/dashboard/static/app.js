@@ -12,6 +12,77 @@
   let reconnectAttempts = 0;
   const MAX_RECONNECT_DELAY = 30000;
   const BASE_RECONNECT_DELAY = 1000;
+  const AUTH_STORAGE_KEY = "sensingVoxelApiToken";
+  const WS_APPLICATION_PROTOCOL = "sensing-voxel.v1";
+  const WS_AUTH_PROTOCOL_PREFIX = "sensing-voxel.auth.";
+  const nativeFetch = window.fetch.bind(window);
+  let apiToken = sessionStorage.getItem(AUTH_STORAGE_KEY);
+  let dashboardStarted = false;
+  let cameraAbortController = null;
+  let cameraFrameUrl = null;
+
+  function encodeWebSocketToken(token) {
+    const bytes = new TextEncoder().encode(token);
+    let binary = "";
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  }
+
+  function setAuthError(message) {
+    const error = document.querySelector("#auth-error");
+    if (error) error.textContent = message || "";
+  }
+
+  function showAuthentication(message = "") {
+    document.body.classList.add("auth-required");
+    setAuthError(message);
+    const input = document.querySelector("#auth-token");
+    if (input) {
+      input.value = "";
+      input.focus();
+    }
+  }
+
+  function clearAuthentication(message = "Your session is not authorized. Enter the token again.") {
+    sessionStorage.removeItem(AUTH_STORAGE_KEY);
+    apiToken = null;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws) {
+      ws.onclose = null;
+      ws.close();
+      ws = null;
+    }
+    if (cameraAbortController) {
+      cameraAbortController.abort();
+      cameraAbortController = null;
+    }
+    showAuthentication(message);
+  }
+
+  async function authenticatedFetch(input, init = {}) {
+    if (!apiToken) throw new Error("Dashboard authentication is required");
+    const headers = new Headers(init.headers || {});
+    headers.set("Authorization", `Bearer ${apiToken}`);
+    const response = await nativeFetch(input, { ...init, headers });
+    if (response.status === 401) clearAuthentication();
+    return response;
+  }
+
+  async function authenticate(token) {
+    apiToken = token;
+    const response = await authenticatedFetch("/api/v1/status");
+    if (!response.ok) {
+      if (response.status !== 401) apiToken = null;
+      throw new Error(response.status === 401 ? "Invalid API token" : "Unable to verify API token");
+    }
+    sessionStorage.setItem(AUTH_STORAGE_KEY, token);
+    document.body.classList.remove("auth-required");
+    setAuthError("");
+    startDashboard();
+  }
 
   const state = {
     agentState: "UNKNOWN",
@@ -48,12 +119,19 @@
 
   // --- WebSocket ---
   function connectWebSocket() {
+    if (!apiToken) return;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/api/v1/ws`;
+    const authProtocol = WS_AUTH_PROTOCOL_PREFIX + encodeWebSocketToken(apiToken);
 
-    ws = new WebSocket(url);
+    ws = new WebSocket(url, [WS_APPLICATION_PROTOCOL, authProtocol]);
 
     ws.onopen = () => {
+      if (ws.protocol !== WS_APPLICATION_PROTOCOL) {
+        ws.close(1002, "Required application protocol was not negotiated");
+        clearAuthentication("The server rejected dashboard authentication.");
+        return;
+      }
       reconnectAttempts = 0;
       updateConnectionDot(true);
       addAlert("info", "Connected to server");
@@ -79,7 +157,7 @@
   }
 
   function scheduleReconnect() {
-    if (reconnectTimer) return;
+    if (reconnectTimer || !apiToken || document.body.classList.contains("auth-required")) return;
     const delay = Math.min(
       BASE_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts),
       MAX_RECONNECT_DELAY
@@ -190,25 +268,40 @@
     addAlert("success", `Decision: ${data.action} for ${data.job_id}`);
   }
 
+  function createElement(tag, className = "", text) {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    if (text !== undefined) element.textContent = String(text);
+    return element;
+  }
+
+  function replaceWithMessage(container, tag, className, text) {
+    container.replaceChildren(createElement(tag, className, text));
+  }
+
   // --- Printer selector ---
   function updatePrinterSelect() {
     const select = $("#printer-select");
     if (!select) return;
 
     const printerIds = Object.keys(state.printers);
+    select.replaceChildren();
     if (printerIds.length === 0) {
-      select.innerHTML = '<option value="">No printers</option>';
+      const option = createElement("option", "", "No printers");
+      option.value = "";
+      select.appendChild(option);
       return;
     }
 
-    select.innerHTML = printerIds
-      .map((pid) => {
-        const p = state.printers[pid];
-        const dot = p.connected ? "\u25cf" : "\u25cb";
-        const active = pid === state.activePrinter ? " *" : "";
-        return `<option value="${escapeHtml(pid)}" ${pid === state.selectedPrinter ? "selected" : ""}>${dot} ${escapeHtml(pid)}${active}</option>`;
-      })
-      .join("");
+    printerIds.forEach((pid) => {
+      const printer = state.printers[pid];
+      const dot = printer.connected ? "\u25cf" : "\u25cb";
+      const active = pid === state.activePrinter ? " *" : "";
+      const option = createElement("option", "", `${dot} ${pid}${active}`);
+      option.value = pid;
+      option.selected = pid === state.selectedPrinter;
+      select.appendChild(option);
+    });
   }
 
   function updatePrinterFilters() {
@@ -217,9 +310,15 @@
 
     const printerIds = Object.keys(state.printers);
     const currentVal = filter.value;
-
-    filter.innerHTML = '<option value="">All Printers</option>' +
-      printerIds.map(pid => `<option value="${escapeHtml(pid)}">${escapeHtml(pid)}</option>`).join("");
+    filter.replaceChildren();
+    const allOption = createElement("option", "", "All Printers");
+    allOption.value = "";
+    filter.appendChild(allOption);
+    printerIds.forEach((pid) => {
+      const option = createElement("option", "", pid);
+      option.value = pid;
+      filter.appendChild(option);
+    });
 
     if (currentVal && printerIds.includes(currentVal)) {
       filter.value = currentVal;
@@ -286,36 +385,40 @@
   function updateJobPanel() {
     const panel = $(".job-panel");
     if (!panel) return;
+    const content = panel.querySelector(".job-content");
+    if (!content) return;
 
     const job = state.job;
     if (!job) {
-      panel.querySelector(".job-content").innerHTML =
-        '<p class="no-job">No active job</p>';
+      replaceWithMessage(content, "p", "no-job", "No active job");
       return;
     }
 
-    const progress = job.progress != null ? (job.progress * 100).toFixed(1) : 0;
+    const progressNumber = Number(job.progress);
+    const progress = Number.isFinite(progressNumber)
+      ? Math.max(0, Math.min(100, progressNumber * 100))
+      : 0;
+    const progressText = progress.toFixed(1);
     const layers = job.current_layer != null && job.total_layers != null
       ? `${job.current_layer} / ${job.total_layers}`
       : "--";
     const time = job.print_time != null ? formatTime(job.print_time) : "--";
 
-    panel.querySelector(".job-content").innerHTML = `
-      <div class="job-filename">${escapeHtml(job.job_file || job.filename || "Unknown")}</div>
-      <div class="progress-container">
-        <div class="progress-bar">
-          <div class="progress-fill" style="width: ${progress}%"></div>
-        </div>
-        <div class="progress-text">
-          <span>${progress}%</span>
-          <span>${time}</span>
-        </div>
-      </div>
-      <div class="job-meta">
-        <span>Job: ${escapeHtml(job.job_id || "--")}</span>
-        <span>Layers: ${layers}</span>
-      </div>
-    `;
+    const filename = createElement("div", "job-filename", job.job_file || job.filename || "Unknown");
+    const progressContainer = createElement("div", "progress-container");
+    const progressBar = createElement("div", "progress-bar");
+    const progressFill = createElement("div", "progress-fill");
+    progressFill.style.width = `${progress}%`;
+    progressBar.appendChild(progressFill);
+    const labels = createElement("div", "progress-text");
+    labels.append(createElement("span", "", `${progressText}%`), createElement("span", "", time));
+    progressContainer.append(progressBar, labels);
+    const metadata = createElement("div", "job-meta");
+    metadata.append(
+      createElement("span", "", `Job: ${job.job_id || "--"}`),
+      createElement("span", "", `Layers: ${layers}`)
+    );
+    content.replaceChildren(filename, progressContainer, metadata);
   }
 
   function updateTempsPanel() {
@@ -366,38 +469,46 @@
 
     const content = panel.querySelector(".decision-content");
     if (!state.decisionToken) {
-      content.innerHTML = '<p class="no-decision">No pending decisions</p>';
+      replaceWithMessage(content, "p", "no-decision", "No pending decisions");
       return;
     }
 
     const isApproval = state.agentState === "AWAITING_APPROVAL";
     const isPaused = state.agentState === "PAUSED_PENDING_USER";
-
-    let buttons = "";
+    const prompt = createElement(
+      "p",
+      "decision-prompt",
+      isApproval ? "Print job awaiting your approval." : "Print paused. What would you like to do?"
+    );
+    const buttons = createElement("div", "decision-buttons");
+    const addDecisionButton = (label, className, action) => {
+      const button = createElement("button", `btn ${className}`, label);
+      button.type = "button";
+      button.addEventListener("click", () => window.sendDecision(action));
+      buttons.appendChild(button);
+    };
     if (isApproval) {
-      buttons = `
-        <button class="btn btn-approve" onclick="sendDecision('approve')">Approve</button>
-        <button class="btn btn-reject" onclick="sendDecision('reject')">Reject</button>
-      `;
+      addDecisionButton("Approve", "btn-approve", "approve");
+      addDecisionButton("Reject", "btn-reject", "reject");
     } else if (isPaused) {
-      buttons = `
-        <button class="btn btn-resume" onclick="sendDecision('resume')">Resume</button>
-        <button class="btn btn-cancel" onclick="sendDecision('cancel')">Cancel Print</button>
-      `;
+      addDecisionButton("Resume", "btn-resume", "resume");
+      addDecisionButton("Cancel Print", "btn-cancel", "cancel");
     }
-
-    content.innerHTML = `
-      <p class="decision-prompt">
-        ${isApproval ? "Print job awaiting your approval." : "Print paused. What would you like to do?"}
-      </p>
-      <div class="decision-buttons">${buttons}</div>
-    `;
+    content.replaceChildren(prompt, buttons);
   }
 
   // --- Alert management ---
+  function chatRoleClass(role) {
+    return ["assistant", "system", "user"].includes(role) ? role : "assistant";
+  }
+
+  function alertTypeClass(type) {
+    return ["error", "info", "success", "warning"].includes(type) ? type : "info";
+  }
+
   function addAlert(type, message) {
     const alert = {
-      type: type,
+      type: alertTypeClass(type),
       message: message,
       timestamp: new Date().toISOString(),
     };
@@ -411,20 +522,21 @@
     if (!list) return;
 
     if (state.alerts.length === 0) {
-      list.innerHTML = '<p class="no-alerts">No recent alerts</p>';
+      replaceWithMessage(list, "p", "no-alerts", "No recent alerts");
       return;
     }
 
-    list.innerHTML = state.alerts
-      .map(
-        (a) => `
-        <div class="alert-item ${a.type}">
-          <div class="alert-dot ${a.type}"></div>
-          <div class="alert-content">${escapeHtml(a.message)}</div>
-          <div class="alert-time">${formatAlertTime(a.timestamp)}</div>
-        </div>`
-      )
-      .join("");
+    const fragment = document.createDocumentFragment();
+    state.alerts.forEach((alert) => {
+      const item = createElement("div", `alert-item ${alert.type}`);
+      item.append(
+        createElement("div", `alert-dot ${alert.type}`),
+        createElement("div", "alert-content", alert.message),
+        createElement("div", "alert-time", formatAlertTime(alert.timestamp))
+      );
+      fragment.appendChild(item);
+    });
+    list.replaceChildren(fragment);
   }
 
   // --- Decision submission ---
@@ -434,7 +546,7 @@
     $$(".decision-buttons .btn").forEach((b) => (b.disabled = true));
 
     try {
-      const resp = await fetch("/api/v1/decision", {
+      const resp = await authenticatedFetch("/api/v1/decision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -516,17 +628,65 @@
     return formatTime(seconds);
   }
 
-  function escapeHtml(str) {
-    if (!str) return "";
-    const div = document.createElement("div");
-    div.textContent = str;
-    return div.innerHTML;
+  async function startCameraStream() {
+    const image = $("#camera-feed");
+    const noFeed = $("#camera-no-feed");
+    if (!image || !apiToken || cameraAbortController) return;
+
+    cameraAbortController = new AbortController();
+    try {
+      const response = await authenticatedFetch("/api/v1/camera/stream", {
+        signal: cameraAbortController.signal,
+      });
+      if (!response.ok || !response.body) {
+        if (noFeed) noFeed.style.display = "flex";
+        return;
+      }
+
+      const reader = response.body.getReader();
+      let bytes = new Uint8Array();
+      while (apiToken) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const combined = new Uint8Array(bytes.length + value.length);
+        combined.set(bytes);
+        combined.set(value, bytes.length);
+        bytes = combined;
+
+        let start = -1;
+        let end = -1;
+        for (let index = 0; index < bytes.length - 1; index++) {
+          if (start < 0 && bytes[index] === 0xff && bytes[index + 1] === 0xd8) {
+            start = index;
+          } else if (start >= 0 && bytes[index] === 0xff && bytes[index + 1] === 0xd9) {
+            end = index + 2;
+            break;
+          }
+        }
+        if (start >= 0 && end > start) {
+          const blob = new Blob([bytes.slice(start, end)], { type: "image/jpeg" });
+          const nextUrl = URL.createObjectURL(blob);
+          image.src = nextUrl;
+          image.style.display = "block";
+          if (noFeed) noFeed.style.display = "none";
+          if (cameraFrameUrl) URL.revokeObjectURL(cameraFrameUrl);
+          cameraFrameUrl = nextUrl;
+          bytes = bytes.slice(end);
+        } else if (start > 0) {
+          bytes = bytes.slice(start);
+        }
+      }
+    } catch (error) {
+      if (error.name !== "AbortError" && noFeed) noFeed.style.display = "flex";
+    } finally {
+      cameraAbortController = null;
+    }
   }
 
   // --- Camera PTZ ---
   window.cameraMove = async function (direction) {
     try {
-      const resp = await fetch("/api/v1/camera/move", {
+      const resp = await authenticatedFetch("/api/v1/camera/move", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ direction }),
@@ -587,7 +747,7 @@
     typingEl.classList.add("typing");
 
     try {
-      const resp = await fetch("/api/v1/chat", {
+      const resp = await authenticatedFetch("/api/v1/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message }),
@@ -614,10 +774,15 @@
   window.clearChat = async function () {
     const messages = $("#chat-messages");
     if (messages) {
-      messages.innerHTML = '<div class="chat-welcome">Ask me anything about 3D printing or your printer status.</div>';
+      replaceWithMessage(
+        messages,
+        "div",
+        "chat-welcome",
+        "Ask me anything about 3D printing or your printer status."
+      );
     }
     try {
-      await fetch("/api/v1/chat/clear", { method: "POST" });
+      await authenticatedFetch("/api/v1/chat/clear", { method: "POST" });
     } catch {
     }
   };
@@ -630,7 +795,7 @@
     if (welcome) welcome.remove();
 
     const el = document.createElement("div");
-    el.className = `chat-msg ${role}`;
+    el.className = `chat-msg ${chatRoleClass(role)}`;
     el.textContent = text;
     messages.appendChild(el);
     scrollChatToBottom();
@@ -715,7 +880,7 @@
     formData.append("file", file);
 
     try {
-      const resp = await fetch("/api/v1/upload", {
+      const resp = await authenticatedFetch("/api/v1/upload", {
         method: "POST",
         body: formData,
       });
@@ -734,7 +899,7 @@
 
   async function loadChatHistory() {
     try {
-      const resp = await fetch("/api/v1/chat/history");
+      const resp = await authenticatedFetch("/api/v1/chat/history");
       if (!resp.ok) return;
       const data = await resp.json();
       if (data.history && data.history.length > 0) {
@@ -783,7 +948,7 @@
         params.append("printer_id", jobHistoryState.filterPrinter);
       }
 
-      const resp = await fetch(`/api/v1/jobs/history?${params}`);
+      const resp = await authenticatedFetch(`/api/v1/jobs/history?${params}`);
       if (resp.ok) {
         const data = await resp.json();
         jobHistoryState.jobs = data.jobs || [];
@@ -803,20 +968,33 @@
     if (!tbody) return;
 
     if (jobHistoryState.jobs.length === 0) {
-      tbody.innerHTML = '<tr class="no-data"><td colspan="6">No jobs found</td></tr>';
+      const row = createElement("tr", "no-data");
+      const cell = createElement("td", "", "No jobs found");
+      cell.colSpan = 6;
+      row.appendChild(cell);
+      tbody.replaceChildren(row);
       return;
     }
 
-    tbody.innerHTML = jobHistoryState.jobs.map(job => `
-      <tr>
-        <td class="job-filename-cell" title="${escapeHtml(job.file_name)}">${escapeHtml(job.file_name)}</td>
-        <td>${escapeHtml(job.printer_id)}</td>
-        <td><span class="job-status-badge ${job.status}">${job.status}</span></td>
-        <td>${formatDateTime(job.started_at)}</td>
-        <td>${formatDuration(job.duration_seconds)}</td>
-        <td>${job.filament_used_mm ? job.filament_used_mm.toFixed(1) + "mm" : "--"}</td>
-      </tr>
-    `).join("");
+    const fragment = document.createDocumentFragment();
+    jobHistoryState.jobs.forEach((job) => {
+      const row = createElement("tr");
+      const filename = createElement("td", "job-filename-cell", job.file_name || "");
+      filename.title = String(job.file_name || "");
+      const printer = createElement("td", "", job.printer_id || "");
+      const statusCell = createElement("td");
+      const safeStatus = ["completed", "failed", "cancelled", "running", "pending"].includes(job.status)
+        ? job.status
+        : "pending";
+      statusCell.appendChild(createElement("span", `job-status-badge ${safeStatus}`, job.status || "unknown"));
+      const started = createElement("td", "", formatDateTime(job.started_at));
+      const duration = createElement("td", "", formatDuration(job.duration_seconds));
+      const filament = Number(job.filament_used_mm);
+      const filamentText = Number.isFinite(filament) && filament > 0 ? `${filament.toFixed(1)}mm` : "--";
+      row.append(filename, printer, statusCell, started, duration, createElement("td", "", filamentText));
+      fragment.appendChild(row);
+    });
+    tbody.replaceChildren(fragment);
   }
 
   function updateJobPagination() {
@@ -930,7 +1108,7 @@
     queueState.loading = true;
 
     try {
-      const resp = await fetch("/api/v1/queue");
+      const resp = await authenticatedFetch("/api/v1/queue");
       if (resp.ok) {
         const data = await resp.json();
         renderQueue(data.queues || []);
@@ -958,19 +1136,27 @@
     });
 
     if (allItems.length === 0) {
-      container.innerHTML = '<p class="no-queue">Queue is empty</p>';
+      replaceWithMessage(container, "p", "no-queue", "Queue is empty");
       return;
     }
 
-    container.innerHTML = allItems.map(item => `
-      <div class="queue-item">
-        <span class="queue-handle">&#9776;</span>
-        <div class="queue-info">
-          <div class="queue-filename">Queue for ${escapeHtml(item.printer_id)}</div>
-          <div class="queue-printer">${item.size} pending ${item.processing ? "(processing)" : ""}</div>
-        </div>
-      </div>
-    `).join("");
+    const fragment = document.createDocumentFragment();
+    allItems.forEach((item) => {
+      const queueItem = createElement("div", "queue-item");
+      queueItem.appendChild(createElement("span", "queue-handle", "\u2630"));
+      const info = createElement("div", "queue-info");
+      info.append(
+        createElement("div", "queue-filename", `Queue for ${item.printer_id}`),
+        createElement(
+          "div",
+          "queue-printer",
+          `${item.size} pending ${item.processing ? "(processing)" : ""}`.trim()
+        )
+      );
+      queueItem.appendChild(info);
+      fragment.appendChild(queueItem);
+    });
+    container.replaceChildren(fragment);
   }
 
   window.clearQueue = async function() {
@@ -981,7 +1167,7 @@
     }
 
     try {
-      const resp = await fetch("/api/v1/queue/clear", {
+      const resp = await authenticatedFetch("/api/v1/queue/clear", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ printer_id: selectedPrinter }),
@@ -1008,7 +1194,7 @@
   async function pollStatus() {
     if (ws && ws.readyState === WebSocket.OPEN) return;
     try {
-      const resp = await fetch("/api/v1/status");
+      const resp = await authenticatedFetch("/api/v1/status");
       if (resp.ok) {
         const data = await resp.json();
         state.agentState = data.agent_state || "UNKNOWN";
@@ -1019,21 +1205,20 @@
   }
 
   // --- Init ---
-  function init() {
-    const select = $("#printer-select");
-    if (select) select.addEventListener("change", onPrinterSelectChange);
-
-    const chatInput = $("#chat-input");
-    if (chatInput) {
-      chatInput.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && !e.shiftKey) {
-          e.preventDefault();
-          sendChatMessage();
-        }
-      });
+  function startDashboard() {
+    if (!apiToken) return;
+    if (dashboardStarted) {
+      connectWebSocket();
+      startCameraStream();
+      loadChatHistory();
+      loadJobHistory();
+      loadQueueStatus();
+      fetchSvaApprovals();
+      return;
     }
-
+    dashboardStarted = true;
     connectWebSocket();
+    startCameraStream();
     initFileUpload();
     loadChatHistory();
     initJobHistory();
@@ -1050,39 +1235,265 @@
     }, 25000);
   }
 
+  function init() {
+    const authForm = $("#auth-form");
+    const authInput = $("#auth-token");
+    const authSubmit = $("#auth-submit");
+    if (authForm && authInput) {
+      authForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const token = authInput.value.trim();
+        if (!token) return;
+        if (authSubmit) authSubmit.disabled = true;
+        setAuthError("");
+        try {
+          await authenticate(token);
+        } catch (error) {
+          apiToken = null;
+          sessionStorage.removeItem(AUTH_STORAGE_KEY);
+          showAuthentication(error.message);
+        } finally {
+          if (authSubmit) authSubmit.disabled = false;
+        }
+      });
+    }
+
+    const logout = $("#auth-logout");
+    if (logout) logout.addEventListener("click", () => clearAuthentication("Logged out."));
+
+    const cameraButtons = {
+      "#camera-up": "up",
+      "#camera-left": "left",
+      "#camera-right": "right",
+      "#camera-down": "down",
+    };
+    Object.entries(cameraButtons).forEach(([selector, direction]) => {
+      const button = $(selector);
+      if (button) button.addEventListener("click", () => window.cameraMove(direction));
+    });
+
+    const queueClear = $("#queue-clear");
+    if (queueClear) queueClear.addEventListener("click", window.clearQueue);
+    const chatClear = $("#chat-clear");
+    if (chatClear) chatClear.addEventListener("click", window.clearChat);
+    const fileCancel = $("#file-cancel");
+    if (fileCancel) fileCancel.addEventListener("click", window.cancelUpload);
+    const fileAttach = $("#file-attach");
+    const fileInput = $("#chat-file-input");
+    if (fileAttach && fileInput) fileAttach.addEventListener("click", () => fileInput.click());
+    const chatSend = $("#chat-send");
+    if (chatSend) chatSend.addEventListener("click", window.sendChatMessage);
+
+    const select = $("#printer-select");
+    if (select) select.addEventListener("change", onPrinterSelectChange);
+
+    const chatInput = $("#chat-input");
+    if (chatInput) {
+      chatInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendChatMessage();
+        }
+      });
+    }
+
+    if (apiToken) {
+      authenticate(apiToken).catch((error) => clearAuthentication(error.message));
+    } else {
+      showAuthentication();
+    }
+  }
+
   async function fetchSvaApprovals() {
     try {
-      const resp = await fetch("/api/v1/pending-approvals?limit=10");
+      const resp = await authenticatedFetch("/api/v1/pending-approvals?limit=10");
       if (!resp.ok) return;
       const data = await resp.json();
       renderSvaApprovals(data.approvals || []);
     } catch (e) { /* silent */ }
   }
 
+  const approvalPreviewUrls = new Set();
+
+  function clearApprovalPreviewUrls() {
+    approvalPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+    approvalPreviewUrls.clear();
+  }
+
+  function approvalElement(tag, className, text) {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    if (text !== undefined && text !== null) element.textContent = String(text);
+    return element;
+  }
+
+  function formatApprovalValue(value, suffix = "") {
+    if (value === undefined || value === null || value === "") return "Not provided";
+    return `${value}${suffix}`;
+  }
+
+  function formatApprovalDuration(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds)) return "Not provided";
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.round((seconds % 3600) / 60);
+    if (hours && minutes) return `${hours} hr ${minutes} min`;
+    if (hours) return `${hours} hr`;
+    return `${minutes} min`;
+  }
+
+  function addApprovalField(grid, label, value, options = {}) {
+    const field = approvalElement("div", `approval-field${options.hash ? " approval-field-hash" : ""}`);
+    field.appendChild(approvalElement("span", "approval-field-label", label));
+    field.appendChild(approvalElement("span", "approval-field-value", value));
+    grid.appendChild(field);
+  }
+
+  function addApprovalSection(card, title) {
+    const section = approvalElement("section", "approval-section");
+    section.appendChild(approvalElement("h4", "approval-section-title", title));
+    card.appendChild(section);
+    return section;
+  }
+
+  function printEvidencePayload(approval) {
+    const payload = approval && approval.payload;
+    if (!payload || typeof payload !== "object") return null;
+    const nestedPayload = payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+    const containers = nestedPayload ? [nestedPayload, payload] : [payload];
+    let printEvidence = null;
+    for (const container of containers) {
+      printEvidence = (container.print_request && typeof container.print_request === "object" && container.print_request)
+        || (container.print_evidence && typeof container.print_evidence === "object" && container.print_evidence)
+        || (container.evidence && typeof container.evidence === "object" && container.evidence)
+        || (container.request && typeof container.request === "object" && container.request);
+      if (printEvidence) break;
+    }
+    printEvidence = printEvidence || nestedPayload || payload;
+    const evidence = Object.assign({}, payload, nestedPayload || {}, printEvidence);
+    const confirmation = [
+      printEvidence.confirmation,
+      nestedPayload && nestedPayload.confirmation,
+      payload.confirmation,
+    ].find((value) => value && typeof value === "object") || {};
+    const binding = [
+      printEvidence.binding,
+      nestedPayload && nestedPayload.binding,
+      payload.binding,
+    ].find((value) => value && typeof value === "object") || {};
+    const renderedPreview = evidence.rendered_preview;
+    const looksLikePrint = approval.tool_name === "start_print_with_monitor"
+      || renderedPreview
+      || evidence.artifact_sha256
+      || evidence.preview_sha256
+      || evidence.rendered_preview_sha256
+      || evidence.validation_sha256
+      || evidence.confirmation_sha256;
+    return looksLikePrint ? { evidence, confirmation, binding, renderedPreview } : null;
+  }
+
+
+  function renderPrintEvidence(card, printData) {
+    const { evidence, confirmation, binding, renderedPreview } = printData;
+    const setupSection = addApprovalSection(card, "Physical print setup");
+    const setupGrid = approvalElement("div", "approval-evidence-grid");
+    addApprovalField(setupGrid, "Material", formatApprovalValue(confirmation.material));
+    addApprovalField(setupGrid, "Build plate", formatApprovalValue(confirmation.build_plate_surface));
+    addApprovalField(setupGrid, "Nozzle size", formatApprovalValue(confirmation.hotend_nozzle_size_mm, " mm"));
+    addApprovalField(setupGrid, "Probe Z offset", formatApprovalValue(binding.probe_z_offset, " mm"));
+    addApprovalField(setupGrid, "Homing-origin Z", formatApprovalValue(binding.homing_origin_z, " mm"));
+    addApprovalField(setupGrid, "Confirmation Z", formatApprovalValue(confirmation.z_offset_mm, " mm"));
+    addApprovalField(setupGrid, "Estimated time", formatApprovalDuration(confirmation.estimated_print_time_seconds));
+    addApprovalField(setupGrid, "Filament usage", formatApprovalValue(confirmation.filament_usage_mm, " mm"));
+    setupSection.appendChild(setupGrid);
+
+    const hashesSection = addApprovalSection(card, "Validated evidence hashes");
+    const hashesGrid = approvalElement("div", "approval-evidence-grid approval-hash-grid");
+    addApprovalField(hashesGrid, "Artifact", formatApprovalValue(evidence.artifact_sha256), { hash: true });
+    addApprovalField(hashesGrid, "Preview JSON", formatApprovalValue(evidence.preview_sha256), { hash: true });
+    addApprovalField(hashesGrid, "Rendered preview", formatApprovalValue(evidence.rendered_preview_sha256), { hash: true });
+    addApprovalField(hashesGrid, "Validation", formatApprovalValue(evidence.validation_sha256), { hash: true });
+    addApprovalField(hashesGrid, "Confirmation", formatApprovalValue(evidence.confirmation_sha256), { hash: true });
+    hashesSection.appendChild(hashesGrid);
+
+    const previewSection = addApprovalSection(card, "Validated toolpath preview");
+    if (typeof renderedPreview === "string" && renderedPreview.trim()) {
+      const mediaType = evidence.rendered_preview_media_type || "image/svg+xml";
+      if (mediaType === "image/svg+xml") {
+        const blob = new Blob([renderedPreview], { type: "image/svg+xml" });
+        const previewUrl = URL.createObjectURL(blob);
+        approvalPreviewUrls.add(previewUrl);
+        const image = approvalElement("img", "approval-toolpath-preview");
+        image.alt = "Validated G-code toolpath preview";
+        image.src = previewUrl;
+        image.addEventListener("load", () => {
+          URL.revokeObjectURL(previewUrl);
+          approvalPreviewUrls.delete(previewUrl);
+        }, { once: true });
+        image.addEventListener("error", () => {
+          URL.revokeObjectURL(previewUrl);
+          approvalPreviewUrls.delete(previewUrl);
+        }, { once: true });
+        previewSection.appendChild(image);
+      } else {
+        previewSection.appendChild(approvalElement("p", "approval-preview-unavailable", "Preview format is not supported."));
+      }
+    } else {
+      previewSection.appendChild(approvalElement("p", "approval-preview-unavailable", "No rendered preview was provided."));
+    }
+  }
+
+  function renderGenericPayload(card, payload) {
+    if (!payload || typeof payload !== "object") return;
+    const section = addApprovalSection(card, "Requested values");
+    const grid = approvalElement("div", "approval-evidence-grid");
+    Object.entries(payload).forEach(([key, value]) => {
+      const display = value && typeof value === "object" ? JSON.stringify(value) : formatApprovalValue(value);
+      addApprovalField(grid, key.replaceAll("_", " "), display);
+    });
+    section.appendChild(grid);
+  }
+
   function renderSvaApprovals(approvals) {
     const container = $("#sva-approvals-list");
     if (!container) return;
+    clearApprovalPreviewUrls();
+    container.replaceChildren();
+
     if (!approvals.length) {
-      container.innerHTML = '<p class="no-approvals">No pending approvals</p>';
+      container.appendChild(approvalElement("p", "no-approvals", "No pending approvals"));
       return;
     }
-    container.innerHTML = approvals.map(a => {
-      const payloadStr = a.payload ? Object.entries(a.payload).map(([k,v]) => `${k}: ${v}`).join(", ") : "";
-      return `<div class="approval-item" data-token="${a.approval_token}">
-        <div class="approval-tool">${a.tool_name}</div>
-        <div class="approval-payload">${payloadStr}</div>
-        <div class="approval-reason">${a.reason || ""}</div>
-        <div class="approval-actions">
-          <button class="btn btn-approve" onclick="approveSvaTool('${a.approval_token}')">Approve</button>
-          <button class="btn btn-reject" onclick="rejectSvaTool('${a.approval_token}')">Reject</button>
-        </div>
-      </div>`;
-    }).join("");
+
+    approvals.forEach((approval) => {
+      const card = approvalElement("article", "approval-item");
+      card.appendChild(approvalElement("h3", "approval-tool", approval.tool_name || "Unknown tool"));
+
+      const printData = printEvidencePayload(approval);
+      if (printData) renderPrintEvidence(card, printData);
+      else renderGenericPayload(card, approval.payload);
+
+      if (approval.reason) {
+        const reason = addApprovalSection(card, "Why approval is required");
+        reason.appendChild(approvalElement("p", "approval-reason", approval.reason));
+      }
+
+      const actions = approvalElement("div", "approval-actions");
+      const approve = approvalElement("button", "btn btn-approve", "Approve");
+      approve.type = "button";
+      approve.addEventListener("click", () => window.approveSvaTool(approval.approval_token));
+      const reject = approvalElement("button", "btn btn-reject", "Reject");
+      reject.type = "button";
+      reject.addEventListener("click", () => window.rejectSvaTool(approval.approval_token));
+      actions.append(approve, reject);
+      card.appendChild(actions);
+      container.appendChild(card);
+    });
   }
 
   window.approveSvaTool = async function(token) {
     try {
-      const resp = await fetch("/api/v1/approve", {
+      const resp = await authenticatedFetch("/api/v1/approve", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({approval_token: token, action: "approve"}),
@@ -1097,7 +1508,7 @@
 
   window.rejectSvaTool = async function(token) {
     try {
-      const resp = await fetch("/api/v1/approve", {
+      const resp = await authenticatedFetch("/api/v1/approve", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({approval_token: token, action: "reject"}),
@@ -1109,6 +1520,8 @@
       addAlert("error", `Reject failed: ${e.message}`);
     }
   };
+
+  window.addEventListener("beforeunload", clearApprovalPreviewUrls);
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
