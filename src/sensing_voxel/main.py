@@ -7,21 +7,88 @@ AI-powered 3D printer monitoring and control system.
 
 import asyncio
 import logging
+import math
+import re
 import signal
 import sys
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from sensing_voxel.adapters.base import PrinterAdapter
 from sensing_voxel.adapters.klipper import KlipperAdapter
-from sensing_voxel.bot.telegram import TelegramBot
 from sensing_voxel.config import BambuConfig, Config, KlipperConfig
 from sensing_voxel.core.decision import DecisionEngine
+from sensing_voxel.core.models import CommandResultStatus
 from sensing_voxel.core.persistence import StatePersistence
 from sensing_voxel.core.state_machine import AgentStateMachine
+from sensing_voxel.safety import (
+    PhysicalConfirmationSnapshot,
+    PrintSafetyService,
+    SafetyBinding,
+)
+from sensing_voxel.safety.models import MonitorStartContract, canonical_sha256
+from sensing_voxel.safety.service import MANDATORY_MONITOR_SOURCES
+from sensing_voxel.storage import JobRepository, PrinterMemoRepository, create_database
 
 logger = logging.getLogger(__name__)
+
+_BUILD_PLATE_MEMO_KEYS = ("bed_surface", "build_plate_surface")
+_EXTRUDER_SECTION_RE = re.compile(
+    r"^\s*\[\s*extruder\s*\]\s*(?:[#;].*)?$", re.IGNORECASE
+)
+_SECTION_RE = re.compile(r"^\s*\[[^]]+]")
+_NOZZLE_DIAMETER_RE = re.compile(
+    r"^\s*nozzle_diameter\s*:\s*([^#;\s]+)\s*(?:[#;].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_nozzle_diameter(config_text: str) -> float:
+    """Extract one finite positive nozzle diameter from the trusted extruder section."""
+    in_extruder = False
+    nozzle_values: list[float] = []
+    for line in config_text.splitlines():
+        if _EXTRUDER_SECTION_RE.match(line):
+            in_extruder = True
+            continue
+        if _SECTION_RE.match(line):
+            in_extruder = False
+            continue
+        if not in_extruder:
+            continue
+        match = _NOZZLE_DIAMETER_RE.match(line)
+        if match is None:
+            continue
+        try:
+            value = float(match.group(1))
+        except ValueError as exc:
+            raise RuntimeError("trusted nozzle diameter is invalid") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError("trusted nozzle diameter is invalid")
+        nozzle_values.append(value)
+
+    if len(nozzle_values) != 1:
+        raise RuntimeError("trusted nozzle diameter is unavailable or ambiguous")
+    return nozzle_values[0]
+
+
+async def _read_build_plate_surface(
+    memo_repository: PrinterMemoRepository, printer_id: str
+) -> str:
+    """Read accepted build-plate memos without blocking the event loop."""
+    memos = await asyncio.to_thread(memo_repository.get_as_dict, printer_id)
+    values = {
+        value.strip()
+        for key in _BUILD_PLATE_MEMO_KEYS
+        if isinstance((value := memos.get(key)), str) and value.strip()
+    }
+    if len(values) != 1:
+        raise RuntimeError("trusted build plate surface memo is unavailable or ambiguous")
+    return values.pop()
+
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -74,6 +141,122 @@ def create_adapters(config: Config) -> dict[str, PrinterAdapter]:
     return adapters
 
 
+def create_safety_services(
+    config: Config,
+    adapters: dict[str, PrinterAdapter],
+    print_monitors: dict[str, Any],
+    memo_repository: PrinterMemoRepository,
+) -> dict[str, PrintSafetyService]:
+    """Create one fail-closed safety gate per configured printer."""
+    configured_printers = {printer.name for printer in config.printers}
+    services: dict[str, PrintSafetyService] = {}
+
+    for printer_id, adapter in adapters.items():
+        if printer_id not in configured_printers:
+            raise RuntimeError(f"adapter has no matching printer configuration: {printer_id}")
+        profile_digest = canonical_sha256(asdict(config.slicer))
+        nozzle_by_config_digest: dict[str, float] = {}
+
+        async def binding_provider(
+            *,
+            pid: str = printer_id,
+            current_adapter: PrinterAdapter = adapter,
+            current_profile_digest: str = profile_digest,
+            current_nozzles: dict[str, float] = nozzle_by_config_digest,
+        ) -> SafetyBinding:
+            get_config = getattr(current_adapter, "get_config_file", None)
+            get_hardware = getattr(current_adapter, "get_hardware_info", None)
+            list_macros = getattr(current_adapter, "list_macros", None)
+            if get_config is None or get_hardware is None or list_macros is None:
+                raise RuntimeError("adapter cannot provide trusted print safety binding")
+
+            config_result, hardware_result, macros_result = await asyncio.gather(
+                get_config(filename="printer.cfg", max_bytes=200000),
+                get_hardware(),
+                list_macros(),
+            )
+            for label, result in (
+                ("printer configuration", config_result),
+                ("hardware identity", hardware_result),
+                ("macro inventory", macros_result),
+            ):
+                if result.status is not CommandResultStatus.SUCCESS:
+                    raise RuntimeError(f"failed to query trusted {label}: {result.message}")
+
+            config_text = config_result.data.get("content")
+            if not isinstance(config_text, str) or config_result.data.get("truncated"):
+                raise RuntimeError("trusted printer configuration is unavailable or truncated")
+            hardware_data = hardware_result.data
+            if not isinstance(hardware_data, dict) or not any(hardware_data.values()):
+                raise RuntimeError("trusted hardware identity is unavailable")
+
+            config_digest = canonical_sha256(config_text)
+            current_nozzles[config_digest] = _parse_nozzle_diameter(config_text)
+            return SafetyBinding(
+                user_id="runtime",
+                source_trust="runtime",
+                target_printer=pid,
+                hardware_digest=canonical_sha256(hardware_data),
+                profile_digest=current_profile_digest,
+                config_digest=config_digest,
+                macro_digest=canonical_sha256(macros_result.data),
+                probe_z_offset=None,
+                homing_origin_z=None,
+            )
+
+        async def confirmation_provider(
+            _artifact,
+            binding: SafetyBinding,
+            *,
+            pid: str = printer_id,
+            current_nozzles: dict[str, float] = nozzle_by_config_digest,
+            current_memo_repository: PrinterMemoRepository = memo_repository,
+        ) -> PhysicalConfirmationSnapshot:
+            if binding.target_printer != pid:
+                raise RuntimeError("confirmation binding targets a different printer")
+            if binding.probe_z_offset is None:
+                raise RuntimeError("trusted live Z offset is unavailable")
+            try:
+                hotend_nozzle_size_mm = current_nozzles[binding.config_digest]
+            except KeyError as exc:
+                raise RuntimeError("trusted nozzle evidence is unavailable") from exc
+            build_plate_surface = await _read_build_plate_surface(
+                current_memo_repository, pid
+            )
+            return PhysicalConfirmationSnapshot(
+                build_plate_surface=build_plate_surface,
+                hotend_nozzle_size_mm=hotend_nozzle_size_mm,
+                z_offset_mm=binding.probe_z_offset,
+            )
+
+        async def monitor_start(
+            contract: MonitorStartContract, *, pid: str = printer_id
+        ) -> None:
+            monitor = print_monitors.get(pid)
+            if monitor is None:
+                raise RuntimeError(f"required print monitor is unavailable for {pid}")
+            await monitor.start_monitoring(contract=contract)
+            if not monitor.is_monitoring:
+                raise RuntimeError(f"required print monitor did not remain active for {pid}")
+
+        async def monitor_stop(*, pid: str = printer_id) -> None:
+            monitor = print_monitors.get(pid)
+            if monitor is None:
+                raise RuntimeError(f"required print monitor is unavailable for {pid}")
+            await monitor.stop_monitoring(reason="printer start failed")
+
+        services[printer_id] = PrintSafetyService(
+            adapter,
+            binding_provider=binding_provider,
+            confirmation_provider=confirmation_provider,
+            monitor_start=monitor_start,
+            monitor_stop=monitor_stop,
+            monitor_required_sources=MANDATORY_MONITOR_SOURCES,
+        )
+
+    return services
+
+
 async def shutdown(
     signal: signal.Signals,
     loop: asyncio.AbstractEventLoop,
@@ -123,9 +306,19 @@ async def main() -> None:
     # Initialize decision engine
     decision_engine = DecisionEngine()
 
-    # Initialize adapters (multi-printer)
+    db = create_database(config.storage.data_dir)
+    memo_repo = PrinterMemoRepository(db)
+    job_repo = JobRepository(db)
+
+    # Initialize adapters and one safety gate per configured printer.
+    # The monitor map is intentionally shared and populated later; required-monitor
+    # execution fails closed until the corresponding monitor is available.
     adapters = create_adapters(config)
     active_printer = next(iter(adapters), None)
+    print_monitors: dict[str, Any] = {}
+    safety_services = create_safety_services(
+        config, adapters, print_monitors, memo_repo
+    )
 
     # Initialize Tapo camera (optional)
     tapo_camera = None
@@ -146,14 +339,9 @@ async def main() -> None:
         from sensing_voxel.llm.chat import ChatManager
         from sensing_voxel.llm.client import LlmClient
         from sensing_voxel.llm.context import PrinterContextCollector
-        from sensing_voxel.storage import JobRepository, PrinterMemoRepository, create_database
 
         llm_client = LlmClient(config.llm)
         await llm_client.initialize()
-
-        db = create_database(config.storage.data_dir)
-        memo_repo = PrinterMemoRepository(db)
-        job_repo = JobRepository(db)
 
         async def _llm_analyze(**kwargs):
             return await llm_client.send_message(**kwargs)
@@ -183,6 +371,9 @@ async def main() -> None:
             verbose_tool_use=config.llm.verbose_tool_use,
             memo_repository=memo_repo,
             llm_analyze_fn=_llm_analyze,
+            safety_services=safety_services,
+            slicer_config=config.slicer,
+            print_monitors=print_monitors,
         )
         chat_manager.load_history()
         logger.info(f"LLM initialized: model={config.llm.model}")
@@ -193,6 +384,8 @@ async def main() -> None:
     bot = None
     token = config.telegram.bot_token
     if token and token != "YOUR_BOT_TOKEN_HERE":
+        from sensing_voxel.bot.telegram import TelegramBot
+
         # Bot uses the active (first) printer adapter
         active_adapter = adapters.get(active_printer) if active_printer else None
         bot = TelegramBot(
@@ -203,6 +396,8 @@ async def main() -> None:
             config=config,
             persistence=persistence,
             chat_manager=chat_manager,
+            safety_services=safety_services,
+            active_printer=active_printer,
         )
         if chat_manager:
             chat_manager.set_photo_sender(bot.send_photo)
@@ -223,6 +418,7 @@ async def main() -> None:
             active_printer=active_printer,
             chat_manager=chat_manager,
             camera=tapo_camera,
+            safety_services=safety_services,
         )
         if dashboard_runner.app:
             default_logical_user_id = (
@@ -315,7 +511,6 @@ async def main() -> None:
             adapter.on_connection_restored(on_connection_restored_llm)
 
     # Initialize print monitors (optional)
-    print_monitors: dict[str, Any] = {}
     if config.print_monitor.enabled and chat_manager and config.dashboard.camera_rtsp_url:
         from sensing_voxel.monitoring.print_monitor import PrintMonitor
 
@@ -343,9 +538,6 @@ async def main() -> None:
             print_monitors[printer_id] = monitor
             monitor.enable_auto_monitoring()
             logger.info(f"Print monitor initialized for {printer_id}")
-
-        if chat_manager and chat_manager._tool_executor:
-            chat_manager._tool_executor._print_monitors = print_monitors
 
     # Set up signal handlers
     loop = asyncio.get_running_loop()
