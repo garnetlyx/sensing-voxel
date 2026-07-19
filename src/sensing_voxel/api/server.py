@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 # Max alerts kept in ring buffer
 MAX_ALERTS = 50
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def validate_dashboard_security(config: DashboardConfig) -> None:
+    """Reject unauthenticated dashboard exposure beyond the local machine."""
+    if config.host.strip().lower() not in _LOOPBACK_HOSTS and not config.api_token:
+        raise ValueError("Dashboard api_token is required when binding to a non-loopback host")
 
 
 def create_app(
@@ -28,6 +35,7 @@ def create_app(
     active_printer: str | None = None,
     chat_manager=None,
     camera=None,
+    safety_services: dict | None = None,
 ) -> tuple[web.Application, WebSocketManager]:
     """Create and configure the dashboard web application.
 
@@ -36,7 +44,11 @@ def create_app(
     if adapters is None:
         adapters = {}
 
-    ws_manager = WebSocketManager()
+    validate_dashboard_security(config)
+    ws_manager = WebSocketManager(
+        api_token=config.api_token,
+        allowed_origins=set(config.allowed_origins),
+    )
 
     # Middleware stack
     middlewares = [create_auth_middleware(config.api_token)]
@@ -48,8 +60,8 @@ def create_app(
         "state_machine": state_machine,
         "decision_engine": decision_engine,
         "adapters": adapters,
-        "connections": {pid: False for pid in adapters},
-        "telemetries": {pid: None for pid in adapters},
+        "connections": dict.fromkeys(adapters, False),
+        "telemetries": dict.fromkeys(adapters),
         "active_printer": active_printer,
         "ws_manager": ws_manager,
         "alerts": deque(maxlen=MAX_ALERTS),
@@ -58,6 +70,12 @@ def create_app(
         "camera_mjpeg_quality": config.camera_mjpeg_quality,
         "chat_manager": chat_manager,
         "camera": camera,
+        "safety_services": safety_services or {},
+        "upload_dir": Path(config.upload_dir),
+        "max_upload_bytes": config.max_upload_bytes,
+        "allowed_upload_extensions": {
+            extension.lower() for extension in config.allowed_upload_extensions
+        },
     }
 
     # Register REST + WebSocket routes
@@ -89,14 +107,21 @@ async def start_server(
     active_printer: str | None = None,
     chat_manager=None,
     camera=None,
+    safety_services: dict | None = None,
 ) -> tuple[web.AppRunner, WebSocketManager]:
     """Start the dashboard server (non-blocking, coexists with asyncio loop).
 
     Returns (runner, ws_manager). Caller must call runner.cleanup() on shutdown.
     """
     app, ws_manager = create_app(
-        config, state_machine, decision_engine, adapters, active_printer, chat_manager,
+        config,
+        state_machine,
+        decision_engine,
+        adapters,
+        active_printer,
+        chat_manager,
         camera,
+        safety_services,
     )
 
     runner = web.AppRunner(app)

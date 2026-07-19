@@ -1,30 +1,126 @@
 """WebSocket handler with fan-out broadcasting"""
 
 import asyncio
+import base64
+import binascii
+import hmac
 import json
 import logging
 import weakref
 from datetime import datetime
+from urllib.parse import urlsplit
 
-from aiohttp import web, WSMsgType
+from aiohttp import WSMsgType, web
 
 logger = logging.getLogger(__name__)
 
+WS_APPLICATION_PROTOCOL = "sensing-voxel.v1"
+WS_AUTH_PROTOCOL_PREFIX = "sensing-voxel.auth."
+
 
 class WebSocketManager:
-    """Manages WebSocket connections and broadcasts events"""
+    """Manages authenticated WebSocket connections and broadcasts events."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        api_token: str | None = None,
+        allowed_origins: set[str] | None = None,
+    ):
+        self._api_token = api_token
+        self._allowed_origins = frozenset(allowed_origins or ())
         self._clients: weakref.WeakSet[web.WebSocketResponse] = weakref.WeakSet()
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        parsed = urlsplit(origin.strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Origin must be an absolute HTTP(S) URL")
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+    def _origin_allowed(self, request: web.Request, origin: str) -> bool:
+        try:
+            normalized = self._normalize_origin(origin)
+        except ValueError:
+            return False
+
+        if self._allowed_origins:
+            try:
+                allowed = {self._normalize_origin(value) for value in self._allowed_origins}
+            except ValueError:
+                logger.error("Invalid configured WebSocket origin")
+                return False
+            return normalized in allowed
+
+        return normalized == f"{request.scheme.lower()}://{request.host.lower()}"
+
+    @staticmethod
+    def _offered_protocols(request: web.Request) -> tuple[str, ...]:
+        header = request.headers.get("Sec-WebSocket-Protocol", "")
+        return tuple(protocol.strip() for protocol in header.split(",") if protocol.strip())
+
+    def _protocol_token(self, request: web.Request) -> bytes | None:
+        protocols = self._offered_protocols(request)
+        if WS_APPLICATION_PROTOCOL not in protocols:
+            return None
+
+        encoded_tokens = [
+            protocol.removeprefix(WS_AUTH_PROTOCOL_PREFIX)
+            for protocol in protocols
+            if protocol.startswith(WS_AUTH_PROTOCOL_PREFIX)
+        ]
+        if len(encoded_tokens) != 1 or not encoded_tokens[0]:
+            return None
+
+        encoded = encoded_tokens[0]
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            return base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        except (binascii.Error, ValueError):
+            return None
+
+    def _authorize_upgrade(self, request: web.Request) -> None:
+        if not self._api_token:
+            raise web.HTTPUnauthorized(
+                text="WebSocket authentication is not configured",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        expected = self._api_token.encode()
+        auth_header = request.headers.get("Authorization", "")
+        scheme, separator, bearer_token = auth_header.partition(" ")
+        bearer_valid = (
+            separator == " "
+            and scheme.lower() == "bearer"
+            and bool(bearer_token)
+            and hmac.compare_digest(bearer_token.encode(), expected)
+        )
+        protocol_token = self._protocol_token(request)
+        protocol_valid = protocol_token is not None and hmac.compare_digest(
+            protocol_token, expected
+        )
+        if not bearer_valid and not protocol_valid:
+            raise web.HTTPUnauthorized(
+                text="Missing or invalid WebSocket credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        origin = request.headers.get("Origin")
+        if not origin or not self._origin_allowed(request, origin):
+            raise web.HTTPForbidden(text="WebSocket origin is not allowed")
 
     @property
     def client_count(self) -> int:
         return len(self._clients)
 
     async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
-        """Handle new WebSocket connection"""
-        ws = web.WebSocketResponse(heartbeat=30.0)
+        """Validate and handle a new WebSocket connection."""
+        self._authorize_upgrade(request)
+        offered_protocols = self._offered_protocols(request)
+        protocols = (
+            (WS_APPLICATION_PROTOCOL,) if WS_APPLICATION_PROTOCOL in offered_protocols else ()
+        )
+        ws = web.WebSocketResponse(heartbeat=30.0, protocols=protocols)
         await ws.prepare(request)
 
         async with self._lock:
