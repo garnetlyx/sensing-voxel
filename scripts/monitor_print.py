@@ -9,7 +9,7 @@ Monitors print progress via Moonraker API:
 - Trigger notifications on state changes
 
 Usage:
-    python scripts/monitor_print.py --printer printer.example --duration 3600
+    python scripts/monitor_print.py --printer 192.0.2.10 --duration 3600
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import aiohttp
 
@@ -255,8 +254,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Monitor 3D print progress with telemetry logging")
     parser.add_argument(
         "--printer",
-        default="printer.example",
-        help="Printer hostname or IP (default: printer.example)",
+        default="192.0.2.10",
+        help="Printer hostname or IP (default: 192.0.2.10 example address)",
     )
     parser.add_argument(
         "--port",
@@ -266,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera-url",
-        help="Camera snapshot URL (e.g., http://camera.local/snapshot.jpg)",
+        help="Camera snapshot URL (e.g., https://camera.example.test/snapshot.jpg)",
     )
     parser.add_argument(
         "--log-file",

@@ -1,317 +1,262 @@
-# Sensing Voxel - Product Requirements Document
+# Sensing Voxel — Product Requirements Document
 
-**Version**: 1.1
-**Date**: 2026-03-03
-**Status**: Approved
-**Source**: `.design/plan.md` v10 + `.design/review.md` fixes
-
----
-
-## 1. Overview
-
-### 1.1 Vision
-
-Sensing Voxel is an end-to-end AI platform that turns photos into physical 3D prints with minimal human intervention. The long-term goal is a single-message workflow: a user sends a photo, and the system generates a 3D model, prepares it for printing, prints it, and monitors the entire process autonomously.
-
-This vision is delivered in phases:
-- **Phase 1 (MVP)**: Intelligent print automation — Telegram-driven job intake, automated slicing, camera monitoring (first-layer auto-correction), and printer control across a mixed Klipper/Bambu fleet.
-- **Phase 2**: Platform maturity — multi-printer orchestration, job history/analytics, full Bambu parity, predictive maintenance.
-- **Phase 3**: Photo-to-print pipeline — Image-to-3D generation via AI models, automated mesh repair for printability, and one-tap physical output from any photo or sketch.
-
-### 1.2 Problem Statement
-
-**Near-term**: Current home and prosumer 3D-print workflows are fragmented and manual: users manually slice, tune first layer, monitor print quality, and inspect calibration towers by eye. This leads to failed overnight prints, wasted filament, and inconsistent quality. The problem is worse in mixed-printer environments where control APIs differ (Moonraker vs Bambu protocols), forcing duplicated manual processes.
-
-**Long-term**: 3D printing remains inaccessible to non-technical users. Even with perfect printer automation, the pipeline breaks at the start: users need CAD skills or must find pre-made models. Image-to-3D generation is advancing rapidly (TripoSR, Meshy, Tripo3D, etc.), but no platform connects AI-generated models to a reliable print pipeline. The generated meshes are not print-ready — they require manifold repair, wall thickening, support analysis, and orientation optimization before slicing. Sensing Voxel aims to close this gap by owning the full chain from image capture to finished print.
-
-### 1.3 Goals & Success Metrics
-
-| Goal | Metric | Target | Phase |
-|------|--------|--------|-------|
-| Reduce failed prints | Failure rate on monitored jobs | < 5% | 1 |
-| Detect defects early | Time from defect onset to pause/cancel | < 30s | 1 |
-| Reduce manual workflow | User interactions from file to print start | <= 3 | 1 |
-| First-layer quality | First-layer classification accuracy (qualified conditions) | > 80% | 1 |
-| Safety race correctness | Duplicate decision actions (approve/resume/timeout races) | 0 in test suite | 1 |
-| External print coverage | External active prints detected while agent idle | 100% | 1 |
-| Photo-to-print success | Printable mesh generated from single photo | > 70% (decorative objects) | 3 |
-| End-to-end autonomy | User interactions from photo to finished print | 1 (send photo + approve) | 3 |
+**Version**: 2.0
+**Date**: 2026-07-18
+**Status**: Implemented-product baseline
 
 ---
 
-## 2. Users & Personas
+## 1. Product Definition
 
-### 2.1 Target Users
+Sensing Voxel is an experimental, locally operated 3D-printer control and monitoring service. Its primary product promise is not autonomous model generation; it is a traceable, fail-closed path from supplied G-code to an authorized printer start, followed by camera-assisted monitoring.
 
-**Phase 1 (MVP)**:
-- Hobbyists and makers running Klipper printers (Ender-class, Neptune-class, custom builds).
-- Users with Bambu printers who want a unified Telegram-first workflow.
-- Small-batch operators managing 2-6 printers and needing unattended monitoring.
+SVA (Sensing-Voxel Agent) exposes that path through Telegram, a web dashboard/API, and LLM-assisted tools. Deterministic local controls remain authoritative for print authorization. Probabilistic camera/LLM analysis is isolated to monitoring and cannot substitute for validation, operator confirmation, or live preflight.
 
-**Phase 3 (Photo-to-Print)**:
-- Non-technical users who want physical objects from photos without learning CAD or slicing.
-- Creators and designers who need rapid physical prototyping from reference images.
-- Small businesses wanting on-demand custom prints from product photos.
+### 1.1 Product Goals
 
-### 2.2 Persona: Wei - Mixed-Fleet Hobby Operator
+1. Reject unsupported or unsafe G-code before it reaches a printer.
+2. Give an operator a deterministic summary and rendered toolpath preview of the exact artifact being approved.
+3. Bind approval to the artifact, validation result, target printer, mutable machine/configuration facts, source trust, user identity, and physical evidence derived from the configured printer state.
+4. Recheck mutable printer and Z facts immediately before execution and fail closed on drift.
+5. Require first-layer monitoring for user-supplied and SVA-generated G-code started through the safety service.
+6. Make hardware-affecting actions attributable through explicit decisions and audit records.
+7. Keep dashboard and WebSocket access closed unless deployment authentication requirements are met.
 
-- **Background**: Runs an Ender 3 V2 (Klipper/Fluidd), Neptune 4 Max (modified Moonraker/Fluidd), and Bambu P1-series printer.
-- **Goals**: Submit models from phone, avoid babysitting, get consistent first layers and fewer failed long prints.
-- **Pain Points**: Different printer control surfaces, manual slicer steps, late failure discovery, and repetitive tuning work.
+### 1.2 Non-Goals
 
-### 2.3 Persona: Mia - Non-Technical Creator (Phase 3)
+- Certifying a printer, G-code file, or physical environment as safe.
+- Replacing firmware limits, thermal protection, fire precautions, supervision, or a hardware emergency stop.
+- Automatically correcting first-layer Z offset from camera output.
+- Treating LLM judgment as a deterministic safety control.
+- Providing a production end-to-end model-slicing or photo-to-print workflow.
+- Guaranteeing production support for printer transports other than the configured Klipper/Moonraker path.
 
-- **Background**: Runs a small craft shop. Owns a Bambu A1 but rarely uses it because she cannot create 3D models.
-- **Goals**: Snap a photo of a product idea, get a physical prototype in hours without learning any software.
-- **Pain Points**: CAD tools are intimidating, Thingiverse models never match what she wants, hiring a 3D modeler is slow and expensive.
+### 1.3 Success Criteria
 
----
-
-## 3. Use Cases
-
-### UC-01: Geek Customer Service Workflow (Telegram File-to-Print)
-
-**Actor**: Wei
-**Trigger**: Wei sends `.stl` or `.step` to Telegram bot.
-**Flow**:
-1. Agent validates file type/size and stages file.
-2. Agent runs headless PrusaSlicer/OrcaSlicer and performs geometry analysis (overhang >60°, bridges, thin walls).
-3. Agent **proactively recommends** optimizations based on geometry analysis. Example: detects overhangs >60° and asks user in chat if they want to enable tree supports, with estimated filament cost (e.g., "+15g filament, +20min print time").
-4. Agent sends full summary (print time, filament usage, detected issues, recommendations) with inline **Approve/Reject** decision.
-5. On approve, agent uploads G-code and starts print.
-6. On timeout (default: **10 minutes**, configurable) or reject, agent performs local cleanup and notifies user.
-
-**Success**: Print starts within 2 minutes of approval. Agent acts as a knowledgeable assistant, proactively surfacing issues and suggesting fixes rather than silently slicing.
-
-### UC-02: First-Layer "God Hand" Auto-Correction (Agent-Initiated Jobs Only)
-
-**Actor**: Agent
-**Trigger**: Agent-started print enters first-layer monitoring window.
-**Flow**:
-1. Verify calibration validity (`homography`, `mm_per_pixel`) and `FirstLayerParams` availability.
-2. Compute toolpath-aware ROI from first-layer G-code bounds.
-3. Evaluate at 5s cadence with 2-consecutive hysteresis and 10s cooldown.
-4. Visual classifier analyzes first-layer quality: gaps between lines indicate Z too high, filament scraping/ridging indicates Z too low.
-5. Inject bounded Z-offset corrections via Moonraker `SET_GCODE_OFFSET Z_ADJUST` (`±0.01mm` step, clamp `±0.05mm`).
-6. **Saturation exit**: if cumulative correction reaches clamp boundary and classifier still reports poor quality for 3 consecutive evaluations, pause print and notify user with current offset and classification result.
-7. Restore Z-offset baseline on terminal transition.
-
-**Success**: First layer converges without user intervention and no cross-print drift. The agent acts as a "god hand" — doing what experienced operators do by feel, but via real-time vision.
-
-### UC-03: Multimodal Failure Detection With Controlled Stop
-
-**Actor**: Agent
-**Trigger**: Active print monitoring detects sustained failure pattern via vision and/or audio.
-**Flow**:
-1. **Vision**: Multimodal failure detector emits confidence stream from camera frames.
-2. **Audio** (Phase 2): YAMNet-based audio classifier monitors microphone feed for anomalous sounds — stepper motor skipping, glass bed cracking, filament grinding/clicking at extruder. Audio detection triggers `M112` emergency stop immediately for mechanical safety events.
-3. If vision shows high confidence (3/5 frames >0.85), emergency cancel path executes.
-4. If vision shows moderate confidence (2/3 frames 0.6-0.85), pause and request **Resume/Cancel**.
-5. If pause decision times out (default: **5 minutes**, configurable), auto-cancel active job.
-
-**Success**: Defects are stopped quickly. Audio adds a second sensory channel that catches failures invisible to camera (extruder jams, mechanical failures, bed detachment sounds).
-
-### UC-04: External Print Detection (Started Outside Agent)
-
-**Actor**: Agent
-**Trigger**: WebSocket `print_stats.state` transitions to `printing` or `paused` while agent is IDLE.
-**Flow**:
-1. Agent debounces state transition (2 updates / up to 3s).
-2. Agent transitions to monitoring mode.
-3. Monitoring policy is **agent visual monitoring** for the entire external job.
-4. Agent may parse layer markers for notification context only.
-
-**Policy**: External prints receive agent visual monitoring. First-layer auto-correction is **never** enabled for external prints, even if metadata can be parsed.
-
-**Success**: External jobs are monitored for catastrophic failures without unsafe first-layer actuation.
-
-### UC-05: Closed-Loop Temperature/Flow Calibration
-
-**Actor**: Wei
-**Trigger**: User requests filament calibration via `/calibrate <filament>`.
-**Flow**:
-1. Agent generates temperature tower and flow-rate tower G-code.
-2. Agent prints towers and uses vision to score each zone (surface quality, stringing, layer adhesion).
-3. Agent proposes optimal temperature and flow values to user with visual comparison.
-4. On approval, agent injects optimal values into Klipper config via Moonraker API and executes `SAVE_CONFIG` to persist across restarts.
-
-**Success**: Filament calibration reduced from multi-hour manual iteration to a single automated cycle. Values are permanently written to printer config, not just session-temporary.
-**Scope**: Phase 2.
-
-### UC-06: Predictive Maintenance Tracking
-
-**Actor**: Agent
-**Trigger**: Scheduled or user-triggered `SHAPER_CALIBRATE` events.
-**Flow**:
-1. After each `SHAPER_CALIBRATE` run, agent records X/Y resonance frequency and recommended shaper parameters with timestamp.
-2. Agent tracks drift over weeks/months. Significant frequency shift indicates mechanical changes: belt loosening, bearing wear, loose bolts, or frame flex.
-3. When drift exceeds threshold, agent notifies user with specific diagnosis (e.g., "X-axis resonance shifted from 42Hz to 36Hz over 3 months — check belt tension and X-axis bearing").
-4. Agent can trigger a calibration run proactively if time since last run exceeds configured interval.
-
-**Success**: Mechanical issues (belt wear, bearing degradation) caught before they visibly degrade print quality. Users get actionable maintenance alerts, not just raw numbers.
-**Scope**: Phase 2.
-
-### UC-07: Filament Spool Monitoring (Phase 2)
-
-**Actor**: Agent
-**Trigger**: Continuous monitoring during active prints via secondary USB camera pointed at spool holder.
-**Flow**:
-1. Secondary USB camera captures spool images at configurable cadence.
-2. Vision estimates remaining spool volume/diameter to predict filament runout before it happens.
-3. If remaining filament is below estimated job requirement, agent warns user before print start or mid-print.
-4. Vision also detects crossed-filament tangles on the spool — a common cause of mid-print jams that is invisible to filament sensors.
-5. On tangle detection, agent pauses print and notifies user to untangle before resuming.
-
-**Success**: Prevents two common failure modes that existing filament runout sensors cannot catch: (a) running out mid-print when remaining quantity is marginal, (b) tangle-induced jams that snap filament or strip the extruder gear.
-**Scope**: Phase 2.
-
-### UC-08: Photo-to-Print Pipeline (Phase 3)
-
-**Actor**: Mia
-**Trigger**: User sends a photo to Telegram bot.
-**Flow**:
-1. Agent validates image (resolution, clarity, object isolation).
-2. Agent calls Image-to-3D API (e.g., TripoSR, Meshy, Tripo3D) to generate mesh.
-3. Agent runs automated mesh repair pipeline via MeshLab/Blender headless scripts: manifold repair, thin-wall thickening, orientation optimization, support analysis. Image-to-3D models (TripoSR, Meshy, Tripo3D) frequently produce non-manifold meshes — the agent acts as a "fixer" to make them print-ready.
-4. Agent presents 3D preview (rendered thumbnail) with print estimates (time, filament) and inline **Approve/Reject** decision.
-5. On approve, agent enters the existing slicing → upload → print → monitor pipeline (UC-01 flow from step 2 onward).
-6. On reject, agent offers adjustment options (scale, orientation, detail level) or cancels.
-
-**Printability gate**: If the mesh repair pipeline cannot produce a structurally sound model (e.g., too thin, non-manifold after repair), the agent reports the issue and does not proceed to print.
-
-**Success**: User receives a physical object matching the photo within hours, with only 1 interaction (send photo) + 1 approval.
-**Scope**: Phase 3.
-
-### UC-09: Bambu Printer Interface
-
-**Actor**: Agent
-**Trigger**: Job targets Bambu printer.
-**Flow**:
-1. Upload print assets via local FTP/FTPS.
-2. Send job control and receive status via local MQTT broker.
-3. Use adapter-normalized state/events so Agent Core logic remains unchanged.
-
-**MVP Scope**: Minimal command set — start, pause, cancel, status query. Full command parity deferred to Phase 2.
-
-**Success**: Same Telegram workflow works across Klipper and Bambu with adapter-specific transport.
+| Area | Required result |
+|---|---|
+| Whole-file validation | Every executable line is interpreted; unsupported or unsafe semantics reject the artifact |
+| Approval integrity | Artifact, validation, previews, physical confirmation, printer, configuration, source, and user bindings are verified before start |
+| Live preflight | Any stale or changed bound machine/Z fact blocks execution |
+| Monitoring | Required sources cannot complete a safety-managed start without a valid monitor contract and successful monitor start |
+| First layer | Required jobs are checked every 60 seconds until first-layer completion |
+| Dashboard exposure | Non-loopback binding without an API token is rejected at startup |
+| HTTP authentication | Only `/health` is public; absent or invalid bearer credentials fail closed elsewhere |
+| WebSocket access | Token and origin policy are enforced during connection establishment |
+| Decision races | A decision is consumed at most once; duplicate side effects are prevented |
 
 ---
 
-## 4. Feature Scope
+## 2. Users and Supported Scenarios
 
-### 4.1 Must Have (MVP)
+### 2.1 Primary User
 
-Legend: `[x]` wired into runtime · `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented. See `docs/ARCHITECTURE.md` §9 and `.project/TODO.md` for the wiring plan.
+A technically capable operator running one or more locally reachable Klipper/Moonraker printers who wants remote intake, review, controlled starts, status, and camera-assisted monitoring without surrendering final approval to an LLM.
 
-- [x] Telegram bot workflow with upload validation, inline decisions, configurable timeout handling, and **user allowlist authentication**.
-- [x] Klipper/Moonraker printer adapter with compatibility mode for older/modified Moonraker APIs.
-- [x] Bambu printer adapter (minimal): start, pause, cancel, status via local MQTT + FTP/FTPS.
-- [x] Shared printer adapter interface contract (abstract base for Klipper and Bambu adapters).
-- [~] STL/STEP/3MF slicing pipeline with parameter extraction (`FirstLayerParams`, `FirstLayerBounds`) for agent-started jobs. **Module-complete** (`slicer/`); not yet invoked from the Telegram upload flow.
-- [~] Camera calibration lifecycle: checkerboard calibration, artifact storage, validity checking, `/calibrate_camera` command. **Module-complete** (`vision/calibration.py`); not yet wired into `MonitoringOrchestrator`.
-- [~] First-layer auto-correction for agent-started jobs only, with saturation exit behavior. **Module-complete** (`vision/first_layer.py`, `monitoring/z_offset.py`); not yet wired.
-- [x] Decision idempotency with lock-guarded CAS helper across callbacks/timeouts/recovery.
-- [x] Persistent state snapshots (JSON) with safe IDLE reset policy preserving safety flags.
-- [x] Z-offset baseline capture/restore contract with verification, dirty-state print blocking, and `/reset_z_offset [target_mm]`.
-- [x] External print detection with visual monitoring policy.
-- [x] Moonraker WebSocket reconnection with backoff and state reconciliation.
-- [x] **LLM chat with 31+ tool-use functions** for natural language printer control, including SearXNG-backed `web_search` (added post-PRD).
-- [x] **PTZ camera control** via ONVIF for Tapo C220 (added post-PRD).
-- [x] **Web dashboard API** with REST, WebSocket, MJPEG proxy (added post-PRD).
+### 2.2 Supported Runtime Scenarios
 
-### 4.2 Phase 2 — Platform Maturity
+#### UC-01: Authorize and Start Supplied G-code
 
-Legend: `[x]` wired into runtime · `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented.
+1. An authenticated user submits G-code and selects a printer.
+2. The runtime retains the exact bytes in a content-addressed artifact store and computes a SHA-256 identity.
+3. The validator semantically interprets every executable line in order while maintaining machine state.
+4. Unsupported commands/parameters or unsafe motion, extrusion, temperature, or state transitions produce a rejection.
+5. The runtime generates deterministic JSON and rendered SVG previews bound to the artifact and validation result.
+6. The user reviews the result and explicitly approves the request, including its material/print metadata and physical snapshot derived from the configured build-plate memo, hotend/nozzle configuration, and live Z-offset state.
+7. `PrintSafetyService` verifies the approval binding and performs a first live preflight against current printer and Z facts.
+8. For `user_gcode` and `sva_generated`, the service requires a complete monitor contract, validates camera/LLM/printer readiness, and starts `PrintMonitor`.
+9. The service performs a second live preflight and then starts the exact printer-side artifact through the target adapter.
 
-- [~] STEP/3MF intake support alongside STL. **Module-complete** (`slicer/converter.py`); awaiting slicer wiring into upload flow.
-- [~] Audio anomaly detection (YAMNet): stepper skip, glass crack, filament grind/click → `M112` emergency stop (UC-03). **Module-complete** (`audio/`); no `AudioConfig` dataclass yet — see `.project/TODO.md` T2.1.
-- [~] Closed-loop calibration tower scoring and `SAVE_CONFIG` injection of optimal temp/flow values (UC-05). **Module-complete** (`calibration/`); not wired behind `/calibrate`.
-- [~] Filament spool monitoring: secondary USB camera estimates remaining spool volume to prevent runouts, and visually detects crossed-filament tangles to pause before extruder jam (UC-07). **Module-complete** (`vision/filament.py`, `vision/usb_camera.py`); not wired.
-- [x] Full Bambu adapter command parity and richer telemetry. Adapter is code-complete and lazy-instantiated; `default.yaml` does not enable a Bambu config section.
-- [~] SQLite job history and analytics storage. **Module-complete** (`storage/`); repositories not attached to dashboard app state.
-- [~] Multi-printer queue scheduling dashboard. **Module-complete** (`queue/`); `QueueManager` not attached to app state.
-- [~] Predictive maintenance via `SHAPER_CALIBRATE` drift tracking (UC-06). **Module-complete** (`monitoring/maintenance.py`); not wired to calibration events or storage.
+**Required result**: Only the exact, validated, approved artifact starts on the exact printer under the bound conditions.
 
-### 4.3 Future (Phase 3) — Photo-to-Print
+#### UC-02: Review Deterministic Previews
 
-Legend: `[~]` module-complete with unit tests but not yet started by `main.py` · `[ ]` not implemented.
+The approval interface exposes:
 
-- [~] Image-to-3D generation via external AI model APIs (TripoSR, Meshy, Tripo3D, or equivalent). **Module-complete** (`modeling/image_to_3d.py`); not wired behind feature flag.
-- [~] Automated mesh repair pipeline: manifold repair, thin-wall thickening, orientation optimization. **Module-complete** (`modeling/repair.py`, `modeling/orientation.py`, `modeling/support_analysis.py`); trimesh + Blender + MeshLab backends.
-- [~] Printability analysis and gate (reject unprintable meshes before slicing). **Module-complete** (`modeling/support_analysis.py`).
-- [~] 3D preview rendering for Telegram (thumbnail of generated model before approval). **Module-complete** (`modeling/preview.py`).
-- [~] End-to-end photo-to-print pipeline orchestration with Telegram approval flow. **Module-complete** (`modeling/pipeline.py`, 8 stages); not wired into Telegram photo handling.
-- [ ] Multi-view / text-prompt enhancement for higher-quality 3D generation.
-- [ ] Sketch-to-print support (hand-drawn sketches as input alongside photos).
+- a deterministic machine-readable summary;
+- a deterministic SVG rendering of the extrusion toolpath;
+- hashes for the source artifact, validation result, summary, and rendered preview;
+- validation findings, envelopes, and first-layer information available from the interpreted file.
 
-### 4.4 Out of Scope
+The rendered preview is bounded to 20,000 extrusion segments and 2,000,000 SVG bytes.
 
-- Training custom Image-to-3D models (use existing APIs/open-source models).
-- Direct firmware modification/forking.
-- Fully autonomous cloud-only orchestration that bypasses local safety controls.
-- Bambu cloud API fallback (local-only for safety/privacy in MVP).
-- Functional/mechanical part generation from photos (Phase 3 targets decorative/organic shapes only).
+**Required result**: Repeated generation from the same validated input yields the same approval artifacts; changed input invalidates the prior binding.
 
----
+#### UC-03: Confirm Physical Readiness
 
-## 5. Technical Constraints
+Before approval can authorize execution, the request includes material and print metadata plus physical evidence derived from the configured build-plate memo, hotend/nozzle configuration, and live Z-offset state. The operator explicitly reviews and approves this bound snapshot.
 
-- **Runtime**: Python 3.12 + `asyncio`.
-- **Safety**: Real-time safety decisions are rule-based and local. LLM use is advisory only.
-- **Command serialization**: All non-emergency printer commands flow through a prioritized queue. Emergency cancel bypasses queue via dedicated client/session.
-- **Deployment model**: MVP deploys **one Agent Core instance per printer**. Each instance has its own state machine, Telegram command namespace, and state file. Multi-printer coordination is deferred.
-- **State storage**: JSON atomic snapshots for MVP. SQLite deferred to Phase 2 for job history/analytics.
-- **Vision inference**: ONNX INT8 models for edge deployment on SBC hardware.
+**Required result**: Missing, incomplete, expired, or mismatched confirmation prevents authorization.
 
----
+**Boundary**: The snapshot combines configured and live evidence for human review; it is not machine vision or sensor proof of bed clearance, correct material, intact hardware, or safe surroundings.
 
-## 6. Hardware Environment
+#### UC-04: Live Preflight
 
-### Printers
-- **Creality Ender 3 V2**: Klipper + Fluidd on Raspberry Pi.
-- **Elegoo Neptune 4 Max**: Elegoo-modified Fluidd + Klipper on MKSPi (requires Moonraker compatibility mode).
-- **BambuLab P1SC, A1C, H2C**: Local MQTT + FTP/FTPS interface (no Klipper/Moonraker).
+Immediately before printer side effects, the service compares approved bindings with current values for the selected printer, including the available hardware/profile/config/macro digests, probe Z offset, homing-origin Z, source trust, and user identity.
 
-### Cameras
-- **Tapo C220**: Primary PTZ camera. ONVIF control via `camera/tapo.py`. RTSP stream for vision pipeline.
-- **Blurams PTZ Dome Security Camera**: IP camera, RTSP/WebRTC stream (RTSP fallback path).
-- **Wyze Camera**: IP camera, RTSP stream (via firmware or bridge).
+**Required result**: A mismatch, unavailable required fact, disconnected printer, or adapter failure stops execution without guessing.
 
-> Note: Vision module supports RTSP network streams. Tapo C220 is the only camera with first-class PTZ integration today; Blurams/Wyze operate as RTSP-only input. If native support is insufficient, USB webcam alternatives (e.g., Logitech C920/C270) are supported via `vision/usb_camera.py` for filament monitoring.
+#### UC-05: Mandatory First-Layer Monitoring
+
+For a safety-managed print whose source is `user_gcode` or `sva_generated`:
+
+1. Validation must provide the information needed to construct the monitor contract.
+2. The contract must include filename, source identity, and first-layer Z.
+3. `PrintMonitor` captures a camera image and requests independent LLM image analysis at a fixed 60-second cadence until first-layer completion.
+4. After first-layer completion, it uses the configured normal check interval.
+5. An unacknowledged detected anomaly pauses the printer and produces a notification/alert through configured runtime channels.
+
+**Required result**: The print is not reported as successfully started through the safety service if mandatory monitoring cannot start.
+
+**Boundary**: Monitoring observes and may pause; it does not modify Z offset or guarantee detection within less than 60 seconds.
+
+#### UC-06: Dashboard and API Access
+
+1. `/health` remains accessible for health checks.
+2. Every other HTTP path requires the configured bearer credential and fails closed if authentication is unavailable or invalid.
+3. Binding the dashboard to a host other than `127.0.0.1`, `::1`, or `localhost` requires an API token.
+4. WebSocket setup applies token and allowed-origin checks.
+5. Authenticated clients may use available status, telemetry, chat, approval, upload, audit, task, alert, camera, and WebSocket functions.
+
+**Required result**: The application does not silently expose printer controls because a token was omitted.
+
+#### UC-07: Telegram Operation
+
+Telegram commands and uploads require the configured user allowlist. Decisions flow through the same idempotent consumption rules used by other interfaces.
+
+**Required result**: Unauthorized users cannot invoke printer operations, and concurrent callback/timeout paths cannot execute an approval twice.
 
 ---
 
-## 7. Risks
+## 3. Functional Requirements
 
-| Risk | Impact | Likelihood | Mitigation |
-|------|--------|------------|------------|
-| Duplicate decision handling from async races | High | Medium | Lock-guarded `consume_decision(...)` used by all entry points; race tests required |
-| External-print policy drift reintroduces unsafe actuation | High | Medium | Single canonical rule: external jobs use agent visual monitoring only; policy asserted in integration tests |
-| `z_offset_dirty` lost during idle reset | High | Low | Full IDLE snapshot preserving persistent fields |
-| Moonraker variant payload mismatch (Neptune mods) | Medium | Medium | Compatibility shim + normalized internal enums |
-| Unsafe manual Z reset to wrong baseline | Medium | Medium | `/reset_z_offset [target_mm]` baseline-default + explicit zero requirement + verification |
-| Emergency cancel command failures | High | Low | Dedicated bypass client, bounded retries, `EMERGENCY_FAILED` degraded mode and urgent notifications |
-| First-layer false positives due to lighting/contrast | Medium | Medium | Calibration + ROI guard + bounded actuation + per-filament opt-out |
-| Bambu local interface instability | Medium | Medium | Adapter isolation, reconnect/backoff, non-blocking fallback notifications |
-| Moonraker WebSocket disconnection during monitoring | High | Medium | Exponential backoff reconnection, full state poll on reconnect, state reconciliation |
-| Unauthorized Telegram bot access controlling hardware | High | Low | User/chat ID allowlist, reject unauthorized messages |
-| Image-to-3D API quality insufficient for printing | Medium | Medium | Printability gate rejects bad meshes; user shown preview before committing to print |
-| Generated mesh structurally unsound (thin walls, non-manifold) | High | High | Automated mesh repair pipeline + conservative rejection threshold |
-| Image-to-3D API cost per generation | Medium | Medium | Cache results; let user approve before expensive operations; consider open-source model self-hosting |
-| User expectation mismatch (photo vs printed result) | Medium | High | Clear preview with disclaimers; initial scope limited to decorative/organic objects |
+### 3.1 Unified Print Safety Service
+
+- The runtime shall create one `PrintSafetyService` for each configured printer adapter.
+- All safety-managed print starts shall pass through this service as the final authorization gate.
+- The service shall use immutable content identity rather than trusting a mutable filesystem path.
+- Authorization shall fail closed on missing services, adapters, bindings, confirmations, or monitor prerequisites.
+- Adapter upload/start failures shall not be converted into successful authorization receipts.
+
+### 3.2 Whole-File Semantic Validation
+
+The validator shall:
+
+- parse every executable line rather than inspect only a prefix or sample;
+- maintain relevant machine state across lines;
+- enforce supported command and parameter allowlists;
+- validate motion bounds and semantics using interpreted coordinates and modes;
+- validate extrusion and thermal semantics supported by the safety model;
+- identify toolpath and first-layer envelopes and first-layer Z where derivable;
+- produce structured issues and a deterministic result digest;
+- reject unknown safety-relevant semantics instead of assuming they are harmless.
+
+Validation is specific to the supported dialect and safety model. It is not firmware emulation, physical collision simulation, or proof that a mechanically valid file will print successfully.
+
+### 3.3 Preview and Approval Binding
+
+- Summary JSON and rendered SVG bytes shall be deterministic for a given validated artifact.
+- Their digests shall be bound to the source artifact and validation result.
+- Approval shall identify the target printer and approving user.
+- Approval shall include the material/print metadata and physical snapshot derived from the configured build-plate memo, hotend/nozzle configuration, and live Z-offset state.
+- Any changed bound value shall require renewed validation and/or approval as appropriate.
+
+### 3.4 Printer and Z Preflight
+
+- Preflight shall occur after approval verification, again after mandatory monitor startup, and before printer start effects.
+- It shall re-read all required mutable facts available through the adapter/runtime.
+- Probe Z offset and homing-origin Z shall be compared with the approved snapshot under configured policy/tolerances.
+- Preflight shall reject target-printer changes, identity changes, configuration drift, trust changes, and unavailable required data.
+
+### 3.5 Monitoring
+
+- `MANDATORY_MONITOR_SOURCES` shall include `user_gcode` and `sva_generated`.
+- A required `MonitorStartContract` shall contain filename, source identity, and first-layer Z.
+- Required first-layer checks shall occur every 60 seconds until first-layer completion.
+- Normal monitoring cadence shall be configurable for subsequent checks.
+- Required monitor startup shall validate printer progress, camera availability and view, and independent LLM analysis readiness before the printer starts.
+- Image analysis shall run in an independent context so chat history does not bias the observation.
+- The monitor shall treat image/model output as probabilistic evidence and use its configured pause/acknowledgement behavior.
+
+### 3.6 Interfaces and Security
+
+- Telegram shall enforce its configured user allowlist for commands and uploads.
+- Dashboard middleware shall leave only `/health` public.
+- Protected HTTP requests shall require valid bearer authentication.
+- Dashboard startup shall reject non-loopback binding without an API token.
+- WebSocket handshakes shall enforce configured authentication and origin policy.
+- Deployment documentation shall not imply that application authentication supplies TLS, firewalling, VPN, or network segmentation.
+
+### 3.7 Auditing and Persistence
+
+- Decisions and LLM tool operations shall retain enough identity and outcome information for operational audit.
+- Agent state shall use the implemented persistence mechanism and idempotent decision controls.
+- Printer memos may store physical facts that do not belong in printer firmware configuration.
+- Safety artifacts kept solely in the in-memory content-addressed store are process-lifetime data and shall not be presented as durable history.
 
 ---
 
-## 8. Open Questions
+## 4. Technical Constraints
 
-### Phase 1 (MVP)
-- [ ] Should OrcaSlicer become co-equal with PrusaSlicer in MVP, or remain optional profile-compatible backend?
-- [ ] Should external prints support user-approved first-layer correction in a future mode, or remain permanently agent-visual-monitoring only?
-- [ ] What is the minimum integration-test matrix for legacy Moonraker variants (stock, Elegoo-modified, and one pinned older release)?
-- [ ] For Bambu, should cloud API be supported as fallback when local MQTT is unavailable, or explicitly local-only for safety/privacy?
+- **Runtime**: Python 3.12 and `asyncio`.
+- **Primary printer path**: Klipper/Moonraker REST and WebSocket APIs.
+- **Safety authority**: Deterministic local validation, binding checks, and preflight; LLM output is not authorization authority.
+- **Artifact identity**: SHA-256 content identity for source and derived approval artifacts.
+- **Monitoring dependency**: Camera access and a configured image-capable LLM are operational dependencies for required monitoring.
+- **Preview limits**: At most 20,000 rendered extrusion segments and 2,000,000 SVG bytes.
+- **First-layer interval**: Fixed at 60 seconds for required first-layer checks.
+- **API exposure**: A token is mandatory for non-loopback dashboard binding.
 
-### Phase 3 (Photo-to-Print)
-- [ ] Which Image-to-3D backend to prioritize? Cloud API (Meshy, Tripo3D) vs self-hosted open-source (TripoSR, InstantMesh)?
-- [ ] What mesh repair library to use? (trimesh, PyMeshLab, or custom pipeline)
-- [ ] Should the system support multi-view input (multiple photos of same object) for higher quality generation?
-- [ ] How to handle user expectations for functional parts vs decorative objects? Hard gate or soft warning?
+---
+
+## 5. Risks and Mitigations
+
+| Risk | Impact | Implemented mitigation | Residual limitation |
+|---|---|---|---|
+| Malicious or unsupported G-code | Hardware damage or unsafe motion | Whole-file stateful validation and default rejection | Validator models only supported semantics and cannot simulate all physical effects |
+| Artifact changes after review | Wrong bytes reach printer | Content-addressed storage and digest-bound approval | In-memory artifact availability ends at process restart |
+| Printer/configuration drift after approval | Approval no longer describes execution context | Live identity/configuration/Z preflight | Only queryable and modeled facts can be compared |
+| Operator misses a physical hazard | Collision, fire, damage | Required physical-confirmation snapshot | Assertion is not sensor verification |
+| Camera/LLM misses a defect | Print continues incorrectly | Mandatory cadence and independent image analysis | Occlusion, lighting, latency, outage, and model error remain |
+| False anomaly | Unnecessary pause | Acknowledgement/policy handling and operator notification | Probabilistic output cannot eliminate false positives |
+| Monitor fails at start | Unmonitored required print | Safety-managed start fails closed | Adapter-side effects may require cleanup/reconciliation after partial failures |
+| Exposed dashboard | Unauthorized machine control | Bearer auth, loopback exposure check, WebSocket token/origin enforcement | TLS and network perimeter controls remain deployment responsibilities |
+| Concurrent decisions | Duplicate upload/start/cancel effects | Lock-guarded idempotent decision consumption | External systems must still honor returned state and errors |
+| Adapter mismatch | Incorrect control behavior | Adapter abstraction and explicit target binding | Klipper/Moonraker is the production-supported path; other adapters need deployment validation |
+
+---
+
+## 6. Actual Limitations
+
+1. Camera monitoring is not deterministic and is not a certified safety system.
+2. First-layer monitoring runs every 60 seconds, not continuously and not at a five-second control-loop cadence.
+3. No camera-driven first-layer Z-offset actuation is part of the current runtime.
+4. The safety service's content-addressed artifact store is in memory.
+5. Preview output is intentionally bounded and is not full kinematic, thermal, collision, or material simulation.
+6. Physical confirmation depends on attentive review of configured and live evidence and cannot prove every physical condition.
+7. The live preflight cannot observe every loose component, obstruction, wiring fault, material mismatch, firmware defect, or environmental risk.
+8. A supplied G-code workflow is the complete safety-managed path; model slicing is not an end-to-end production runtime feature.
+9. Photo/sketch-to-model generation and automated mesh repair are not current product capabilities.
+10. Durable multi-printer scheduling is not part of the current runtime; job-history data is available through the wired repository and API.
+11. The Bambu adapter is not production-wired by the default configuration.
+12. Dashboard authentication does not itself encrypt traffic or secure the host/network.
+
+---
+
+## 7. Acceptance Tests
+
+The product baseline is acceptable when automated tests demonstrate:
+
+- rejection of unsupported commands, parameters, unsafe state transitions, and out-of-policy motion/thermal behavior anywhere in a file;
+- deterministic validation and preview hashes for identical input;
+- invalidation on artifact, preview, validation, printer, configuration, Z, source, user, or confirmation mismatch;
+- no printer start on failed live preflight;
+- no successful safety-managed start for a mandatory source when monitor contract creation or monitor startup fails;
+- 60-second monitor scheduling before first-layer completion and configured cadence afterward;
+- anomaly-triggered pause behavior under the configured acknowledgement policy;
+- only `/health` bypassing HTTP bearer authentication;
+- startup rejection for non-loopback dashboard binding without an API token;
+- WebSocket rejection for invalid token or disallowed origin;
+- one-time decision consumption under concurrent approval/timeout attempts.
+
+Hardware tests remain necessary before relying on a deployment with a real printer.

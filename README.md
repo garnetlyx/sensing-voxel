@@ -1,253 +1,149 @@
 # Sensing Voxel
 
-AI-powered 3D printer monitoring and control system with real-time vision-based quality detection.
-
-> **SVA** (Sensing-Voxel Agent) is the AI agent runtime at the core — it drives the LLM tool-use loop, state machine, and all wired subsystems. Interact with SVA via the Telegram bot or web dashboard chat.
+Sensing Voxel is an experimental, safety-gated control and monitoring service for 3D printers. SVA (Sensing-Voxel Agent) provides Telegram and web-dashboard interfaces, LLM-assisted operations, deterministic G-code authorization, and camera-based print monitoring.
 
 ## Safety Disclaimer
 
-Sensing Voxel is experimental software. It combines LLM-driven automation, camera-based interpretation, printer control APIs, and physical 3D printers, all of which can behave unpredictably in real-world conditions.
+Sensing Voxel combines automation, camera interpretation, printer-control APIs, and physical machinery. These systems can fail independently or together. The software reduces some avoidable risks but cannot prove that a printer, toolhead, build plate, material, environment, or generated motion is safe.
 
-The author has made best efforts to design safer workflows, approval gates, validation checks, and conservative defaults, but no software layer can predict every printer state, hardware failure, model error, configuration mistake, network issue, or unsafe operating condition. Use this project only with appropriate supervision and at your own risk.
+Operate printers with appropriate supervision, fire precautions, verified firmware limits, and a reachable hardware emergency stop. A successful software validation or camera check is not a safety certification. By using this project, you accept responsibility for machine behavior, print outcomes, hardware damage, material loss, fire risk, and other consequences.
 
-By using Sensing Voxel, you accept full responsibility for any print outcome, machine behavior, hardware damage, material loss, fire risk, or other consequence. The author is not responsible for damage to printers, tools, property, or any other losses arising from use, modification, or deployment of this software.
+## Current Capabilities
 
-## Features
+- **Unified print authorization**: One `PrintSafetyService` is created per configured printer and acts as the final gate for safety-managed print starts.
+- **Whole-file semantic G-code validation**: Every executable line is interpreted in machine-state order. The validator applies command and parameter allowlists, tracks coordinate/extrusion/temperature state, checks motion and thermal semantics, calculates the toolpath and first-layer envelopes, and rejects unsupported or unsafe input.
+- **Content-bound approval**: Source bytes are stored by SHA-256. Validation, deterministic preview artifacts, operator approval, printer identity, configuration state, and execution are cryptographically bound so changed inputs require a new decision.
+- **Rendered preview and physical confirmation**: The approval flow provides deterministic JSON plus an SVG toolpath preview. Its evidence includes material and print metadata plus a physical snapshot derived from the configured build-plate memo, hotend/nozzle configuration, and live Z-offset state for operator review.
+- **Live preflight**: Immediately before execution, the safety service rechecks mutable printer facts, including target identity, hardware/profile/config/macro digests, probe Z offset, homing-origin Z, source trust, and user identity. A mismatch fails closed.
+- **Mandatory monitoring contract**: Prints whose source is `user_gcode` or `sva_generated` cannot start through the safety service unless `PrintMonitor` passes readiness checks and starts with a filename, source identity, and first-layer Z.
+- **First-layer monitoring cadence**: Required jobs receive a camera snapshot and independent LLM image analysis every 60 seconds until first-layer completion; monitoring then uses the configured normal interval. An unacknowledged detected anomaly causes an automatic pause.
+- **Klipper/Moonraker control**: The production runtime supports printer status, telemetry, upload/start, lifecycle commands, macros, and WebSocket updates through the Klipper adapter.
+- **Telegram and dashboard interfaces**: User-allowlisted Telegram operation, REST/WebSocket dashboard updates, chat, approvals, audit information, and camera access.
+- **Dashboard/API hardening**: `/health` is the only public path. Other HTTP routes require bearer authentication, missing authentication fails closed, non-loopback binding requires an API token, and WebSocket connections enforce configured token and origin checks.
+- **Camera and PTZ support**: RTSP snapshots/streaming and ONVIF controls for supported Tapo cameras.
+- **Printer memos and auditability**: Physical attributes that do not belong in printer firmware configuration can be stored in SQLite; tool actions and decisions are auditable.
 
-- 🤖 **Telegram Bot Interface**: Upload G-code files, receive notifications, and control prints
-- 🖨️ **Multi-Printer Support**: Klipper/Moonraker (Bambu adapter exists but is not production-wired)
-- 📊 **Web Dashboard**: Real-time monitoring UI with WebSocket updates
-- 🔧 **First-Layer Auto-Correction**: Z-offset adjustment *(module-complete, not yet wired — see Roadmap)*
-- 📸 **Camera Calibration**: Checkerboard-based bed-level calibration *(module-complete, not yet wired — see Roadmap)*
-- 🛡️ **External Print Detection**: Monitor prints started outside the agent *(module-complete, not yet wired — see Roadmap)*
+## Safety-Managed G-code Flow
+
+```text
+G-code bytes
+  -> content-addressed artifact
+  -> whole-file deterministic validation
+  -> deterministic JSON + rendered SVG preview
+  -> operator approval + physical confirmation
+  -> approval binding for artifact, validation, printer, config, and user
+  -> first live printer/Z preflight
+  -> mandatory PrintMonitor readiness and startup
+  -> second live printer/Z preflight
+  -> start the exact printer-side file through the selected adapter
+  -> 60-second first-layer checks, then configured cadence
+```
+
+Any failed validation, stale binding, changed live fact, absent required confirmation evidence, adapter error, monitor-readiness failure, or failure to start mandatory monitoring prevents authorization or fails the start closed.
 
 ## Architecture
 
+```text
+Telegram / Web Dashboard
+           |
+       Agent Core
+  (state, policy, decisions, LLM tools)
+           |
+  PrintSafetyService per printer
+   |       |        |       |
+artifact validator preview preflight
+   |                         |
+   +---- Printer Adapter ----+
+              |
+       Klipper/Moonraker
+              |
+         PrintMonitor
+   (camera snapshot + isolated
+      LLM anomaly analysis)
 ```
-Telegram Bot <-> Agent Core (state machine + policy + decision engine)
-                      |
-      +---------------+-------------------+
-      |               |                   |
- Slicer Pipeline   Vision Monitor     Printer Adapter (abstract)
- (PrusaSlicer CLI) (RTSP → OpenCV)     ├── KlipperAdapter (Moonraker REST/WS)
-                   ├── FirstLayer       └── BambuAdapter (Local MQTT + FTP)
-                   │   (OpenCV)
-                   └── Calibration
-                       (Checkerboard)
-```
+
+The deterministic authorization path and the probabilistic camera-monitoring path are deliberately separate. LLM output does not replace G-code validation or live preflight.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.12+
-- Docker (optional, for containerized deployment)
-- PrusaSlicer CLI (for slicing STL files)
+- A configured Klipper/Moonraker printer for the production-supported path
+- Docker, optionally, for containerized deployment
+- An RTSP camera and supported LLM provider for camera monitoring
 
 ### Installation
 
-1. Clone the repository:
-
 ```bash
 git clone https://github.com/garnetlyx/sensing-voxel.git
 cd sensing-voxel
-```
-
-2. Create virtual environment and install:
-
-```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-```
-
-3. Configure:
-
-```bash
 cp config/default.yaml config/local.yaml
-# Edit config/local.yaml with your settings
-```
-
-4. Run:
-
-```bash
-source .venv/bin/activate
+# Edit config/local.yaml for your printer, interfaces, authentication, and camera.
 python -m sensing_voxel.main
 ```
 
-### Docker Deployment (One-Liner)
-
-The fastest way to deploy Sensing Voxel is using Docker Compose:
+### Docker Compose
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/garnetlyx/sensing-voxel.git
 cd sensing-voxel
-
-# 2. Copy and configure environment variables
 cp .env.example .env
-# Edit .env with your settings (at minimum, set SV_TELEGRAM_BOT_TOKEN)
-
-# 3. Start the services
+# Configure required credentials and an API token for any non-loopback dashboard bind.
 docker compose up -d
-
-# 4. View logs
 docker compose logs -f
 ```
 
-**Configuration via environment variables:**
+Do not expose the dashboard to a non-loopback interface without a strong API token and appropriate network controls.
 
-All configuration is done through the `.env` file. Key variables:
+## Project Structure
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SV_TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from @BotFather |
-| `SV_TELEGRAM_ALLOWED_USERS` | Yes | Comma-separated Telegram user IDs |
-| `SV_DASHBOARD_PORT` | No | Dashboard port (default: 8080) |
-| `SV_KLIPPER_HOST` | No | Klipper/Moonraker IP address |
-| `SV_BAMBU_MQTT_HOST` | No | Bambu printer IP address |
-| `SV_CAMERA_RTSP_URL` | No | RTSP URL for camera stream |
-
-**Persistent data:**
-
-Docker volumes are automatically created for:
-- `sensing-voxel-data`: Agent state, calibration data
-- `sensing-voxel-uploads`: Uploaded STL files
-- `sensing-voxel-models`: ML models
-
-**Updating:**
-
-```bash
-# Pull latest changes and rebuild
-git pull
-docker compose up -d --build
+```text
+src/sensing_voxel/
+├── main.py                  # Runtime composition and lifecycle
+├── config.py                # Configuration models and loading
+├── core/                    # State machine, decisions, persistence
+├── safety/                  # Artifacts, validator, preview, authorization, execution
+├── monitoring/
+│   └── print_monitor.py     # Required camera/LLM print monitor
+├── adapters/                # Printer adapter contract and implementations
+├── bot/                     # Telegram interface and authorization
+├── api/                     # Hardened HTTP/WebSocket dashboard API
+├── dashboard/               # Browser UI assets
+├── llm/                     # Chat, tools, approvals, context, and audit
+├── camera/                  # ONVIF PTZ support
+├── slicer/                  # Model processing support; not fully runtime-wired
+├── storage/                 # Runtime persistence used by current services
+└── infra/                   # Shared infrastructure utilities
 ```
 
-### Manual Installation
+## Current Limitations
 
-See `config/default.yaml` for configuration options:
-
-- **Telegram**: Bot token and allowed user IDs
-- **Klipper**: Moonraker host, port, and API key
-- **Bambu**: MQTT and FTP credentials
-- **Camera**: RTSP URL and calibration settings
-- **Storage**: Data directory paths
+- Camera anomaly assessment is probabilistic. Lighting, occlusion, focus, camera movement, network faults, and model error can produce false positives or false negatives.
+- The monitor pauses on an unacknowledged anomaly; it does not perform automatic first-layer Z-offset correction.
+- The mandatory first-layer check interval is 60 seconds, so this is not sub-minute hazard detection or a replacement for firmware and hardware protection.
+- Deterministic validation covers the supported G-code dialect and modeled machine semantics only. Unsupported commands or parameters are rejected rather than guessed.
+- Preview rendering is bounded to 20,000 extrusion segments and 2,000,000 SVG bytes. It is an approval aid, not a physical simulation or collision proof.
+- The content-addressed artifact store used by the safety service is in memory; authorization artifacts do not survive a process restart unless persisted elsewhere by a surrounding workflow.
+- Physical confirmation presents configured and live evidence for operator approval. The software cannot independently verify that the bed is clear, material is correct, hardware is intact, or the environment is supervised.
+- The live preflight detects changes in facts it can query and bind; it cannot detect every mechanical, electrical, firmware, or environmental hazard.
+- Klipper/Moonraker is the production-supported printer path. The Bambu adapter exists but is not production-wired by the default runtime configuration.
+- Model slicing and photo-to-print generation are not current end-to-end runtime workflows. Supply already generated G-code to use the complete safety-managed path.
+- Dashboard security protects the application boundary but does not provide TLS termination, host firewalling, VPN access, credential rotation, or network segmentation.
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Run all tests
 pytest
-
-# Run with coverage
 pytest --cov=sensing_voxel --cov-report=html
-
-# Run specific test file
-pytest tests/unit/test_state_machine.py
 ```
-
-### Project Structure
-
-```
-sensing-voxel/
-├── src/
-│   └── sensing_voxel/
-│       ├── main.py                  # Entry point
-│       ├── config.py                # Configuration
-│       ├── core/                    # Core state machine, decision engine, persistence
-│       ├── adapters/                # Printer adapters (Klipper, Bambu, base, command queue)
-│       ├── bot/                     # Telegram bot (telegram, auth, decisions)
-│       ├── api/                     # Dashboard REST/WS API
-│       ├── llm/                     # LLM chat with tool use (50 tools)
-│       ├── camera/                  # PTZ camera control (Tapo ONVIF)
-│       ├── infra/                   # Shared utilities (retry, gcode validation)
-│       ├── dashboard/               # Dashboard static files
-│       ├── slicer/                  # Slicing pipeline (module-complete, unwired)
-│       ├── vision/                  # Vision processing (module-complete, unwired)
-│       ├── monitoring/              # Print monitoring (PrintMonitor wired), Z-offset, maintenance
-│       ├── audio/                   # YAMNet anomaly detection (unwired, no config yet)
-│       ├── calibration/             # Tower generation, visual scoring (unwired)
-│       ├── storage/                 # SQLite job/calibration repositories (unwired)
-│       ├── queue/                   # Multi-printer queue + schedulers (unwired)
-│       └── modeling/                # Photo-to-print, image-to-3D, mesh repair (unwired)
-├── tests/
-│   ├── unit/                        # Unit tests
-│   └── integration/                 # Integration tests
-├── config/
-│   └── default.yaml                 # Default config
-├── data/                            # Runtime data
-└── docs/
-    ├── PRD.md                       # Product requirements
-    └── ARCHITECTURE.md              # Architecture doc
-```
-
-## Roadmap / Current Runtime Status
-
-This section describes the currently wired runtime behavior, not just isolated
-modules or tests.
-
-- **Phase 0**: Stabilization
-  - [x] Project scaffolding and install metadata
-  - [x] Core data models, state machine, decision engine, and JSON persistence
-  - [x] Security hardening for uploaded file paths and G-code command validation
-
-- **Currently wired and usable**
-  - [x] Klipper/Moonraker adapter: REST/WebSocket connection, telemetry, file upload,
-        print lifecycle commands, temperatures, movement, macros, and basic system info
-  - [x] Telegram allowlisted bot with `/start`, `/status`, `/reset_z_offset`,
-        `/calibrate_camera`, `/ask`, `/clear_chat`, `/ctx`, `/audit`, `/tasks`,
-        `/approvals`, and file upload handling
-  - [x] Direct G-code upload workflow through Telegram:
-        upload `.gcode`/`.g`/`.gco` → approval buttons → upload to printer → start print
-  - [x] Web dashboard server with status, printer list, telemetry, alerts,
-        WebSocket updates, chat endpoint, and camera stream route
-  - [x] Tapo PTZ / RTSP camera support when configured
-  - [x] Basic LLM chat when configured
-  - [x] Background print monitoring (`PrintMonitor`): periodic camera snapshot + LLM vision
-        anomaly detection, auto-pause on unacknowledged anomaly, auto-activates on PRINTING state
-  - [x] Printer memo system: SVA stores physical attributes (bed surface, filament brand)
-        in SQLite; rejects values that belong in printer.cfg (single source of truth)
-  - [x] MAC address hardware fingerprinting: auto-discovers printer identity from Moonraker
-  - [x] Web search (`web_search` tool via SearXNG): LLM performs autonomous multi-turn queries
-  - [x] Tool cooldown: physical tools rate-limited to prevent hardware congestion
-  - [x] Independent vision analysis: camera_snapshot performs bias-free LLM analysis
-        in a separate context to prevent confirmation bias from chat history
-
-- **Implemented as modules, but not fully wired into the main runtime**
-  - [ ] STL/STEP/3MF slicing workflow: `SlicerPipeline` exists, but Telegram model
-        uploads currently stop after staging the file and entering `RECEIVING`; the
-        runtime does not yet call the slicer and advance to approval automatically
-  - [ ] Monitoring orchestrator: external print detection,
-        first-layer correction, audio anomaly handling, and filament monitoring are
-        implemented in modules/tests but are not instantiated or started by `main.py`.
-        Note: `PrintMonitor` (background camera check) IS wired; `MonitoringOrchestrator`
-        (first-layer/sfilament/audio) is NOT.
-  - [ ] Dashboard decision side effects: `/api/v1/decision` records a decision but
-        does not yet perform the Telegram-equivalent upload/start/resume/cancel actions
-  - [ ] Job history and queue dashboard APIs: route handlers exist, but repository and
-        queue managers are not wired into app state by the main runtime
-  - [ ] LLM tool execution on OpenAI-compatible backends: basic chat works, but the
-        tool-use loop is not fully compatible with OpenAI-style tool call responses
-  - [ ] Bambu runtime support: adapter code exists, but configuration and startup wiring
-        are incomplete for production use
-  - [ ] Photo-to-print / image-to-3D pipeline: modeling modules exist but are not exposed
-        through Telegram or dashboard runtime workflows
-
-- **Planned integration work**
-  - Wire `SlicerPipeline.process_model()` into Telegram and dashboard upload flows
-  - Start `MonitoringOrchestrator` from `main.py` with configured camera/detectors
-  - Add first-layer test generation and approval/start workflow
-  - Complete dashboard decision side effects
-  - Wire SQLite job history and multi-printer queue manager
-  - Finish OpenAI-compatible LLM tool-call protocol support upstream or via a minimal adapter
 
 ## License
 
-GNU General Public License v3.0
-
-This project is licensed under the GPL-3.0 license, which ensures that all derivatives and integrations remain open source. See the [LICENSE](LICENSE) file for details.
+GNU General Public License v3.0. See [LICENSE](LICENSE).
 
 ## Credits
 

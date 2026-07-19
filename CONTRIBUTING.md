@@ -133,24 +133,26 @@ mypy src/
 
 ## Project Structure
 
-```
+```text
 sensing-voxel/
 ├── src/sensing_voxel/
-│   ├── core/          # State machine, decision engine
-│   ├── adapters/      # Printer adapters (Klipper, Bambu)
-│   ├── bot/           # Telegram bot interface
-│   ├── api/           # Web dashboard API
-│   ├── llm/           # LLM integration
-│   ├── slicer/        # STL slicing pipeline
-│   ├── vision/        # Computer vision modules
-│   ├── camera/        # PTZ camera control
-│   └── monitoring/    # Print monitoring
-├── tests/
-│   ├── unit/          # Unit tests
-│   ├── integration/   # Integration tests
-│   └── e2e/           # End-to-end tests
-├── config/            # Configuration files
-└── docs/              # Documentation
+│   ├── main.py         # Runtime composition and lifecycle
+│   ├── config.py       # Configuration models and loading
+│   ├── core/           # State machine, decisions, persistence
+│   ├── safety/         # Validation, preview, authorization, execution
+│   ├── monitoring/     # Camera/LLM print monitoring
+│   ├── adapters/       # Printer adapter contract and implementations
+│   ├── bot/            # Telegram interface and authorization
+│   ├── api/            # HTTP/WebSocket dashboard API
+│   ├── dashboard/      # Browser UI assets
+│   ├── llm/            # Chat, tools, approvals, context, and audit
+│   ├── camera/         # ONVIF PTZ support
+│   ├── slicer/         # Model processing support; not fully runtime-wired
+│   ├── storage/        # Runtime persistence
+│   └── infra/          # Shared infrastructure utilities
+├── tests/              # Unit, integration, end-to-end, and live tests
+├── config/             # Configuration files
+└── docs/               # Documentation
 ```
 
 ## Testing Guidelines

@@ -2,10 +2,9 @@
 Hardware verification script for Sensing Voxel Phase 4.1 Real-World Test.
 
 Checks connectivity to:
-- Printer 1 (Neptune 4 Max): printer.example:80
-- Printer 2: printer.example:80
-- Camera (Tapo C220): ONVIF connection
-- LLM Proxy: api.minimaxi.com
+- Configured Klipper printers
+- Configured ONVIF camera
+- Configured LLM proxy
 
 Output: hardware_status.json
 """
@@ -31,20 +30,19 @@ from sensing_voxel.config import TapoCameraConfig
 
 logger = logging.getLogger(__name__)
 
-# Default configuration
 DEFAULT_PRINTERS = [
-    {"name": "neptune_4_max", "host": "printer.example", "port": 80},
-    {"name": "ender_3", "host": "printer.example", "port": 80},
+    {"name": "printer_1", "host": "192.0.2.10", "port": 80},
+    {"name": "printer_2", "host": "192.0.2.11", "port": 80},
 ]
 
 DEFAULT_CAMERA_CONFIG = TapoCameraConfig(
-    host="192.168.1.100",  # Update with actual IP
-    user="admin",
-    password="admin",
+    host="192.0.2.20",
+    user="camera-user",
+    password="camera-password",
     onvif_port=2020,
 )
 
-LLM_PROXY_URL = "https://api.minimaxi.com/v1/models"
+LLM_PROXY_URL = "https://llm.example.com/v1/models"
 
 
 class HardwareVerifier:

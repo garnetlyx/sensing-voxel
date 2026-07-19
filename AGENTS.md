@@ -11,7 +11,7 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 - **Runtime**: Python 3.12 + asyncio
 - **Adapters**: Klipper (Moonraker REST+WS), Bambu (MQTT+FTP)
 - **Interfaces**: Telegram bot, Web dashboard, LLM chat (Anthropic tool use)
-- **Vision**: First-layer auto-correction, camera calibration, filament/tangle monitoring, USB camera
+- **Monitoring**: Camera snapshots assessed by the configured multimodal LLM through `PrintMonitor`
 - **Camera**: Tapo C220 with ONVIF PTZ control
 
 ## Architecture
@@ -19,7 +19,8 @@ AI-powered 3D printer monitoring and control system with real-time vision-based 
 ```
 src/sensing_voxel/
   core/         - State machine, decision engine, persistence, data models
-  adapters/     - Printer adapters (klipper.py, bambu.py, base.py, command_queue.py)
+  safety/       - Validation, preview, authorization, and execution barriers
+  adapters/     - Printer adapters (klipper.py, bambu.py, base.py)
   bot/          - Telegram bot (telegram.py, auth.py, decisions.py)
   api/          - Web dashboard REST/WebSocket API
   llm/          - LLM chat with tool use (50 tools incl. web_search, print monitor, printer memo)
@@ -31,7 +32,7 @@ src/sensing_voxel/
   infra/        - Shared utilities (retry.py, gcode.py)
 ```
 
-> **Deleted modules** (2026-07-13): `vision/`, `audio/`, `calibration/`, `queue/`, `modeling/`, `monitoring/monitor.py+z_offset.py+maintenance.py` — all removed to enforce deduplication. Vision analysis is now done via LLM multimodal (camera_snapshot tool + PrintMonitor). These modules exist in git history if needed.
+> **Historical cleanup (2026-07-13):** Superseded experimental packages and the old monitoring orchestrator were removed to enforce deduplication. Current camera analysis belongs to the multimodal LLM and `PrintMonitor`; consult git history for removed implementations.
 
 ## Development
 
@@ -65,161 +66,20 @@ pytest --cov=sensing_voxel --cov-report=html
   4. **Pre-print confirmation**: SVA must display material, build plate surface, hotend size, and z-offset, and get explicit user approval before starting.
   5. **First-layer monitoring**: during first layer, monitor checks every 1 minute (not 30). After first layer completes, switch to normal interval.
   6. **Z-offset sanity check**: if probe z_offset is 0.0 or homing_origin Z is positive, BLOCK print and warn user — this indicates broken/uninitialized probe state.
-- **Deduplicate + consolidate**: No two modules may co-exist if they serve overlapping functions — even under different names or abstractions. If a new module replaces an old one (e.g. PrintMonitor replaces MonitoringOrchestrator, LLM multimodal replaces vision/), **delete the old one immediately and migrate any still-needed logic into the new module**. Renaming is not enough — if `vision/camera.py` (RTSP stream) and `monitoring/print_monitor.py` (RTSP snapshot) both capture camera frames, consolidate into one place. Every module in the codebase must have a unique, non-overlapping responsibility.
+- **Deduplicate + consolidate**: No two modules may co-exist if they serve overlapping functions, even under different names or abstractions. When a replacement becomes canonical, delete its predecessor and migrate any still-needed logic. Renaming is not enough: shared responsibilities such as frame capture must have one owner. Every module in the codebase must have a unique, non-overlapping responsibility.
 - **Local lifecycle state**: `.project/` holds `TODO.md`, `SESSION_LOG.md`, `EVAL.md` (gitignored)
 
-## Printer Connectivity
+## Local Runtime Configuration
 
-- Neptune 4 Max (Klipper): `printer.example:80` — no auth required
-- Second printer: `printer.example:80`
-- Moonraker REST wraps results under `result.status.{object}` — unwrap with `data.get("status", data)`
+Deployment-specific settings—including printer and camera endpoints, credentials, user or bot identifiers, model gateways, and service URLs—belong only in the ignored `config/local.yaml` or environment variables. Never copy values from local configuration, runtime logs, hardware discovery, or live service responses into tracked documentation, tests, examples, or defaults.
 
-## Live Runtime Environment (verified 2026-07-10)
+Use neutral placeholders for documentation and synthetic values for tests. Use RFC 5737 addresses (`192.0.2.0/24`, `198.51.100.0/24`, or `203.0.113.0/24`) whenever an example requires an IPv4 address.
 
-The system runs live against real hardware. All config is in `config/local.yaml` (gitignored).
+Moonraker REST wraps results under `result.status.{object}`; unwrap with `data.get("status", data)`.
 
-### Services
+Before relying on model vision features, verify the configured model's multimodal capability in the local deployment. Do not record the endpoint, credentials, model deployment details, test images, or live verification results in tracked files.
 
-| Service | Address | Status |
-|---------|---------|--------|
-| neptune4max (Klipper) | `printer.example:80` | ✅ Connected, WS subscribed |
-| rpi-printer (Klipper) | `printer.example:80` | ✅ Connected, WS subscribed |
-| Tapo C220 camera (ONVIF) | `192.168.68.67:2020` | ✅ Connected, PTZ working |
-| Tapo C220 RTSP stream | `rtsp://threedp:garage10@192.168.68.67:554/stream1` | ✅ 1080p capture verified |
-| LLM proxy (Anthropic protocol) | `http://host.example:4000` | ✅ MiniMax-M3 model |
-| Telegram bot | `@example_bot` | ✅ Polling (ensure only one instance runs — duplicate `getUpdates` causes 409 Conflict) |
-| Dashboard API | `http://localhost:8080` | ✅ 24 endpoints live |
-| SearXNG (web search) | `http://localhost:8888` (Docker) | ✅ JSON API enabled, web_search tool wired |
-
-### Start the server
-
-```bash
-source .venv/bin/activate
-python -m sensing_voxel.main 2>&1 | tee /tmp/sv-server.log
-```
-
-Or in tmux: `tmux new-session -d -s sv-server -c <repo-root>` then send the above command.
-
-### Verified working (as of 2026-07-10)
-
-- LLM tool-use loop: `get_print_progress` returns real temps, `list_files` returns real G-code list from Moonraker
-- Dual-printer Klipper adapter (REST + WS telemetry)
-- Tapo camera RTSP capture (1920×1080 JPEG) + ONVIF PTZ step-move
-- Dashboard REST API: health, printers, status, telemetry, chat, camera/move
-- Tool audit log: `data/tool_audit.jsonl` records tool name + user ID + result excerpt
-- State machine starts at IDLE, persistence loads from `data/agent_state.json`
-- `web_search` tool: SearXNG instance at `localhost:8888` (Docker), LLM performs multi-turn progressive queries autonomously
-- `camera_snapshot` tool: RTSP → base64 → MiniMax-M3 multimodal analysis (cross-verified against independent look_at)
-- Tool cooldown: physical tools rate-limited (default 1.0s between identical tool calls)
-- Print monitoring (`PrintMonitor`): auto-activates when printer enters PRINTING state, periodic camera snapshot + LLM anomaly detection, auto-pause on unacknowledged anomaly (configurable timeout)
-- Printer memo system: SQLite key-value storage for physical attributes not in Klipper config (bed surface, filament brand); rejects config keys to maintain single source of truth
-- MAC address fingerprinting: auto-discovers printer hardware identity from Moonraker `machine/system_info`, stores in memo DB for persistent identification
-- Independent vision analysis: `camera_snapshot` performs a bias-free LLM analysis in a separate context (no chat history) to prevent confirmation bias
-- `update_printer_config` tool: SVA can modify printer.cfg with mandatory backup + approval flow
-- `approve_pending` tool: helps LLM replay approval tokens reliably
-
-### Known runtime gaps (confirmed by live test)
-
-- `GET /api/v1/jobs/history` → returns empty (JobRepository not wired into app_state)
-- `GET /api/v1/queue` → returns empty (QueueManager not wired)
-- `POST /api/v1/decision` → records only, no upload/start/resume/cancel side effects
-- Telegram STL/STEP upload → enters RECEIVING state, slicer never called
-- LLM config has no `provider` field in local.yaml → defaults to `LlmProvider.MINIMAX` (Anthropic SDK path — this is the working path)
-
-### LLM model multimodal verification
-
-The model may be swapped (MiniMax-M3 today, Doubao/GPT/Ollama tomorrow). **Before relying on any vision feature (camera_snapshot tool, first-layer analysis), independently verify the connected model's multimodal capability** — do not assume it from model name alone.
-
-Quick test (run from repo root with proxy reachable):
-
-```bash
-# Download a known test image
-curl -sL -o /tmp/test-img.jpg "https://picsum.photos/id/237/400/300"
-
-# Send image + question via the same Anthropic protocol SV uses
-IMG_B64=$(base64 -i /tmp/test-img.jpg)
-curl -s -m 60 "$LLM_BASE_URL/v1/messages" \
-  -H "x-api-key: $LLM_API_KEY" \
-  -H "content-type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d "{\"model\":\"$LLM_MODEL\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"$IMG_B64\"}},{\"type\":\"text\",\"text\":\"What animal is this? Describe in detail.\"}]}]}"
-```
-
-**Pass criteria**: model correctly identifies the subject (a black Labrador puppy on wooden floor) without hallucinating objects that aren't there.
-
-**If the model fails or returns text-only / errors**: vision features (camera_snapshot, first-layer visual analysis) are non-functional. Either switch to a multimodal-capable model or disable vision-dependent tools.
-
-**Verified models**:
-- `minimax-m3` via `http://host.example:4000` — ✅ verified 2026-07-10 (Labrador test + Tapo camera snapshot analysis)
-
-### Verification plan
-
-See `.project/module-verification/` for the full per-component verification checklist and go/no-go decisions on orphaned modules.
-
-### Live debugging workflow
-
-When a bug is found or behavior needs verification, follow this loop:
-
-```
-┌─► 1. DISCOVER: identify the problem (log error, wrong behavior, user report)
-│
-│   2. INVESTIGATE: gather evidence in parallel
-│      • Server log:   tail -50 /tmp/sv-server.log
-│      • Camera frame: capture via RTSP → /tmp/sv-camera-snapshot.jpg → look_at
-│      • Hardware:     curl Moonraker REST endpoints, ping devices
-│      • Code:         grep / read the relevant module
-│      • LLM state:    GET /api/v1/chat/context, tool_audit.jsonl
-│
-│   3. FIX: make the minimal code change (never refactor while fixing)
-│      • Run unit tests: pytest tests/unit/test_<module>.py -x -q
-│
-│   4. RESTART: reload the server with the fix
-│      • Ctrl-C in tmux, re-run python -m sensing_voxel.main | tee /tmp/sv-server.log
-│      • Verify startup log: adapters connected, camera ONVIF, LLM initialized
-│
-│   5. REPRODUCE AS USER: act as a human user via Playwright dashboard
-│      • Navigate to http://localhost:8080
-│      • Type the triggering message in the chat input
-│      • Observe: LLM response, tool calls in log, camera movement, state changes
-│      • For vision: capture RTSP frame → look_at → cross-check LLM's description
-│
-│   6. VERIFY OUTCOME
-│      ├─ FIXED → 7. DOCUMENT + COMMIT
-│      │         • Update AGENTS.md / .project/module-verification/ if behavior changed
-│      │         • git add + commit with conventional-commit message
-│      │         • Confirm: pytest still green, server still running
-│      │
-│      └─ STILL BROKEN or NEW BUG → back to step 1 (↑)
-└──────────────────────────────────────────────────────────────────────────
-```
-
-Key tools for each step:
-- **Investigate**: `tail /tmp/sv-server.log`, `curl localhost:8080/api/v1/*`, RTSP capture + `look_at`
-- **Reproduce**: Playwright browser at `http://localhost:8080` — type in `#chat-input`, click `#chat-send`
-- **Verify**: `grep "Tool call:\|cooldown\|error" /tmp/sv-server.log`, `pytest tests/unit/ -x -q`
-
-### Pre-action state check (MANDATORY)
-
-**Before SVA or the operator performs ANY action on a printer** (start print, pause, cancel, set temp, move axis, run gcode, modify config), the current state MUST be read first. This is not optional — it is a hard protocol hook.
-
-**Mandatory four-point observation — ALL FOUR must be checked, none can be skipped:**
-
-1. **Klipper/Moonraker state**: `curl -s http://<printer>:80/printer/objects/query?print_stats&extruder&heater_bed` — actual printer state, temps, progress, filename. This is ground truth from the hardware.
-
-2. **Monitor camera**: capture RTSP frame → `look_at` — what does the physical printer look like RIGHT NOW? Is there a print on the bed? Is it spaghetti? Is the bed clear? Camera reveals what Klipper can't (visual reality vs reported state).
-
-3. **SVA messages**: check dashboard chat (`GET /api/v1/chat/history`) or Telegram — what has SVA told the user? What is SVA's current understanding? SVA may have sent alerts, errors, or status updates that contradict the printer state. Never assume SVA's messages match reality — verify.
-
-4. **Server log**: `tail -50 /tmp/sv-server.log` — tool calls, errors, monitor checks, upload status. The log shows what SVA actually did (not what it said it did). Discrepancies between log and SVA messages indicate bugs.
-
-**Why all four are required:**
-- Klipper says "printing" but camera shows empty bed → print failed but Klipper doesn't know yet
-- Camera shows normal print but SVA sent "anomaly detected" → false positive in LLM analysis
-- SVA says "print started successfully" but log shows "upload timeout" → SVA lied (hallucinated success)
-- Log shows "Check #1 OK" but camera shows spaghetti → LLM missed the failure
-- Any single source alone is insufficient. Cross-verification across all four is the only way to catch real issues.
-
-**Implementation**: SVA's system prompt instructs the LLM to always call `get_print_progress` before any printer action. The operator (you, the AI agent reading this file) must do ALL FOUR checks before driving SVA to act, and must cross-verify results after SVA acts.
+Before any physical printer action, follow the project's safety barriers and verify current state through the configured adapter. Live hardware, camera, chat, and log checks are deployment operations and must use local configuration rather than commands or addresses embedded in repository documentation.
 
 ## LLM Integration
 
@@ -232,19 +92,19 @@ Key tools for each step:
 
 ## Known Issues
 
-See `.project/EVAL.md` for the full review and `.project/TODO.md` for the actionable list. Highlights:
+See `README.md` for current runtime status and `.project/TODO.md` for the actionable local backlog. Highlights:
 
-- **Test suite is green**: 639 passed / 0 failed / 13 xfailed on default `pytest` run. Reduced from 1,181 after deleting orphaned module tests (vision, audio, calibration, queue, modeling, old monitoring).
-- **Orphaned modules DELETED** (2026-07-13): vision/, audio/, calibration/, queue/, modeling/, monitoring/monitor.py+z_offset.py+maintenance.py — all removed. Rationale: either superseded by PrintMonitor (vision → LLM multimodal), blocked by missing hardware/config (audio, calibration), not needed for single-user (queue), or too many bugs + external deps (modeling). Git history preserved.
-- **Remaining wiring work**: `SlicerPipeline` needs PrusaSlicer CLI install + Telegram upload flow integration. `JobRepository` needs dashboard app_state wiring.
-- **`llm/tools.py` is 2,630 LOC** — split into a package before adding more tools.
-- **Emergency cancel** now uses a dedicated session (resolved). Historical note: it once shared the primary session.
+- **Reported default test baseline**: 719 passed / 18 skipped / 3 xfailed. This count was supplied for the documentation refresh; no persisted local pytest result artifact independently confirms it. Rerun `pytest` for current evidence.
+- **Current monitoring path**: `PrintMonitor` performs background camera checks with multimodal LLM anomaly assessment; deleted first-layer correction and legacy monitoring modules are historical only.
+- **Remaining wiring work**: `SlicerPipeline` needs PrusaSlicer CLI availability and Telegram model-upload flow integration. Runtime storage, including `JobRepository`, is already composed.
+- **`llm/tools.py` is large** — split it only as a dedicated, behavior-preserving refactor before adding substantial tool surface.
+- **Emergency cancel** uses a dedicated session; references to shared-session behavior are historical.
 
 ## Documentation
 
 Git-tracked:
 
-- `README.md` — Onboarding, usage, and the "Roadmap / Current Runtime Status" section (source of truth for what is wired)
+- `README.md` — Onboarding, usage, and the "Current Limitations" section (source of truth for what is wired)
 - `docs/PRD.md` — Product requirements
 - `docs/ARCHITECTURE.md` — Technical architecture
 

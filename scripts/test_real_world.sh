@@ -248,7 +248,7 @@ printer:
   primary:
     type: "klipper"
     name: "test_printer"
-    host: "printer.example"
+    host: "192.0.2.10"
     port: 80
     
 camera:

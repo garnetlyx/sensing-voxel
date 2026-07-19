@@ -41,32 +41,40 @@ Alternatively, send an email to **security@garnetlyx.com** with:
 
 When deploying Sensing Voxel:
 
-1. **Environment Variables**
+1. **Environment Variables and Local Configuration**
    - Never commit `.env` or `config/local.yaml` to version control
-   - Use strong, unique tokens for Telegram bot and API keys
-   - Rotate credentials regularly
+   - Keep real hostnames, IP addresses, MAC addresses, user IDs, camera URLs, and hardware identifiers out of public examples and test fixtures
+   - Use RFC 5737 addresses (`192.0.2.0/24`, `198.51.100.0/24`, or `203.0.113.0/24`) and synthetic identifiers in documentation and tests
+   - Generate `SEARXNG_SECRET` and other deployment secrets locally; do not replace public placeholders with usable credentials
+   - Use strong, unique tokens for Telegram bots and API keys
+   - Rotate credentials immediately if they are exposed
 
-2. **Telegram Bot Security**
+2. **Hardware and Integration Tests**
+   - Treat `tests/real_world/` and hardware E2E tests as opt-in tests that can contact configured devices and external services
+   - Do not run hardware tests against public example addresses
+   - Review evidence, logs, screenshots, and captured responses before sharing them because they may contain deployment identifiers or sensitive payloads
+
+3. **Telegram Bot Security**
    - Use the `allowed_users` configuration to restrict bot access
    - Only add trusted user IDs to the allowlist
    - Revoke and regenerate bot token if it's exposed
 
-3. **Network Security**
+4. **Network Security**
    - Run the dashboard behind a reverse proxy with HTTPS
    - Use firewall rules to restrict printer access
    - Don't expose printer ports directly to the internet
 
-4. **Camera Security**
+5. **Camera Security**
    - Use strong passwords for camera authentication
    - Place cameras on isolated network segments
    - Disable camera remote access if not needed
 
-5. **LLM Integration**
+6. **LLM Integration**
    - Use API keys with minimal required permissions
    - Enable approval workflows for high-risk commands
    - Review tool audit logs regularly (`data/tool_audit.jsonl`)
 
-6. **File Upload Safety**
+7. **File Upload Safety**
    - The system validates uploaded G-code files
    - Path traversal protection is enabled by default
    - Emergency commands (M112, M410) are blocked
