@@ -40,7 +40,7 @@ class TestBambuAdapter:
     def adapter(self):
         """Create adapter instance with typical config"""
         return BambuAdapter(
-            host="192.168.1.100",
+            host="192.0.2.11",
             mqtt_port=8883,
             ftp_port=990,
             serial_number=self.SERIAL,
@@ -52,7 +52,7 @@ class TestBambuAdapter:
     def adapter_no_tls(self):
         """Create adapter instance without TLS"""
         return BambuAdapter(
-            host="192.168.1.100",
+            host="192.0.2.11",
             mqtt_port=1883,
             ftp_port=21,
             serial_number=self.SERIAL,
@@ -112,7 +112,7 @@ class TestBambuAdapter:
     async def test_connect_without_access_code(self):
         """Test that connect skips credentials when no access code"""
         adapter = BambuAdapter(
-            host="192.168.1.100",
+            host="192.0.2.11",
             serial_number=self.SERIAL,
             access_code="",
         )
@@ -388,7 +388,7 @@ class TestBambuAdapter:
 
                 assert result.status == CommandResultStatus.SUCCESS
                 MockFtpTls.assert_called_once()
-                mock_ftp.connect.assert_called_once_with("192.168.1.100", 990)
+                mock_ftp.connect.assert_called_once_with("192.0.2.11", 990)
                 mock_ftp.login.assert_called_once_with(self.SERIAL, self.ACCESS_CODE)
                 mock_ftp.prot_p.assert_called_once()
                 mock_ftp.storbinary.assert_called_once()
@@ -406,7 +406,7 @@ class TestBambuAdapter:
 
                 assert result.status == CommandResultStatus.SUCCESS
                 MockFtp.assert_called_once()
-                mock_ftp.connect.assert_called_once_with("192.168.1.100", 21)
+                mock_ftp.connect.assert_called_once_with("192.0.2.11", 21)
                 mock_ftp.login.assert_called_once_with(self.SERIAL, self.ACCESS_CODE)
                 mock_ftp.prot_p.assert_not_called()
 

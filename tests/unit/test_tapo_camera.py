@@ -10,7 +10,9 @@ from sensing_voxel.config import TapoCameraConfig
 
 @pytest.fixture
 def config():
-    return TapoCameraConfig(host="192.168.1.100", user="admin", password="pass")
+    return TapoCameraConfig(
+        host="192.0.2.20", user="camera-user", password="test-camera-password"
+    )
 
 
 @pytest.fixture
@@ -29,7 +31,12 @@ class TestTapoCameraConnect:
         mock_ptz = MagicMock()
         mock_media = MagicMock()
         mock_profiles = [MagicMock(token="test_token")]
-        with patch("sensing_voxel.camera.tapo.asyncio") as mock_asyncio:
+        mock_onvif = MagicMock()
+        mock_onvif.ONVIFCamera = MagicMock()
+        with (
+            patch.dict("sys.modules", {"onvif": mock_onvif}),
+            patch("sensing_voxel.camera.tapo.asyncio") as mock_asyncio,
+        ):
             mock_asyncio.to_thread = AsyncMock(
                 side_effect=[mock_cam, mock_media, mock_ptz, mock_profiles]
             )

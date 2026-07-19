@@ -6,8 +6,8 @@ They are skipped by default and can be run with:
     pytest tests/integration/test_klipper_integration.py -m integration
 
 Printer configurations:
-- Neptune 4 Max: printer.example:80
-- Ender3V2: printer.example:80
+- Printer 1: 192.0.2.10:80
+- Printer 2: 192.0.2.11:80
 """
 
 import pytest
@@ -20,30 +20,30 @@ from sensing_voxel.core.models import NormalizedPrinterState, CommandResultStatu
 
 # Printer configurations for manual testing
 PRINTER_CONFIGS = {
-    "neptune4max": {
-        "host": "printer.example",
+    "printer_1": {
+        "host": "192.0.2.10",
         "port": 80,
         "api_key": None,
-        "description": "Neptune 4 Max (Klipper/Elegoo)",
+        "description": "Example Klipper printer 1",
     },
-    "ender3v2": {
-        "host": "printer.example",
+    "printer_2": {
+        "host": "192.0.2.11",
         "port": 80,
         "api_key": None,
-        "description": "Ender3V2 (Klipper)",
+        "description": "Example Klipper printer 2",
     },
 }
 
 
 @pytest.mark.integration
 @pytest.mark.skip(reason="Requires real Moonraker instance - run manually")
-class TestKlipperIntegrationNeptune4Max:
-    """Integration tests for Neptune 4 Max @ printer.example:80"""
+class TestKlipperIntegrationPrinter1:
+    """Integration tests for an example Klipper printer."""
 
     @pytest.fixture
-    async def adapter_neptune(self):
-        """Create adapter connected to Neptune 4 Max"""
-        config = PRINTER_CONFIGS["neptune4max"]
+    async def adapter_printer_1(self):
+        """Create adapter connected to example printer 1"""
+        config = PRINTER_CONFIGS["printer_1"]
         adapter = KlipperAdapter(
             host=config["host"],
             port=config["port"],
@@ -54,34 +54,34 @@ class TestKlipperIntegrationNeptune4Max:
         await adapter.disconnect()
 
     @pytest.mark.asyncio
-    async def test_connect_disconnect_neptune(self, adapter_neptune):
-        """Test basic connection to Neptune 4 Max"""
-        assert await adapter_neptune.is_connected()
-        await adapter_neptune.disconnect()
-        assert not await adapter_neptune.is_connected()
+    async def test_connect_disconnect_printer_1(self, adapter_printer_1):
+        """Test basic connection to example printer 1"""
+        assert await adapter_printer_1.is_connected()
+        await adapter_printer_1.disconnect()
+        assert not await adapter_printer_1.is_connected()
 
     @pytest.mark.asyncio
-    async def test_websocket_subscription_neptune(self, adapter_neptune):
-        """Test WebSocket subscription works on Neptune 4 Max"""
+    async def test_websocket_subscription_printer_1(self, adapter_printer_1):
+        """Test WebSocket subscription works on example printer 1"""
         # After connect(), WebSocket should be subscribed to print_stats
-        assert await adapter_neptune.is_connected()
+        assert await adapter_printer_1.is_connected()
         # Give WebSocket time to receive initial status
         await asyncio.sleep(2.0)
         # Check that we can get state (requires WS subscription to work)
-        state = await adapter_neptune.get_printer_state()
+        state = await adapter_printer_1.get_printer_state()
         assert state is not None
 
     @pytest.mark.asyncio
-    async def test_gcode_command_execution_neptune(self, adapter_neptune):
-        """Test G-code command execution on Neptune 4 Max"""
+    async def test_gcode_command_execution_printer_1(self, adapter_printer_1):
+        """Test G-code command execution on example printer 1"""
         # Send a safe status query command
-        result = await adapter_neptune.run_gcode("M115")
+        result = await adapter_printer_1.run_gcode("M115")
         assert result.status == CommandResultStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_get_printer_state_neptune(self, adapter_neptune):
-        """Test querying printer state from Neptune 4 Max"""
-        state = await adapter_neptune.get_printer_state()
+    async def test_get_printer_state_printer_1(self, adapter_printer_1):
+        """Test querying printer state from example printer 1"""
+        state = await adapter_printer_1.get_printer_state()
         assert isinstance(state, NormalizedPrinterState)
         assert state in [
             NormalizedPrinterState.PRINTING,
@@ -93,22 +93,22 @@ class TestKlipperIntegrationNeptune4Max:
         ]
 
     @pytest.mark.asyncio
-    async def test_get_print_progress_neptune(self, adapter_neptune):
-        """Test querying print progress from Neptune 4 Max"""
-        progress = await adapter_neptune.get_print_progress()
+    async def test_get_print_progress_printer_1(self, adapter_printer_1):
+        """Test querying print progress from example printer 1"""
+        progress = await adapter_printer_1.get_print_progress()
         assert progress is not None
         assert hasattr(progress, "state")
 
 
 @pytest.mark.integration
 @pytest.mark.skip(reason="Requires real Moonraker instance - run manually")
-class TestKlipperIntegrationEnder3V2:
-    """Integration tests for Ender3V2 @ printer.example:80"""
+class TestKlipperIntegrationPrinter2:
+    """Integration tests for example printer 2."""
 
     @pytest.fixture
-    async def adapter_ender(self):
-        """Create adapter connected to Ender3V2"""
-        config = PRINTER_CONFIGS["ender3v2"]
+    async def adapter_printer_2(self):
+        """Create adapter connected to example printer 2"""
+        config = PRINTER_CONFIGS["printer_2"]
         adapter = KlipperAdapter(
             host=config["host"],
             port=config["port"],
@@ -119,36 +119,36 @@ class TestKlipperIntegrationEnder3V2:
         await adapter.disconnect()
 
     @pytest.mark.asyncio
-    async def test_connect_disconnect_ender(self, adapter_ender):
-        """Test basic connection to Ender3V2"""
-        assert await adapter_ender.is_connected()
-        await adapter_ender.disconnect()
-        assert not await adapter_ender.is_connected()
+    async def test_connect_disconnect_printer_2(self, adapter_printer_2):
+        """Test basic connection to example printer 2"""
+        assert await adapter_printer_2.is_connected()
+        await adapter_printer_2.disconnect()
+        assert not await adapter_printer_2.is_connected()
 
     @pytest.mark.asyncio
-    async def test_websocket_subscription_ender(self, adapter_ender):
-        """Test WebSocket subscription works on Ender3V2"""
-        assert await adapter_ender.is_connected()
+    async def test_websocket_subscription_printer_2(self, adapter_printer_2):
+        """Test WebSocket subscription works on example printer 2"""
+        assert await adapter_printer_2.is_connected()
         await asyncio.sleep(2.0)
-        state = await adapter_ender.get_printer_state()
+        state = await adapter_printer_2.get_printer_state()
         assert state is not None
 
     @pytest.mark.asyncio
-    async def test_gcode_command_execution_ender(self, adapter_ender):
-        """Test G-code command execution on Ender3V2"""
-        result = await adapter_ender.run_gcode("M115")
+    async def test_gcode_command_execution_printer_2(self, adapter_printer_2):
+        """Test G-code command execution on example printer 2"""
+        result = await adapter_printer_2.run_gcode("M115")
         assert result.status == CommandResultStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_get_printer_state_ender(self, adapter_ender):
-        """Test querying printer state from Ender3V2"""
-        state = await adapter_ender.get_printer_state()
+    async def test_get_printer_state_printer_2(self, adapter_printer_2):
+        """Test querying printer state from example printer 2"""
+        state = await adapter_printer_2.get_printer_state()
         assert isinstance(state, NormalizedPrinterState)
 
     @pytest.mark.asyncio
-    async def test_get_print_progress_ender(self, adapter_ender):
-        """Test querying print progress from Ender3V2"""
-        progress = await adapter_ender.get_print_progress()
+    async def test_get_print_progress_printer_2(self, adapter_printer_2):
+        """Test querying print progress from example printer 2"""
+        progress = await adapter_printer_2.get_print_progress()
         assert progress is not None
         assert hasattr(progress, "state")
 
