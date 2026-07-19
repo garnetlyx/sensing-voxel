@@ -2,19 +2,49 @@
 Unit tests for API routes using aiohttp test utilities
 """
 
-import pytest
+import base64
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
-from collections import deque
 
-from aiohttp import web
 import aiohttp
+import pytest
+from aiohttp import web
 
-from sensing_voxel.api.server import create_app
+from sensing_voxel.adapters.base import LiveSafetySnapshot
+from sensing_voxel.api.server import create_app, validate_dashboard_security
+from sensing_voxel.api.websocket import (
+    WS_APPLICATION_PROTOCOL,
+    WS_AUTH_PROTOCOL_PREFIX,
+)
 from sensing_voxel.config import DashboardConfig
-from sensing_voxel.core.state_machine import AgentStateMachine
-from sensing_voxel.core.models import AgentState, JobContext, ConsumeResult, DecisionAction
 from sensing_voxel.core.decision import DecisionEngine
+from sensing_voxel.core.models import (
+    AgentState,
+    CommandResult,
+    CommandResultStatus,
+    ConsumeResult,
+    JobContext,
+    NormalizedPrinterState,
+)
+from sensing_voxel.core.state_machine import AgentStateMachine
+from sensing_voxel.safety import (
+    PhysicalConfirmationSnapshot,
+    PrintSafetyService,
+    RequestState,
+    SafetyBinding,
+)
+
+VALID_GCODE = (
+    b"; filament_type = PLA\n"
+    b"; estimated_time = 3600\n"
+    b"; filament used [mm] = 1234.5\n"
+    b"G28\nM104 S200\nG90\nM83\nG1 X10 Y10 Z0.2 F1200\nG1 X20 E1\n"
+)
+
+
+def websocket_auth_protocol(token: str) -> str:
+    encoded = base64.urlsafe_b64encode(token.encode()).decode().rstrip("=")
+    return f"{WS_AUTH_PROTOCOL_PREFIX}{encoded}"
 
 
 class MockWebSocketManager:
@@ -34,13 +64,72 @@ class MockAdapter:
     def __init__(self, printer_id, printer_type="klipper"):
         self.printer_id = printer_id
         self.printer_type = printer_type
+        self.upload_file = AsyncMock(
+            return_value=CommandResult(CommandResultStatus.SUCCESS, "uploaded")
+        )
+        self.start_print = AsyncMock(
+            return_value=CommandResult(CommandResultStatus.SUCCESS, "started")
+        )
+        self.resume_print = AsyncMock(
+            return_value=CommandResult(CommandResultStatus.SUCCESS, "resumed")
+        )
+        self.cancel_print = AsyncMock(
+            return_value=CommandResult(CommandResultStatus.SUCCESS, "cancelled")
+        )
+        self.is_connected = AsyncMock(return_value=True)
+        self.get_printer_state = AsyncMock(
+            return_value=NormalizedPrinterState.IDLE_NO_ACTIVE_PRINT
+        )
+        self.get_live_safety_snapshot = AsyncMock(
+            side_effect=lambda target: LiveSafetySnapshot(
+                target_printer=target,
+                probe_z_offset=-1.25,
+                homing_origin_z=0.0,
+            )
+        )
+
+
+def safety_binding() -> SafetyBinding:
+    return SafetyBinding(
+        user_id="dashboard-user",
+        source_trust="user_gcode",
+        target_printer="printer1",
+        hardware_digest="hardware-v1",
+        profile_digest="profile-v1",
+        config_digest="config-v1",
+        macro_digest="macros-v1",
+    )
+
+
+def create_safety_service(adapter: MockAdapter) -> PrintSafetyService:
+    async def binding_provider() -> SafetyBinding:
+        return safety_binding()
+
+    async def confirmation_provider(
+        _artifact, binding: SafetyBinding
+    ) -> PhysicalConfirmationSnapshot:
+        return PhysicalConfirmationSnapshot("textured PEI", 0.6, binding.probe_z_offset)
+
+    async def monitor_start(_contract) -> None:
+        return None
+
+    async def monitor_stop() -> None:
+        return None
+
+    return PrintSafetyService(
+        adapter,
+        binding_provider=binding_provider,
+        confirmation_provider=confirmation_provider,
+        monitor_start=monitor_start,
+        monitor_stop=monitor_stop,
+    )
 
 
 class MockDecisionEngine:
     """Mock decision engine for testing"""
 
     def __init__(self):
-        self.consume_decision = AsyncMock()
+        self.consume_decision = AsyncMock(return_value=ConsumeResult.CONSUMED)
 
 
 class MockChatManager:
@@ -71,14 +160,18 @@ def create_test_app(
     active_printer=None,
     chat_manager=None,
     camera=None,
-    api_token=None,
+    safety_services=None,
+    api_token="test-token",
+    auto_auth=True,
+    **dashboard_overrides,
 ):
-    """Create a test app with mocked dependencies"""
+    """Create a test app with mocked dependencies."""
     config = DashboardConfig(
         enabled=True,
         host="127.0.0.1",
         port=8080,
         api_token=api_token,
+        **dashboard_overrides,
     )
 
     if state_machine is None:
@@ -95,9 +188,22 @@ def create_test_app(
         active_printer=active_printer,
         chat_manager=chat_manager,
         camera=camera,
+        safety_services=safety_services,
     )
 
+    if auto_auth and api_token:
+        @web.middleware
+        async def test_auth_middleware(request, handler):
+            if "Authorization" not in request.headers:
+                headers = request.headers.copy()
+                headers["Authorization"] = f"Bearer {api_token}"
+                request = request.clone(headers=headers)
+            return await handler(request)
+
+        app.middlewares.insert(0, test_auth_middleware)
+
     return app
+
 
 
 @pytest.fixture
@@ -332,55 +438,88 @@ async def test_post_decision_no_active_job(aiohttp_client):
 
 
 @pytest.mark.asyncio
-async def test_post_decision_success(aiohttp_client):
-    """Test /api/v1/decision with valid parameters"""
+async def test_post_decision_success(aiohttp_client, tmp_path):
+    """Approval uploads retained bytes and starts only through safety service."""
     sm = AgentStateMachine()
-    await sm.transition_to(AgentState.AWAITING_APPROVAL)
-    sm.job_context = JobContext(
-        job_id="test-job-123",
-        job_file="test.gcode",
-        uploaded_at=datetime.now(),
-    )
-
     decision_engine = MockDecisionEngine()
     decision_engine.consume_decision.return_value = ConsumeResult.CONSUMED
+    adapter = MockAdapter("printer1")
+    service = create_safety_service(adapter)
+    uploaded_content: list[bytes] = []
 
-    app = create_test_app(state_machine=sm, decision_engine=decision_engine)
+    async def capture_upload(local_path: str, remote_path: str) -> CommandResult:
+        uploaded_content.append(__import__("pathlib").Path(local_path).read_bytes())
+        assert remote_path == "test.gcode"
+        return CommandResult(CommandResultStatus.SUCCESS, "uploaded")
+
+    adapter.upload_file.side_effect = capture_upload
+    app = create_test_app(
+        state_machine=sm,
+        decision_engine=decision_engine,
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        safety_services={"printer1": service},
+        upload_dir=str(tmp_path / "uploads"),
+    )
     client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", VALID_GCODE, filename="test.gcode")
+    upload_response = await client.post("/api/v1/upload", data=form)
+    upload = await upload_response.json()
 
     resp = await client.post(
         "/api/v1/decision",
-        json={"action": "approve", "token": "test-token"},
+        json={
+            "action": "approve",
+            "token": upload["decision_token"],
+            "job_id": upload["job_id"],
+        },
     )
+
+    assert upload_response.status == 200
     assert resp.status == 200
     data = await resp.json()
     assert data["result"] == "CONSUMED"
+    assert uploaded_content == [VALID_GCODE]
+    adapter.start_print.assert_awaited_once_with("test.gcode")
+    assert sm.current_state is AgentState.PRINTING
 
 
 @pytest.mark.asyncio
-async def test_post_decision_conflict_result(aiohttp_client):
-    """Test /api/v1/decision returns 409 on conflict result"""
+async def test_post_decision_conflict_result(aiohttp_client, tmp_path):
+    """Test /api/v1/decision returns 409 on conflict result."""
     sm = AgentStateMachine()
-    await sm.transition_to(AgentState.AWAITING_APPROVAL)
-    sm.job_context = JobContext(
-        job_id="test-job-123",
-        job_file="test.gcode",
-        uploaded_at=datetime.now(),
-    )
-
     decision_engine = MockDecisionEngine()
     decision_engine.consume_decision.return_value = ConsumeResult.INVALID_TOKEN
-
-    app = create_test_app(state_machine=sm, decision_engine=decision_engine)
+    adapter = MockAdapter("printer1")
+    service = create_safety_service(adapter)
+    app = create_test_app(
+        state_machine=sm,
+        decision_engine=decision_engine,
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        safety_services={"printer1": service},
+        upload_dir=str(tmp_path / "uploads"),
+    )
     client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", VALID_GCODE, filename="test.gcode")
+    upload_response = await client.post("/api/v1/upload", data=form)
+    upload = await upload_response.json()
 
     resp = await client.post(
         "/api/v1/decision",
-        json={"action": "approve", "token": "bad-token"},
+        json={
+            "action": "approve",
+            "token": "bad-token",
+            "job_id": upload["job_id"],
+        },
     )
     assert resp.status == 409
     data = await resp.json()
     assert data["result"] == "INVALID_TOKEN"
+    adapter.upload_file.assert_not_awaited()
+    adapter.start_print.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -632,13 +771,120 @@ async def test_post_camera_preset_missing_id(aiohttp_client):
 
 
 @pytest.mark.asyncio
-async def test_websocket_route(aiohttp_client):
-    """Test /api/v1/ws endpoint exists"""
-    app = create_test_app()
+async def test_websocket_rejects_missing_auth_before_upgrade(aiohttp_client):
+    app = create_test_app(auto_auth=False)
     client = await aiohttp_client(app)
 
-    resp = await client.get("/api/v1/ws")
-    assert resp.status in [200, 400, 426]
+    response = await client.get(
+        "/api/v1/ws",
+        headers={"Origin": str(client.make_url("/")).rstrip("/")},
+    )
+
+    assert response.status == 401
+    assert response.headers.get("Upgrade", "").lower() != "websocket"
+
+
+@pytest.mark.asyncio
+async def test_websocket_rejects_disallowed_origin_before_upgrade(aiohttp_client):
+    app = create_test_app(auto_auth=False)
+    client = await aiohttp_client(app)
+
+    response = await client.get(
+        "/api/v1/ws",
+        headers={
+            "Authorization": "Bearer test-token",
+            "Origin": "https://attacker.example",
+        },
+    )
+
+    assert response.status == 403
+    assert response.headers.get("Upgrade", "").lower() != "websocket"
+
+
+@pytest.mark.asyncio
+async def test_websocket_accepts_authenticated_same_origin(aiohttp_client):
+    app = create_test_app(auto_auth=False)
+    client = await aiohttp_client(app)
+    origin = str(client.make_url("/")).rstrip("/")
+
+    websocket = await client.ws_connect(
+        "/api/v1/ws",
+        headers={"Authorization": "Bearer test-token", "Origin": origin},
+    )
+    assert not websocket.closed
+    assert websocket.protocol is None
+    await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_websocket_accepts_browser_subprotocol_without_echoing_secret(aiohttp_client):
+    app = create_test_app(auto_auth=False)
+    client = await aiohttp_client(app)
+    origin = str(client.make_url("/")).rstrip("/")
+    auth_protocol = websocket_auth_protocol("test-token")
+
+    websocket = await client.ws_connect(
+        "/api/v1/ws",
+        protocols=(WS_APPLICATION_PROTOCOL, auth_protocol),
+        headers={"Origin": origin},
+    )
+
+    assert not websocket.closed
+    assert websocket.protocol == WS_APPLICATION_PROTOCOL
+    assert websocket.protocol != auth_protocol
+    await websocket.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protocols",
+    [
+        (WS_APPLICATION_PROTOCOL,),
+        (WS_APPLICATION_PROTOCOL, websocket_auth_protocol("wrong-token")),
+        (WS_APPLICATION_PROTOCOL, f"{WS_AUTH_PROTOCOL_PREFIX}%%%"),
+        (websocket_auth_protocol("test-token"),),
+    ],
+)
+async def test_websocket_rejects_invalid_browser_subprotocol_credentials(
+    aiohttp_client, protocols
+):
+    app = create_test_app(auto_auth=False)
+    client = await aiohttp_client(app)
+    origin = str(client.make_url("/")).rstrip("/")
+
+    response = await client.get(
+        "/api/v1/ws",
+        headers={
+            "Origin": origin,
+            "Connection": "Upgrade",
+            "Upgrade": "websocket",
+            "Sec-WebSocket-Version": "13",
+            "Sec-WebSocket-Key": base64.b64encode(b"0123456789abcdef").decode(),
+            "Sec-WebSocket-Protocol": ", ".join(protocols),
+        },
+    )
+
+    assert response.status == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+    assert response.headers.get("Sec-WebSocket-Protocol") is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_without_configured_auth_fails_closed(aiohttp_client):
+    app = create_test_app(api_token=None, auto_auth=False)
+    client = await aiohttp_client(app)
+    origin = str(client.make_url("/")).rstrip("/")
+
+    response = await client.get(
+        "/api/v1/ws",
+        headers={
+            "Authorization": "Bearer any-token",
+            "Origin": origin,
+        },
+    )
+
+    assert response.status == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
 
 
 @pytest.mark.asyncio
@@ -685,11 +931,12 @@ async def test_get_telemetry_pytest(aiohttp_client):
 @pytest.mark.asyncio
 async def test_post_upload(aiohttp_client, tmp_path):
     """Test file upload endpoint"""
-    app = create_test_app()
+    upload_dir = tmp_path / "uploads"
+    app = create_test_app(upload_dir=str(upload_dir))
     client = await aiohttp_client(app)
 
-    test_file = tmp_path / "test_upload.gcode"
-    test_file.write_text("; Test G-code content")
+    test_file = tmp_path / "test_upload.stl"
+    test_file.write_text("synthetic mesh payload")
 
     with open(test_file, "rb") as f:
         data = {"file": f}
@@ -698,15 +945,306 @@ async def test_post_upload(aiohttp_client, tmp_path):
     assert resp.status == 200
     result = await resp.json()
     assert result["status"] == "success"
-    assert result["filename"] == "test_upload.gcode"
-    assert "path" in result
-    assert "size" in result
+    assert result["filename"] == "test_upload.stl"
+    assert result["size"] == len("synthetic mesh payload")
+    assert (upload_dir / result["filename"]).read_text() == "synthetic mesh payload"
+
+
+@pytest.mark.asyncio
+async def test_pending_approvals_preserve_nested_print_evidence(aiohttp_client):
+    chat_manager = MockChatManager()
+    approval = {
+        "approval_token": "synthetic-approval-token",
+        "tool_name": "start_print_with_monitor",
+        "reason": "Review the validated print evidence.",
+        "payload": {
+            "print_request": {
+                "artifact_sha256": "a" * 64,
+                "preview_sha256": "b" * 64,
+                "rendered_preview_sha256": "c" * 64,
+                "validation_sha256": "d" * 64,
+                "confirmation_sha256": "e" * 64,
+                "rendered_preview_media_type": "image/svg+xml",
+                "rendered_preview": '<svg xmlns="http://www.w3.org/2000/svg"/>',
+                "confirmation": {
+                    "material": "PLA",
+                    "build_plate_surface": "textured PEI",
+                    "hotend_nozzle_size_mm": 0.6,
+                    "estimated_print_time_seconds": 3600,
+                    "filament_usage_mm": 1234.5,
+                    "z_offset_mm": -1.25,
+                },
+                "binding": {
+                    "probe_z_offset": -1.25,
+                    "homing_origin_z": 0.0,
+                },
+            }
+        },
+    }
+    chat_manager.get_pending_approvals.return_value = [approval]
+    app = create_test_app(chat_manager=chat_manager)
+    client = await aiohttp_client(app)
+
+    response = await client.get("/api/v1/pending-approvals?limit=7")
+
+    assert response.status == 200
+    assert await response.json() == {"approvals": [approval]}
+    chat_manager.get_pending_approvals.assert_called_once_with("dashboard-user", limit=7)
+
+
+@pytest.mark.asyncio
+async def test_gcode_upload_stages_immutable_safety_request(aiohttp_client, tmp_path):
+    upload_dir = tmp_path / "uploads"
+    adapter = MockAdapter("printer1")
+    service = create_safety_service(adapter)
+    app = create_test_app(
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        safety_services={"printer1": service},
+        upload_dir=str(upload_dir),
+    )
+    client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", VALID_GCODE, filename="safe.gcode")
+
+    response = await client.post("/api/v1/upload", data=form)
+    payload = await response.json()
+
+    assert response.status == 200
+    assert payload["approval_required"] is True
+    assert payload["printer_id"] == "printer1"
+    assert payload["binding"] == {
+        "target_printer": "printer1",
+        "hardware_digest": "hardware-v1",
+        "profile_digest": "profile-v1",
+        "config_digest": "config-v1",
+        "macro_digest": "macros-v1",
+        "probe_z_offset": -1.25,
+        "homing_origin_z": 0.0,
+        "source_trust": "user_gcode",
+        "user_id": "dashboard-user",
+    }
+    assert payload["confirmation"]["material"] == "PLA"
+    assert payload["confirmation"]["build_plate_surface"] == "textured PEI"
+    assert payload["confirmation"]["hotend_nozzle_size_mm"] == 0.6
+    assert payload["confirmation"]["estimated_print_time_seconds"] == 3600
+    assert payload["confirmation"]["filament_usage_mm"] == 1234.5
+    assert payload["confirmation"]["z_offset_mm"] == -1.25
+    assert payload["preview"]["artifact_sha256"] == payload["artifact_sha256"]
+    assert payload["preview_media_type"] == "application/json"
+    assert payload["rendered_preview_media_type"] == "image/svg+xml"
+    assert payload["rendered_preview"].startswith('<?xml version="1.0"')
+    assert "<svg" in payload["rendered_preview"]
+    print_request = service.get_request(payload["request_id"])
+    assert payload["artifact_sha256"] == print_request.artifact.sha256
+    assert payload["preview_sha256"] == print_request.preview.sha256
+    assert payload["rendered_preview_sha256"] == print_request.preview.rendered_sha256
+    assert payload["validation_sha256"] == print_request.validation.result_sha256
+    assert payload["confirmation_sha256"] == print_request.confirmation.confirmation_sha256
+    assert payload["confirmation"]["artifact_sha256"] == payload["artifact_sha256"]
+    assert payload["confirmation"]["preview_sha256"] == payload["preview_sha256"]
+    assert (
+        payload["confirmation"]["rendered_preview_sha256"]
+        == payload["rendered_preview_sha256"]
+    )
+    assert payload["confirmation"]["confirmation_sha256"] == payload["confirmation_sha256"]
+    assert print_request.artifact.content == VALID_GCODE
+    assert print_request.state is RequestState.PENDING
+    job = app["app_state"]["state_machine"].job_context
+    assert job is not None
+    for key in (
+        "artifact_sha256",
+        "preview_sha256",
+        "rendered_preview_sha256",
+        "validation_sha256",
+        "confirmation_sha256",
+        "binding",
+        "confirmation",
+        "preview",
+        "preview_media_type",
+        "rendered_preview",
+        "rendered_preview_media_type",
+    ):
+        assert job.metadata["safety"][key] == payload[key]
+    assert app["app_state"]["state_machine"].current_state is AgentState.AWAITING_APPROVAL
+
+
+@pytest.mark.asyncio
+async def test_gcode_upload_without_active_safety_service_fails_closed(
+    aiohttp_client, tmp_path
+):
+    upload_dir = tmp_path / "uploads"
+    adapter = MockAdapter("printer1")
+    app = create_test_app(
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        upload_dir=str(upload_dir),
+    )
+    client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", VALID_GCODE, filename="safe.gcode")
+
+    response = await client.post("/api/v1/upload", data=form)
+
+    assert response.status == 503
+    assert list(upload_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_gcode_upload_validation_failure_deletes_staged_file(
+    aiohttp_client, tmp_path
+):
+    upload_dir = tmp_path / "uploads"
+    adapter = MockAdapter("printer1")
+    service = create_safety_service(adapter)
+    app = create_test_app(
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        safety_services={"printer1": service},
+        upload_dir=str(upload_dir),
+    )
+    client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", b"M104 S200\nG1 X10\n", filename="unsafe.gcode")
+
+    response = await client.post("/api/v1/upload", data=form)
+
+    assert response.status == 400
+    assert list(upload_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rejection_rejects_request_and_deletes_staged_file(
+    aiohttp_client, tmp_path
+):
+    sm = AgentStateMachine()
+    decision_engine = MockDecisionEngine()
+    adapter = MockAdapter("printer1")
+    service = create_safety_service(adapter)
+    app = create_test_app(
+        state_machine=sm,
+        decision_engine=decision_engine,
+        adapters={"printer1": adapter},
+        active_printer="printer1",
+        safety_services={"printer1": service},
+        upload_dir=str(tmp_path / "uploads"),
+    )
+    client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", VALID_GCODE, filename="reject.gcode")
+    upload_response = await client.post("/api/v1/upload", data=form)
+    upload = await upload_response.json()
+    staged_path = __import__("pathlib").Path(upload["path"])
+
+    response = await client.post(
+        "/api/v1/decision",
+        json={
+            "action": "reject",
+            "token": upload["decision_token"],
+            "job_id": upload["job_id"],
+        },
+    )
+
+    assert response.status == 200
+    assert service.get_request(upload["request_id"]).state is RequestState.REJECTED
+    assert not staged_path.exists()
+    assert sm.current_state is AgentState.IDLE
+    adapter.upload_file.assert_not_awaited()
+    adapter.start_print.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upload_enforces_actual_streamed_byte_limit_and_cleans_up(aiohttp_client, tmp_path):
+    upload_dir = tmp_path / "uploads"
+    app = create_test_app(upload_dir=str(upload_dir), max_upload_bytes=4)
+    client = await aiohttp_client(app)
+
+    form = aiohttp.FormData()
+    form.add_field(
+        "file",
+        b"12345",
+        filename="oversize.gcode",
+        content_type="application/octet-stream",
+    )
+    response = await client.post("/api/v1/upload", data=form)
+
+    assert response.status == 413
+    assert list(upload_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_disallowed_extension_without_writing(aiohttp_client, tmp_path):
+    upload_dir = tmp_path / "uploads"
+    app = create_test_app(upload_dir=str(upload_dir))
+    client = await aiohttp_client(app)
+    form = aiohttp.FormData()
+    form.add_field("file", b"payload", filename="payload.exe")
+
+    response = await client.post("/api/v1/upload", data=form)
+
+    assert response.status == 400
+    assert not upload_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_uses_unique_non_overwriting_names(aiohttp_client, tmp_path):
+    upload_dir = tmp_path / "uploads"
+    app = create_test_app(upload_dir=str(upload_dir))
+    client = await aiohttp_client(app)
+
+    first_form = aiohttp.FormData()
+    first_form.add_field("file", b"first", filename="model.stl")
+    first_response = await client.post("/api/v1/upload", data=first_form)
+    second_form = aiohttp.FormData()
+    second_form.add_field("file", b"second", filename="model.stl")
+    second_response = await client.post("/api/v1/upload", data=second_form)
+
+    first = await first_response.json()
+    second = await second_response.json()
+    assert first_response.status == second_response.status == 200
+    assert first["filename"] == "model.stl"
+    assert second["filename"] == "model-1.stl"
+    assert (upload_dir / "model.stl").read_bytes() == b"first"
+    assert (upload_dir / "model-1.stl").read_bytes() == b"second"
+
+
+@pytest.mark.asyncio
+async def test_public_dashboard_shell_and_assets_do_not_require_auth(aiohttp_client):
+    """Only the shell, static assets, favicon path, and health are public."""
+    app = create_test_app(api_token="secret_token", auto_auth=False)
+    client = await aiohttp_client(app)
+
+    shell = await client.get("/")
+    shell_text = await shell.text()
+    script = await client.get("/static/app.js")
+    script_text = await script.text()
+    stylesheet = await client.get("/static/style.css")
+    health = await client.get("/health")
+    favicon = await client.get("/favicon.ico")
+    unknown = await client.get("/robots.txt")
+
+    assert shell.status == 200
+    assert shell.content_type == "text/html"
+    assert 'id="auth-form"' in shell_text
+    assert 'id="auth-token"' in shell_text
+    assert "secret_token" not in shell_text
+    assert script.status == 200
+    assert script.content_type in {"application/javascript", "text/javascript"}
+    assert "sessionStorage" in script_text
+    assert "localStorage" not in script_text
+    assert "secret_token" not in script_text
+    assert stylesheet.status == 200
+    assert stylesheet.content_type == "text/css"
+    assert health.status == 200
+    assert favicon.status == 404
+    assert unknown.status == 401
+    assert unknown.headers["WWW-Authenticate"] == "Bearer"
 
 
 @pytest.mark.asyncio
 async def test_api_with_auth_token(aiohttp_client):
     """Test API with authentication token"""
-    app = create_test_app(api_token="secret_token")
+    app = create_test_app(api_token="secret_token", auto_auth=False)
     client = await aiohttp_client(app)
 
     resp = await client.get("/api/v1/printers")
@@ -728,19 +1266,43 @@ async def test_api_with_auth_token(aiohttp_client):
 
 
 @pytest.mark.asyncio
-async def test_api_no_auth_in_dev_mode(aiohttp_client):
-    """Test API without auth when token is None (dev mode)"""
-    app = create_test_app(api_token=None)
+async def test_api_without_configured_auth_fails_closed(aiohttp_client):
+    """The public shell stays available but protected APIs fail closed."""
+    app = create_test_app(api_token=None, auto_auth=False)
     client = await aiohttp_client(app)
 
     resp = await client.get("/api/v1/printers")
+    assert resp.status == 401
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+
+    resp = await client.get(
+        "/api/v1/status",
+        headers={"Authorization": "Bearer any-token"},
+    )
+    assert resp.status == 401
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+
+    resp = await client.get("/")
     assert resp.status == 200
 
-    resp = await client.get("/api/v1/status")
+    resp = await client.get("/static/app.js")
     assert resp.status == 200
 
     resp = await client.get("/health")
     assert resp.status == 200
+
+
+def test_dashboard_defaults_to_loopback():
+    assert DashboardConfig().host == "127.0.0.1"
+
+
+def test_remote_dashboard_bind_requires_authentication():
+    with pytest.raises(ValueError, match="api_token is required"):
+        validate_dashboard_security(DashboardConfig(host="0.0.0.0", api_token=None))
+
+
+def test_remote_dashboard_bind_with_authentication_is_allowed():
+    validate_dashboard_security(DashboardConfig(host="0.0.0.0", api_token="secret"))
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,35 @@
 """REST API route handlers for dashboard"""
 
+import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+import tempfile
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+
+from sensing_voxel.api.serializers import (
+    serialize_alert,
+    serialize_job_context,
+    serialize_state_machine,
+    serialize_telemetry,
+)
+from sensing_voxel.core.models import (
+    AgentState,
+    CommandResultStatus,
+    ConsumeResult,
+    DecisionAction,
+    FileValidationStatus,
+    JobContext,
+    generate_decision_token,
+)
+from sensing_voxel.llm.runtime import ChatRequestContext
+from sensing_voxel.safety.models import PrintRequest
+from sensing_voxel.storage.job_repository import JobStatus
 
 
 def normalize_filename(filename: str) -> str:
@@ -16,23 +38,57 @@ def normalize_filename(filename: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-")
     return f"{name}{ext}"
 
-from sensing_voxel.api.serializers import (
-    serialize_alert,
-    serialize_job_context,
-    serialize_print_progress,
-    serialize_state_machine,
-    serialize_telemetry,
-)
-from sensing_voxel.config import BambuConfig, KlipperConfig
-from sensing_voxel.core.models import (
-    AgentState,
-    ConsumeResult,
-    DecisionAction,
-)
-from sensing_voxel.storage.job_repository import JobRepository, JobStatus
-from sensing_voxel.llm.runtime import ChatRequestContext
-
 logger = logging.getLogger(__name__)
+
+
+def _serialize_safety_binding(print_request: PrintRequest) -> dict[str, Any]:
+    """Serialize every mutable environment value bound by approval."""
+    binding = print_request.binding
+    return {
+        "target_printer": binding.target_printer,
+        "hardware_digest": binding.hardware_digest,
+        "profile_digest": binding.profile_digest,
+        "config_digest": binding.config_digest,
+        "macro_digest": binding.macro_digest,
+        "probe_z_offset": binding.probe_z_offset,
+        "homing_origin_z": binding.homing_origin_z,
+        "source_trust": binding.source_trust,
+        "user_id": binding.user_id,
+    }
+
+
+def _serialize_print_confirmation(print_request: PrintRequest) -> dict[str, Any]:
+    """Serialize the complete immutable evidence shown for approval."""
+    confirmation = print_request.confirmation
+    return {
+        "material": confirmation.material,
+        "build_plate_surface": confirmation.build_plate_surface,
+        "hotend_nozzle_size_mm": confirmation.hotend_nozzle_size_mm,
+        "estimated_print_time_seconds": confirmation.estimated_print_time_seconds,
+        "filament_usage_mm": confirmation.filament_usage_mm,
+        "z_offset_mm": confirmation.z_offset_mm,
+        "artifact_sha256": confirmation.artifact_sha256,
+        "preview_sha256": confirmation.preview_sha256,
+        "rendered_preview_sha256": confirmation.rendered_preview_sha256,
+        "confirmation_sha256": confirmation.confirmation_sha256,
+    }
+
+
+def _serialize_print_evidence(print_request: PrintRequest) -> dict[str, Any]:
+    """Serialize deterministic previews and all hashes required to audit approval."""
+    return {
+        "artifact_sha256": print_request.artifact.sha256,
+        "preview_sha256": print_request.preview.sha256,
+        "rendered_preview_sha256": print_request.preview.rendered_sha256,
+        "validation_sha256": print_request.validation.result_sha256,
+        "confirmation_sha256": print_request.confirmation.confirmation_sha256,
+        "binding": _serialize_safety_binding(print_request),
+        "confirmation": _serialize_print_confirmation(print_request),
+        "preview": json.loads(print_request.preview.content),
+        "preview_media_type": print_request.preview.media_type,
+        "rendered_preview": print_request.preview.rendered_content.decode("utf-8"),
+        "rendered_preview_media_type": print_request.preview.rendered_media_type,
+    }
 
 
 async def health_check(request: web.Request) -> web.Response:
@@ -130,7 +186,7 @@ async def post_decision(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     action_str = body.get("action")
     token = body.get("token")
@@ -168,8 +224,41 @@ async def post_decision(request: web.Request) -> web.Response:
 
     expected_state = expected_state_map.get(action)
 
+    job = sm.job_context
+    safety_context: tuple[Any, Any, Any] | None = None
+    if action in {DecisionAction.APPROVE, DecisionAction.REJECT}:
+        safety = job.metadata.get("safety", {})
+        printer_id = safety.get("printer_id")
+        request_id = safety.get("request_id")
+        operation_id = safety.get("operation_id")
+        service = app_state.get("safety_services", {}).get(printer_id or "")
+        adapter = app_state.get("adapters", {}).get(printer_id or "")
+        if (
+            not printer_id
+            or printer_id != app_state.get("active_printer")
+            or service is None
+            or adapter is None
+            or not request_id
+            or not operation_id
+        ):
+            raise web.HTTPServiceUnavailable(
+                text="Print safety approval is unavailable or incomplete"
+            )
+        try:
+            print_request: PrintRequest = service.get_request(request_id)
+            expected_evidence = _serialize_print_evidence(print_request)
+            if (
+                print_request.operation_id != operation_id
+                or any(safety.get(key) != value for key, value in expected_evidence.items())
+                or print_request.binding.source_trust != "user_gcode"
+            ):
+                raise ValueError("stored safety context does not match the print request")
+        except Exception as error:
+            raise web.HTTPConflict(text=f"Invalid print safety context: {error}") from error
+        safety_context = (service, adapter, print_request)
+
     result = await decision_engine.consume_decision(
-        job_context=sm.job_context,
+        job_context=job,
         decision_token=token,
         action=action,
         expected_state=expected_state,
@@ -184,23 +273,90 @@ async def post_decision(request: web.Request) -> web.Response:
         ConsumeResult.INVALID_JOB: "Invalid job",
     }
 
-    if result == ConsumeResult.CONSUMED:
-        # Broadcast decision result via WebSocket
-        ws_manager = app_state.get("ws_manager")
-        if ws_manager:
-            await ws_manager.broadcast_decision_result(sm.job_context.job_id, action.name)
-
-        return web.json_response(
-            {
-                "result": result.name,
-                "message": result_messages[result],
-            }
-        )
-    else:
+    if result != ConsumeResult.CONSUMED:
         return web.json_response(
             {"result": result.name, "message": result_messages.get(result, "Unknown error")},
             status=409,
         )
+
+    try:
+        if action is DecisionAction.APPROVE:
+            assert safety_context is not None
+            service, adapter, print_request = safety_context
+            if not await sm.transition_to(AgentState.UPLOADING):
+                raise RuntimeError("could not enter upload state")
+            with tempfile.NamedTemporaryFile(suffix=".gcode") as staged:
+                staged.write(print_request.artifact.content)
+                staged.flush()
+                upload_result = await adapter.upload_file(
+                    staged.name,
+                    print_request.printer_file,
+                )
+            if upload_result.status is not CommandResultStatus.SUCCESS:
+                raise RuntimeError(f"upload failed: {upload_result.message}")
+            approval = service.approve(
+                print_request.request_id,
+                binding=print_request.binding,
+            )
+            receipt = await service.execute(
+                approval.token,
+                operation_id=print_request.operation_id,
+                binding=print_request.binding,
+            )
+            if not receipt.started:
+                raise RuntimeError(f"print start failed: {receipt.message}")
+            if not await sm.transition_to(AgentState.PRINTING):
+                raise RuntimeError("could not enter printing state")
+        elif action is DecisionAction.REJECT:
+            assert safety_context is not None
+            service, _, print_request = safety_context
+            service.reject(print_request.request_id, binding=print_request.binding)
+            if job.gcode_path:
+                Path(job.gcode_path).unlink(missing_ok=True)
+            if not await sm.transition_to(AgentState.IDLE):
+                raise RuntimeError("could not return to idle state")
+        elif action is DecisionAction.RESUME:
+            printer_id = app_state.get("active_printer")
+            adapter = app_state.get("adapters", {}).get(printer_id or "")
+            if adapter is None:
+                raise RuntimeError("active printer adapter is unavailable")
+            command = await adapter.resume_print()
+            if command.status is not CommandResultStatus.SUCCESS:
+                raise RuntimeError(f"resume failed: {command.message}")
+            if not await sm.transition_to(AgentState.MONITORING):
+                raise RuntimeError("could not return to monitoring state")
+        elif action is DecisionAction.CANCEL:
+            printer_id = app_state.get("active_printer")
+            adapter = app_state.get("adapters", {}).get(printer_id or "")
+            if adapter is None:
+                raise RuntimeError("active printer adapter is unavailable")
+            command = await adapter.cancel_print()
+            if command.status is not CommandResultStatus.SUCCESS:
+                raise RuntimeError(f"cancel failed: {command.message}")
+            if not await sm.transition_to(AgentState.IDLE):
+                raise RuntimeError("could not return to idle state")
+    except Exception as error:
+        logger.error("Dashboard decision side effect failed: %s", error, exc_info=True)
+        if sm.current_state in {AgentState.UPLOADING, AgentState.PRINTING}:
+            await sm.transition_to(AgentState.ERROR)
+        return web.json_response(
+            {
+                "result": result.name,
+                "message": f"Decision accepted but execution failed: {error}",
+            },
+            status=500,
+        )
+
+    ws_manager = app_state.get("ws_manager")
+    if ws_manager:
+        await ws_manager.broadcast_decision_result(job.job_id, action.name)
+
+    return web.json_response(
+        {
+            "result": result.name,
+            "message": result_messages[result],
+        }
+    )
 
 
 async def post_chat(request: web.Request) -> web.Response:
@@ -214,7 +370,7 @@ async def post_chat(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     message = (body.get("message") or "").strip()
     if not message:
@@ -327,7 +483,7 @@ async def set_active_printer(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     printer_id = body.get("printer_id")
     if not printer_id:
@@ -353,7 +509,7 @@ async def post_camera_move(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     direction = (body.get("direction") or "").strip().lower()
     if direction not in ("left", "right", "up", "down"):
@@ -376,7 +532,7 @@ async def post_camera_preset(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     preset_id = body.get("preset_id")
     if preset_id is None:
@@ -388,46 +544,177 @@ async def post_camera_preset(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+def _reserve_unique_upload_path(upload_dir: Path, filename: str) -> Path:
+    stem = Path(filename).stem or "upload"
+    suffix = Path(filename).suffix
+    for counter in range(10_000):
+        candidate_name = filename if counter == 0 else f"{stem}-{counter}{suffix}"
+        candidate = upload_dir / candidate_name
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return candidate
+    raise web.HTTPConflict(text="Could not allocate a unique upload filename")
+
+
 async def post_upload(request: web.Request) -> web.Response:
-    """Handle file upload and save to data/uploads"""
+    """Store one validated upload without overwriting an existing file."""
+    app_state = request.app["app_state"]
+    upload_dir = Path(app_state.get("upload_dir", "data/uploads"))
+    max_upload_bytes = int(app_state.get("max_upload_bytes", 100 * 1024 * 1024))
+    allowed_extensions = {
+        str(extension).lower()
+        for extension in app_state.get(
+            "allowed_upload_extensions",
+            {".gcode", ".3mf", ".stl", ".step", ".stp"},
+        )
+    }
+    if max_upload_bytes <= 0:
+        raise web.HTTPInternalServerError(text="Upload size policy is invalid")
+
     try:
         reader = await request.multipart()
-    except Exception:
-        raise web.HTTPBadRequest(text="Invalid multipart request")
+        field = await reader.next()
+    except Exception as error:
+        raise web.HTTPBadRequest(text="Invalid multipart request") from error
 
-    field = await reader.next()  # type: ignore[attr-defined]
-    if not field or field.name != "file":  # type: ignore[union-attr]
-        return web.json_response({"error": "No file field in multipart request"}, status=400)
+    if field is None or field.name != "file":
+        raise web.HTTPBadRequest(text="No file field in multipart request")
 
-    filename = field.filename  # type: ignore[union-attr]
-    if not filename:
-        return web.json_response({"error": "No filename provided"}, status=400)
+    supplied_filename = field.filename
+    if not supplied_filename:
+        raise web.HTTPBadRequest(text="No filename provided")
 
-    # Sanitize filename
-    filename = os.path.basename(filename)
-    filename = normalize_filename(filename)
+    filename = normalize_filename(os.path.basename(supplied_filename))
+    if not filename or filename in {".", ".."}:
+        raise web.HTTPBadRequest(text="Invalid filename")
+    extension = Path(filename).suffix.lower()
+    if extension not in allowed_extensions:
+        raise web.HTTPBadRequest(text="File extension is not allowed")
 
-    # Ensure data/uploads directory exists
-    # Use data directory relative to the project root
-    upload_dir = Path("data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
-
-    file_path = upload_dir / filename
-
-    size = 0
-    with open(file_path, "wb") as f:
-        while True:
-            chunk = await field.read_chunk()  # type: ignore[attr-defined]
-            if not chunk:
-                break
-            size += len(chunk)
-            f.write(chunk)
-
-    logger.info(f"Saved uploaded file to {file_path} ({size} bytes)")
-
-    return web.json_response(
-        {"status": "success", "filename": filename, "path": str(file_path.absolute()), "size": size}
+    descriptor, raw_temp_path = tempfile.mkstemp(
+        dir=upload_dir,
+        prefix=".upload-",
+        suffix=".tmp",
     )
+    temp_path = Path(raw_temp_path)
+    final_path: Path | None = None
+    size = 0
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_upload_bytes:
+                    raise web.HTTPRequestEntityTooLarge(
+                        max_size=max_upload_bytes,
+                        actual_size=size,
+                    )
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        final_path = _reserve_unique_upload_path(upload_dir, filename)
+        os.replace(temp_path, final_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        if final_path is not None:
+            final_path.unlink(missing_ok=True)
+        raise
+
+    logger.info("Saved uploaded file to %s (%d bytes)", final_path, size)
+
+    response: dict[str, Any] = {
+        "status": "success",
+        "filename": final_path.name,
+        "path": str(final_path.absolute()),
+        "size": size,
+    }
+    if extension != ".gcode":
+        return web.json_response(response)
+
+    printer_id = app_state.get("active_printer")
+    service = app_state.get("safety_services", {}).get(printer_id or "")
+    if not printer_id or service is None:
+        final_path.unlink(missing_ok=True)
+        raise web.HTTPServiceUnavailable(
+            text="Print safety service is unavailable for the active printer"
+        )
+
+    logical_user_id = str(app_state.get("default_logical_user_id", "dashboard-user"))
+    operation_id = uuid.uuid4().hex
+    try:
+        binding = await service.create_binding(
+            user_id=logical_user_id,
+            source_trust="user_gcode",
+        )
+        print_request = await service.request_from_path(
+            final_path,
+            operation_id=operation_id,
+            binding=binding,
+            printer_file=final_path.name,
+        )
+    except Exception as error:
+        final_path.unlink(missing_ok=True)
+        logger.warning("Dashboard G-code safety validation failed: %s", error)
+        raise web.HTTPBadRequest(text=f"G-code safety validation failed: {error}") from error
+
+    job_id = uuid.uuid4().hex
+    decision_token = generate_decision_token()
+    safety_evidence = _serialize_print_evidence(print_request)
+    safety_metadata = {
+        "printer_id": printer_id,
+        "request_id": print_request.request_id,
+        "operation_id": print_request.operation_id,
+        **safety_evidence,
+    }
+    job_context = JobContext(
+        job_id=job_id,
+        job_file=str(final_path),
+        uploaded_at=datetime.now(),
+        decision_token=decision_token,
+        gcode_path=str(final_path),
+        gcode_hash=print_request.artifact.sha256,
+        metadata={"safety": safety_metadata},
+        file_validation_status=FileValidationStatus.VALID,
+    )
+    state_machine = app_state["state_machine"]
+    if state_machine.current_state is not AgentState.IDLE:
+        service.reject(print_request.request_id, binding=print_request.binding)
+        final_path.unlink(missing_ok=True)
+        raise web.HTTPConflict(text="Another job is already active")
+    state_machine.job_context = job_context
+    if not await state_machine.transition_to(AgentState.AWAITING_APPROVAL):
+        service.reject(print_request.request_id, binding=print_request.binding)
+        state_machine.job_context = None
+        final_path.unlink(missing_ok=True)
+        raise web.HTTPConflict(text="Could not stage print approval")
+
+    ws_manager = app_state.get("ws_manager")
+    if ws_manager:
+        await ws_manager.broadcast_decision_request(
+            job_id,
+            final_path.name,
+            decision_token,
+        )
+
+    response.update(
+        {
+            "job_id": job_id,
+            "decision_token": decision_token,
+            "approval_required": True,
+            "printer_id": printer_id,
+            "request_id": print_request.request_id,
+            "operation_id": print_request.operation_id,
+            **safety_evidence,
+        }
+    )
+    return web.json_response(response)
 
 
 async def get_job_history(request: web.Request) -> web.Response:
@@ -450,9 +737,8 @@ async def get_job_history(request: web.Request) -> web.Response:
         per_page = min(int(request.query.get("per_page", "20")), 100)
         printer_id = request.query.get("printer_id")
         status = request.query.get("status")
-        days = int(request.query.get("days", "30"))
     except ValueError:
-        raise web.HTTPBadRequest(text="Invalid query parameters")
+        raise web.HTTPBadRequest(text="Invalid query parameters") from None
 
     offset = (page - 1) * per_page
 
@@ -461,7 +747,7 @@ async def get_job_history(request: web.Request) -> web.Response:
         try:
             status_filter = JobStatus[status.upper()]
         except KeyError:
-            raise web.HTTPBadRequest(text=f"Invalid status: {status}")
+            raise web.HTTPBadRequest(text=f"Invalid status: {status}") from None
 
     try:
         all_jobs = job_repo.list_jobs(
@@ -508,7 +794,7 @@ async def get_job_history(request: web.Request) -> web.Response:
         )
     except Exception as e:
         logger.error(f"Error fetching job history: {e}", exc_info=True)
-        raise web.HTTPInternalServerError(text="Failed to fetch job history")
+        raise web.HTTPInternalServerError(text="Failed to fetch job history") from e
 
 
 async def get_job_stats(request: web.Request) -> web.Response:
@@ -534,14 +820,14 @@ async def get_job_stats(request: web.Request) -> web.Response:
         days = int(request.query.get("days", "30"))
         printer_id = request.query.get("printer_id")
     except ValueError:
-        raise web.HTTPBadRequest(text="Invalid query parameters")
+        raise web.HTTPBadRequest(text="Invalid query parameters") from None
 
     try:
         stats = job_repo.get_job_stats(printer_id=printer_id, days=days)
         return web.json_response(stats)
     except Exception as e:
         logger.error(f"Error fetching job stats: {e}", exc_info=True)
-        raise web.HTTPInternalServerError(text="Failed to fetch job stats")
+        raise web.HTTPInternalServerError(text="Failed to fetch job stats") from e
 
 
 async def post_approve(request: web.Request) -> web.Response:
@@ -554,7 +840,7 @@ async def post_approve(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        raise web.HTTPBadRequest(text="Invalid JSON body")
+        raise web.HTTPBadRequest(text="Invalid JSON body") from None
 
     token = body.get("approval_token", "").strip()
     action = body.get("action", "approve")
@@ -562,30 +848,43 @@ async def post_approve(request: web.Request) -> web.Response:
         return web.json_response({"error": "approval_token is required"}, status=400)
 
     store = chat_manager._tool_executor._approval_store
+    record = store.get(token)
+    if record is None or record.status != "pending":
+        return web.json_response({"error": "Token not found among pending approvals"}, status=404)
+
+    logical_user_id = str(app_state.get("default_logical_user_id", "dashboard-user"))
+    if record.logical_user_id != logical_user_id or record.channel != "dashboard":
+        return web.json_response({"error": "Token does not belong to this dashboard user"}, status=403)
 
     if action == "reject":
-        for r in store._records.values():
-            if r.approval_token == token and r.status == "pending":
-                r.status = "rejected"
-                return web.json_response({"status": "rejected", "token": token})
-        return web.json_response({"error": "Token not found"}, status=404)
+        rejected = store.reject(
+            token,
+            logical_user_id,
+            "dashboard",
+            record.tool_name,
+        )
+        if rejected is None:
+            return web.json_response({"error": "Rejection failed"}, status=400)
+        return web.json_response({"status": "rejected", "token": token})
+    if action != "approve":
+        return web.json_response({"error": "action must be approve or reject"}, status=400)
 
-    pending = store.tail(limit=50, status="pending")
-    for record in pending:
-        if record.get("approval_token") == token:
-            tool_name = record.get("tool_name", "")
-            logical_user_id = record.get("logical_user_id", "dashboard")
-            approved = store.approve(token, logical_user_id, tool_name)
-            if approved is None:
-                return web.json_response({"error": "Approval failed"}, status=400)
-            return web.json_response({
-                "status": "approved",
-                "token": token,
-                "tool_name": tool_name,
-                "payload": record.get("payload", {}),
-            })
-
-    return web.json_response({"error": "Token not found among pending approvals"}, status=404)
+    approved = store.approve(
+        token,
+        logical_user_id,
+        "dashboard",
+        record.tool_name,
+    )
+    if approved is None:
+        return web.json_response({"error": "Approval failed"}, status=400)
+    return web.json_response(
+        {
+            "status": "approved",
+            "token": token,
+            "tool_name": approved.tool_name,
+            "payload": approved.payload,
+        }
+    )
 
 
 def setup_routes(app: web.Application, ws_manager):
